@@ -7,9 +7,23 @@ use crate::analysis::{OwnershipAnalyzer, OwnershipSet, SetAnnotation, SetEntry, 
 use crate::util::{ChangeType, StateTimeline};
 use std::collections::HashMap;
 
+/// Renderer output category - determines syntactic validity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderCategory {
+    /// Output is syntactically valid Rust (uses `//` comments only).
+    /// Can be compiled, run through rustfmt, etc.
+    ValidRust,
+    /// Output uses rich typography (box drawing, diagrams).
+    /// More visually powerful but not valid Rust syntax.
+    RichText,
+}
+
 /// Available rendering styles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RenderStyle {
+    // ─────────────────────────────────────────────────────────────────────
+    // Valid Rust renderers (output can be compiled)
+    // ─────────────────────────────────────────────────────────────────────
     /// Inline comments at end of each line: `// x ●●○`
     #[default]
     Inline,
@@ -17,6 +31,10 @@ pub enum RenderStyle {
     Columnar,
     /// Grouped transitions with horizontal rules and blank lines
     Grouped,
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Rich text renderers (more typographical freedom)
+    // ─────────────────────────────────────────────────────────────────────
     /// Rustc-style diagnostic format with line numbers and underlines
     Diagnostic,
 }
@@ -32,12 +50,27 @@ impl RenderStyle {
         }
     }
 
-    pub fn all() -> &'static [(&'static str, &'static str)] {
+    /// Returns the output category for this render style.
+    pub fn category(&self) -> RenderCategory {
+        match self {
+            // Valid Rust - can be compiled
+            Self::Inline | Self::Columnar | Self::Grouped => RenderCategory::ValidRust,
+            // Rich text - more typographical freedom
+            Self::Diagnostic => RenderCategory::RichText,
+        }
+    }
+
+    /// Returns true if output is syntactically valid Rust.
+    pub fn is_valid_rust(&self) -> bool {
+        self.category() == RenderCategory::ValidRust
+    }
+
+    pub fn all() -> &'static [(&'static str, &'static str, RenderCategory)] {
         &[
-            ("inline", "Comments at end of line"),
-            ("columnar", "Fixed columns with NLL transitions"),
-            ("grouped", "Horizontal rules with blank lines"),
-            ("diagnostic", "Rustc-style with line numbers and underlines"),
+            ("inline", "Comments at end of line", RenderCategory::ValidRust),
+            ("columnar", "Fixed columns with NLL transitions", RenderCategory::ValidRust),
+            ("grouped", "Horizontal rules with blank lines", RenderCategory::ValidRust),
+            ("diagnostic", "Rustc-style with line numbers and underlines", RenderCategory::RichText),
         ]
     }
 }
@@ -157,15 +190,32 @@ impl<'a> RenderContext<'a> {
     }
 }
 
-/// Trait for ownership annotation renderers.
-pub trait Renderer {
+// ─────────────────────────────────────────────────────────────────────────────
+// Renderer traits - separated by output category
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Trait for renderers that produce valid Rust output.
+///
+/// Implementations must ensure output can be compiled by rustc.
+/// This typically means annotations are placed inside `//` comments.
+pub trait ValidRustRenderer {
+    /// Render source with annotations as valid Rust.
+    fn render(&self, ctx: &mut RenderContext) -> String;
+}
+
+/// Trait for renderers that produce rich text output.
+///
+/// Implementations have full typographical freedom - box drawing,
+/// diagrams, custom layouts. Output is for display only, not compilation.
+pub trait RichTextRenderer {
+    /// Render source with rich text annotations.
     fn render(&self, ctx: &mut RenderContext) -> String;
 }
 
 /// Inline renderer - comments at end of each line.
 pub struct InlineRenderer;
 
-impl Renderer for InlineRenderer {
+impl ValidRustRenderer for InlineRenderer {
     fn render(&self, ctx: &mut RenderContext) -> String {
         let mut output = String::new();
 
@@ -192,7 +242,7 @@ impl Renderer for InlineRenderer {
 /// Columnar renderer - fixed columns with NLL transition lines.
 pub struct ColumnarRenderer;
 
-impl Renderer for ColumnarRenderer {
+impl ValidRustRenderer for ColumnarRenderer {
     fn render(&self, ctx: &mut RenderContext) -> String {
         let col_width = ctx.all_vars.iter().map(|v| v.len()).max().unwrap_or(1) + 6;
 
@@ -244,7 +294,7 @@ impl Renderer for ColumnarRenderer {
 /// Grouped renderer - horizontal rules with blank lines.
 pub struct GroupedRenderer;
 
-impl Renderer for GroupedRenderer {
+impl ValidRustRenderer for GroupedRenderer {
     fn render(&self, ctx: &mut RenderContext) -> String {
         let rule_width = 45;
 
@@ -311,7 +361,7 @@ impl Renderer for GroupedRenderer {
 /// Diagnostic renderer - rustc-style with line numbers and underline annotations.
 pub struct DiagnosticRenderer;
 
-impl Renderer for DiagnosticRenderer {
+impl RichTextRenderer for DiagnosticRenderer {
     fn render(&self, ctx: &mut RenderContext) -> String {
         let mut output = String::new();
         let line_num_width = ctx.lines.len().to_string().len().max(2);
@@ -656,6 +706,9 @@ fn format_entries_compact(entries: &[&SetEntry], timeline: &StateTimeline) -> St
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Render source with the specified style.
+///
+/// Returns annotated source code. Check `style.category()` to determine
+/// whether the output is valid Rust or rich text.
 pub fn render_source(source: &str, style: RenderStyle, config: RenderConfig) -> String {
     let mut analyzer = OwnershipAnalyzer::new();
 
@@ -667,9 +720,11 @@ pub fn render_source(source: &str, style: RenderStyle, config: RenderConfig) -> 
     let mut ctx = RenderContext::new(source, set_annotations, config);
 
     match style {
-        RenderStyle::Inline => InlineRenderer.render(&mut ctx),
-        RenderStyle::Columnar => ColumnarRenderer.render(&mut ctx),
-        RenderStyle::Grouped => GroupedRenderer.render(&mut ctx),
-        RenderStyle::Diagnostic => DiagnosticRenderer.render(&mut ctx),
+        // ValidRustRenderer implementations
+        RenderStyle::Inline => ValidRustRenderer::render(&InlineRenderer, &mut ctx),
+        RenderStyle::Columnar => ValidRustRenderer::render(&ColumnarRenderer, &mut ctx),
+        RenderStyle::Grouped => ValidRustRenderer::render(&GroupedRenderer, &mut ctx),
+        // RichTextRenderer implementations
+        RenderStyle::Diagnostic => RichTextRenderer::render(&DiagnosticRenderer, &mut ctx),
     }
 }
