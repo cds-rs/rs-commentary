@@ -1,0 +1,237 @@
+# rs-commentary Design
+
+## Vision
+
+rs-commentary makes Rust's ownership system visible. It annotates source code with ownership, borrowing, and move state at each binding, helping developers understand what the borrow checker sees.
+
+## Core Concept: Capabilities
+
+Every binding has three capabilities:
+
+| Capability | Meaning |
+|------------|---------|
+| **O** (Ownership) | Can transfer ownership (move or drop) |
+| **R** (Read) | Can read the value |
+| **W** (Write) | Can mutate the value |
+
+### State Table
+
+| State | Notation | Capabilities | Example |
+|-------|----------|--------------|---------|
+| Owned (mut) | `●●●` | O R W | `let mut x = val;` |
+| Owned (immut) | `●●○` | O R | `let x = val;` |
+| Shared (borrowed) | `●●○` | O R | `x` while `&x` exists |
+| Frozen | `●○○` | O | `x` while `&mut x` exists |
+| Shared borrow | `○●○` | R | `r` in `let r = &x;` |
+| Mutable borrow | `○●●` | R W | `r` in `let r = &mut x;` |
+| Moved/Dropped | `†` | ∅ | after move or scope end |
+
+### Aliasing XOR Mutability
+
+When borrowed, the original binding's capabilities are temporarily reduced:
+
+- **Shared (`&x`)**: Original becomes read-only (O R) - can't mutate while alias exists
+- **Frozen (`&mut x`)**: Original loses all access (O only) - exclusive access transferred
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      rs-commentary                          │
+├─────────────────────────────────────────────────────────────┤
+│  CLI                                                        │
+│    rs-commentary annotate file.rs --style=diagnostic        │
+├─────────────────────────────────────────────────────────────┤
+│  LSP Server                                                 │
+│    textDocument/inlayHint, textDocument/hover               │
+├─────────────────────────────────────────────────────────────┤
+│  Output Layer (src/output/)                                 │
+│    Renderer trait + 4 styles                                │
+│    RenderContext builds from analysis                       │
+├─────────────────────────────────────────────────────────────┤
+│  Utilities (src/util/)                                      │
+│    StateTimeline - time-traveling state machine             │
+│    Position utilities - offset/line conversion              │
+├─────────────────────────────────────────────────────────────┤
+│  Analysis Engine (src/analysis/)                            │
+│    OwnershipAnalyzer - AST visitor, state tracking          │
+│    BindingState - state machine with transitions            │
+│    SetAnnotation - per-line ownership snapshots             │
+├─────────────────────────────────────────────────────────────┤
+│  ra_ap_syntax                                               │
+│    Rust parser from rust-analyzer                           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## State Machine
+
+All state changes go through `BindingState::transition(event)`:
+
+```rust
+pub enum OwnershipEvent {
+    SharedBorrow { by: BindingId },
+    MutBorrow { by: BindingId },
+    BorrowEnd { borrow_id: BindingId },
+    Move { to: Option<BindingId> },
+    Copy,
+    ScopeExit,
+}
+```
+
+```
+                    ┌──────────┐
+     let x = ...    │  Owned   │
+    ─────────────►  │  (ORW)   │
+                    └────┬─────┘
+                         │
+         ┌───────────────┼───────────────┐
+         │               │               │
+         ▼               ▼               ▼
+    ┌─────────┐    ┌──────────┐    ┌──────────┐
+    │   &x    │    │  &mut x  │    │  move x  │
+    │ x → shr │    │ x → frz  │    │  x → ∅   │
+    └────┬────┘    └────┬─────┘    └──────────┘
+         │              │
+         ▼              ▼
+    ┌─────────┐    ┌──────────┐
+    │ borrow  │    │ borrow   │
+    │  ends   │    │  ends    │
+    │ x → ORW │    │ x → ORW  │
+    └─────────┘    └──────────┘
+```
+
+## StateTimeline (src/util/state.rs)
+
+Time-traveling state machine for rendering. Records state at each line:
+
+```rust
+let mut timeline = StateTimeline::new();
+
+// Record state as you process lines
+timeline.record(line_num, &entries, line_text);
+
+// Query any point in history
+let state_at_line_5 = timeline.get(5);
+
+// Get what changed on a line
+let changes = timeline.get_changes(line_num);
+
+// Detect NLL drops
+let drops = timeline.get_pending_drops(line_num);
+
+// Rewind for re-processing
+timeline.rewind_to(3);
+```
+
+Key features:
+- Automatic scope reset at function boundaries
+- Drop detection (variables in prev but not current)
+- Change detection (new vars, state transitions)
+- Scope-aware queries (don't compare across functions)
+
+## Renderer Framework (src/output/renderer.rs)
+
+Pluggable output styles via trait:
+
+```rust
+pub trait Renderer {
+    fn render(&self, ctx: &RenderContext) -> String;
+}
+```
+
+### Available Styles
+
+| Style | Description |
+|-------|-------------|
+| `diagnostic` | Rustc-style with line numbers, underlines (default) |
+| `inline` | Comments at end of each line |
+| `columnar` | Fixed columns per variable |
+| `grouped` | Horizontal rules between changes |
+
+### Example: diagnostic (default)
+
+```
+   ╭─
+ 1 │ fn main() {
+ 2 │     let mut x = String::from("hello");
+   │             ─
+   │             └─ x: ●●● owned mut
+ 3 │     let r = &x;
+   │         ─    ─
+   │         |    └─ x: ●●○ shared (borrowed) (was owned)
+   │         └─ r: ○●○ &x
+ 4 │     println!("{}", r);
+   │                    ^ note: `r` dropped (last use)
+ 5 │     x.push_str(" world");
+   │     ─
+   │     └─ x: ●●● owned mut (was shared)
+ 6 │ }
+   ╰─
+```
+
+### Adding a Renderer
+
+1. Implement `Renderer` trait
+2. Add variant to `RenderStyle` enum
+3. Add case in `render_source()` match
+
+## CLI
+
+```bash
+rs-commentary annotate file.rs                    # diagnostic (default)
+rs-commentary annotate file.rs --style=inline
+rs-commentary annotate file.rs --style=columnar
+rs-commentary annotate file.rs --style=grouped
+rs-commentary annotate file.rs --all              # include Copy types
+```
+
+## Heuristics
+
+Without full type inference, we use pattern matching:
+
+**Copy types** (not tracked):
+- Primitives: `i32`, `bool`, `char`, etc.
+- References: `&T`
+- Arrays of primitives: `[u32; 5]`
+
+**Non-Copy** (tracked):
+- `String::from(...)`, `String::new()`
+- `vec![...]`, `Vec::new()`
+- `.to_string()`, `.to_owned()`
+- Struct literals `Foo { ... }`
+
+**Macro handling**:
+- `println!`, `format!`, `dbg!` etc. implicitly borrow
+- Both `println!("{}", x)` and `println!("{x}")` detected
+
+## NLL Support
+
+Borrows end at last use, not scope end:
+
+```rust
+let r = &x;           // r created, x shared
+println!("{}", r);    // last use of r
+                      // ^ note: `r` dropped (last use)
+x.push_str("!");      // x restored to ●●●
+```
+
+## Design Principles
+
+1. **Show state, not rules** - Concrete examples over abstract explanations
+2. **Annotate changes** - Mark where state transitions happen
+3. **Local reasoning** - One function at a time, no cross-function analysis
+4. **Good enough** - Heuristics acceptable for educational use
+
+## Non-Goals
+
+- Perfect accuracy (heuristics have edge cases)
+- Cross-function analysis
+- Lifetime bound visualization
+- Replacing rust-analyzer
+
+## Future Directions
+
+- ra_ap_hir integration for accurate Copy detection
+- Control flow tracking through if/match
+- Struct field tracking (`x.field` moved independently)
+- Semantic tokens for color-coding by state

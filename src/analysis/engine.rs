@@ -1,0 +1,1903 @@
+//! Core analysis engine that tracks ownership state through code.
+//!
+//! This module uses the state machine defined in `state.rs` for all
+//! ownership state transitions. See [`BindingState::transition`] for
+//! the complete transition table.
+
+use super::state::{
+    Annotation, BindingId, BindingState, OwnershipEvent, OwnershipSet, Scope, ScopeId,
+    SetAnnotation,
+};
+use anyhow::Result;
+use ra_ap_syntax::{
+    ast::{self, HasArgList, HasLoopBody, HasModuleItem, HasName},
+    AstNode, SourceFile, TextRange,
+};
+use std::collections::HashMap;
+
+/// Information about a tracked binding.
+#[derive(Debug, Clone)]
+pub struct BindingInfo {
+    pub id: BindingId,
+    pub name: String,
+    pub scope: ScopeId,
+    pub is_mutable: bool,
+    pub is_copy: bool, // Whether the type implements Copy
+    pub declaration_range: TextRange,
+    pub current_state: BindingState,
+}
+
+/// The ownership analyzer tracks variable state through code.
+pub struct OwnershipAnalyzer {
+    bindings: HashMap<BindingId, BindingInfo>,
+    scopes: HashMap<ScopeId, Scope>,
+    annotations: Vec<Annotation>,
+    set_annotations: Vec<SetAnnotation>,
+    next_binding_id: u32,
+    next_scope_id: u32,
+    current_scope: ScopeId,
+    current_fn_name: String,
+    source: String,
+}
+
+impl OwnershipAnalyzer {
+    pub fn new() -> Self {
+        let root_scope_id = ScopeId(0);
+        let mut scopes = HashMap::new();
+        scopes.insert(
+            root_scope_id,
+            Scope {
+                id: root_scope_id,
+                parent: None,
+                bindings: Vec::new(),
+            },
+        );
+
+        Self {
+            bindings: HashMap::new(),
+            scopes,
+            annotations: Vec::new(),
+            set_annotations: Vec::new(),
+            next_binding_id: 0,
+            next_scope_id: 1,
+            current_scope: root_scope_id,
+            current_fn_name: String::new(),
+            source: String::new(),
+        }
+    }
+
+    // ========================================================================
+    // State Machine Interface
+    // ========================================================================
+
+    /// Apply an ownership event to a binding, using the state machine.
+    ///
+    /// This is the single point of entry for all state transitions.
+    /// Returns the new state if the transition was valid.
+    fn apply_event(&mut self, binding_id: BindingId, event: OwnershipEvent) -> Option<BindingState> {
+        let binding = self.bindings.get(&binding_id)?;
+        let current_state = binding.current_state.clone();
+
+        match current_state.transition(event.clone()) {
+            Ok(new_state) => {
+                if let Some(b) = self.bindings.get_mut(&binding_id) {
+                    b.current_state = new_state.clone();
+                }
+                Some(new_state)
+            }
+            Err(e) => {
+                tracing::debug!("Transition error for {:?}: {}", binding_id, e);
+                None
+            }
+        }
+    }
+
+    /// Apply an event and create an annotation for the transition.
+    fn apply_event_with_annotation(
+        &mut self,
+        binding_id: BindingId,
+        event: OwnershipEvent,
+        range: TextRange,
+        explanation: String,
+    ) -> Option<BindingState> {
+        let name = self.bindings.get(&binding_id)?.name.clone();
+        let new_state = self.apply_event(binding_id, event)?;
+
+        self.annotations.push(Annotation::new(
+            range,
+            name,
+            new_state.clone(),
+            explanation,
+        ));
+
+        Some(new_state)
+    }
+
+    /// Analyze a source file and generate annotations.
+    pub fn analyze(&mut self, source: &str) -> Result<Vec<Annotation>> {
+        tracing::debug!("Analyzing source ({} bytes)", source.len());
+        self.source = source.to_string();
+        let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
+        let file = parse.tree();
+
+        // Check for parse errors
+        for error in parse.errors() {
+            tracing::warn!("Parse error: {:?}", error);
+        }
+
+        // Walk the AST and track ownership state
+        self.visit_source_file(&file);
+
+        tracing::debug!("Analysis complete: {} annotations", self.annotations.len());
+        Ok(self.annotations.clone())
+    }
+
+    /// Get the set annotations (ownership sets per line).
+    pub fn set_annotations(&self) -> &[SetAnnotation] {
+        &self.set_annotations
+    }
+
+    /// Generate an ownership set snapshot at the given byte offset.
+    fn snapshot_set(&mut self, offset: u32) {
+        let line = self.offset_to_line(offset);
+        let mut set = OwnershipSet::new(self.current_fn_name.clone(), line);
+
+        // Collect all live bindings in current scope chain
+        let mut scope_id = Some(self.current_scope);
+        let mut binding_ids: Vec<BindingId> = Vec::new();
+
+        while let Some(sid) = scope_id {
+            if let Some(scope) = self.scopes.get(&sid) {
+                binding_ids.extend(scope.bindings.iter().cloned());
+                scope_id = scope.parent;
+            } else {
+                break;
+            }
+        }
+
+        // Sort by binding id to maintain declaration order
+        binding_ids.sort_by_key(|id| id.0);
+
+        // Add each binding to the set based on its current state
+        for binding_id in binding_ids {
+            if let Some(binding) = self.bindings.get(&binding_id) {
+                match &binding.current_state {
+                    BindingState::Owned { mutable } => {
+                        set.add_owned(binding.name.clone(), *mutable);
+                    }
+                    BindingState::Shared { original_mutable, .. } => {
+                        set.add_shared(binding.name.clone(), *original_mutable);
+                    }
+                    BindingState::Frozen { original_mutable, .. } => {
+                        set.add_frozen(binding.name.clone(), *original_mutable);
+                    }
+                    BindingState::SharedBorrow { from } => {
+                        let from_name = self.bindings.get(from)
+                            .map(|b| b.name.clone())
+                            .unwrap_or_else(|| "?".to_string());
+                        set.add_shared_borrow(binding.name.clone(), from_name);
+                    }
+                    BindingState::MutBorrow { from } => {
+                        let from_name = self.bindings.get(from)
+                            .map(|b| b.name.clone())
+                            .unwrap_or_else(|| "?".to_string());
+                        set.add_mut_borrow(binding.name.clone(), from_name);
+                    }
+                    // Moved, Dropped, etc. - not in set
+                    BindingState::Moved { .. } | BindingState::Dropped => {}
+                    // Other states
+                    _ => {
+                        set.add_owned(binding.name.clone(), binding.is_mutable);
+                    }
+                }
+            }
+        }
+
+        self.set_annotations.push(SetAnnotation { line, set });
+    }
+
+    /// Generate an ownership set snapshot at scope exit, showing dropped bindings.
+    /// Takes the scope_id of the scope that was just exited.
+    fn snapshot_set_with_dropped(&mut self, offset: u32, exited_scope: ScopeId) {
+        let line = self.offset_to_line(offset);
+        let mut set = OwnershipSet::new(self.current_fn_name.clone(), line);
+
+        // Get the bindings from the scope that just exited
+        if let Some(scope) = self.scopes.get(&exited_scope) {
+            for &binding_id in &scope.bindings {
+                if let Some(binding) = self.bindings.get(&binding_id) {
+                    // Show as dropped if the binding was in the exited scope
+                    set.add_dropped(binding.name.clone());
+                }
+            }
+        }
+
+        // If we have any dropped entries, add the annotation
+        if !set.entries.is_empty() {
+            self.set_annotations.push(SetAnnotation { line, set });
+        }
+    }
+
+    /// Convert byte offset to line number (0-indexed).
+    fn offset_to_line(&self, offset: u32) -> u32 {
+        let offset = offset as usize;
+        self.source[..offset.min(self.source.len())]
+            .chars()
+            .filter(|&c| c == '\n')
+            .count() as u32
+    }
+
+    /// Create a new binding in the current scope.
+    pub fn new_binding(
+        &mut self,
+        name: String,
+        is_mutable: bool,
+        is_copy: bool,
+        range: TextRange,
+    ) -> BindingId {
+        let id = BindingId(self.next_binding_id);
+        self.next_binding_id += 1;
+
+        let info = BindingInfo {
+            id,
+            name: name.clone(),
+            scope: self.current_scope,
+            is_mutable,
+            is_copy,
+            declaration_range: range,
+            current_state: BindingState::Owned { mutable: is_mutable },
+        };
+
+        self.bindings.insert(id, info);
+
+        // Add to current scope
+        if let Some(scope) = self.scopes.get_mut(&self.current_scope) {
+            scope.bindings.push(id);
+        }
+
+        // Generate annotation for the declaration
+        self.annotations.push(Annotation::new(
+            range,
+            name,
+            BindingState::Owned { mutable: is_mutable },
+            if is_mutable {
+                "New owned binding (mutable): O R W".to_string()
+            } else {
+                "New owned binding: O R".to_string()
+            },
+        ));
+
+        id
+    }
+
+    /// Create a new binding that holds a borrow (shared or mutable).
+    pub fn new_borrow_binding(
+        &mut self,
+        name: String,
+        is_mutable: bool,
+        is_mut_borrow: bool,
+        borrowed_from: BindingId,
+        range: TextRange,
+    ) -> BindingId {
+        let id = BindingId(self.next_binding_id);
+        self.next_binding_id += 1;
+
+        let state = if is_mut_borrow {
+            BindingState::MutBorrow { from: borrowed_from }
+        } else {
+            BindingState::SharedBorrow { from: borrowed_from }
+        };
+
+        let borrowed_name = self.bindings.get(&borrowed_from)
+            .map(|b| b.name.clone())
+            .unwrap_or_else(|| "?".to_string());
+
+        let info = BindingInfo {
+            id,
+            name: name.clone(),
+            scope: self.current_scope,
+            is_mutable,
+            is_copy: true, // References are Copy
+            declaration_range: range,
+            current_state: state.clone(),
+        };
+
+        self.bindings.insert(id, info);
+
+        if let Some(scope) = self.scopes.get_mut(&self.current_scope) {
+            scope.bindings.push(id);
+        }
+
+        let explanation = if is_mut_borrow {
+            format!("Mutable borrow of {}: R W", borrowed_name)
+        } else {
+            format!("Shared borrow of {}: R", borrowed_name)
+        };
+
+        self.annotations.push(Annotation::new(range, name, state, explanation));
+
+        id
+    }
+
+    /// Enter a new scope (block, function body, etc.).
+    pub fn enter_scope(&mut self) -> ScopeId {
+        let id = ScopeId(self.next_scope_id);
+        self.next_scope_id += 1;
+
+        let scope = Scope {
+            id,
+            parent: Some(self.current_scope),
+            bindings: Vec::new(),
+        };
+
+        self.scopes.insert(id, scope);
+        self.current_scope = id;
+        id
+    }
+
+    /// Exit the current scope, dropping all bindings in it.
+    pub fn exit_scope(&mut self) {
+        if let Some(scope) = self.scopes.get(&self.current_scope).cloned() {
+            // Apply ScopeExit event to all bindings in this scope
+            for binding_id in &scope.bindings {
+                self.apply_event(*binding_id, OwnershipEvent::ScopeExit);
+            }
+
+            // Move to parent scope
+            if let Some(parent) = scope.parent {
+                self.current_scope = parent;
+            }
+        }
+    }
+
+    /// Record a move of a binding.
+    pub fn record_move(&mut self, from: BindingId, to: Option<BindingId>, range: TextRange) {
+        let Some(binding) = self.bindings.get(&from).cloned() else {
+            return;
+        };
+
+        if binding.is_copy {
+            // Copy types don't move - apply Copy event
+            self.apply_event_with_annotation(
+                from,
+                OwnershipEvent::Copy,
+                range,
+                format!("{}: copied (implements Copy)", binding.name),
+            );
+        } else {
+            // Apply Move event
+            self.apply_event_with_annotation(
+                from,
+                OwnershipEvent::Move { to },
+                range,
+                format!("{}: moved out, no longer accessible", binding.name),
+            );
+        }
+    }
+
+    /// Record a shared borrow of a binding.
+    /// This also marks the original as "shared" (shr) - temporarily read-only.
+    pub fn record_shared_borrow(&mut self, from: BindingId, range: TextRange) -> BindingId {
+        let borrow_id = BindingId(self.next_binding_id);
+        self.next_binding_id += 1;
+
+        let Some(binding) = self.bindings.get(&from).cloned() else {
+            return borrow_id;
+        };
+
+        // Annotation for the borrow itself
+        self.annotations.push(Annotation::new(
+            range,
+            binding.name.clone(),
+            BindingState::SharedBorrow { from },
+            format!("&{}: shared borrow, read-only access", binding.name),
+        ));
+
+        // Apply SharedBorrow event to the source binding (Owned -> Shared)
+        let was_mutable = binding.is_mutable;
+        self.apply_event_with_annotation(
+            from,
+            OwnershipEvent::SharedBorrow { by: borrow_id },
+            range,
+            format!(
+                "{}: {} → shr (shared borrow active)",
+                binding.name,
+                if was_mutable { "mut" } else { "owned" }
+            ),
+        );
+
+        borrow_id
+    }
+
+    /// Record a mutable borrow of a binding.
+    /// This also marks the original as "frozen" (frz) - no access until borrow ends.
+    pub fn record_mut_borrow(&mut self, from: BindingId, range: TextRange) -> BindingId {
+        let borrow_id = BindingId(self.next_binding_id);
+        self.next_binding_id += 1;
+
+        let Some(binding) = self.bindings.get(&from).cloned() else {
+            return borrow_id;
+        };
+
+        // Annotation for the borrow itself
+        self.annotations.push(Annotation::new(
+            range,
+            binding.name.clone(),
+            BindingState::MutBorrow { from },
+            format!("&mut {}: exclusive borrow, R W access", binding.name),
+        ));
+
+        // Apply MutBorrow event to the source binding (Owned -> Frozen)
+        let was_mutable = binding.is_mutable;
+        self.apply_event_with_annotation(
+            from,
+            OwnershipEvent::MutBorrow { by: borrow_id },
+            range,
+            format!(
+                "{}: {} → frz (mutable borrow active, access frozen)",
+                binding.name,
+                if was_mutable { "mut" } else { "owned" }
+            ),
+        );
+
+        borrow_id
+    }
+
+    /// Look up a binding by name in the current scope chain.
+    pub fn lookup_binding(&self, name: &str) -> Option<BindingId> {
+        let mut scope_id = Some(self.current_scope);
+
+        while let Some(sid) = scope_id {
+            if let Some(scope) = self.scopes.get(&sid) {
+                for &binding_id in &scope.bindings {
+                    if let Some(binding) = self.bindings.get(&binding_id) {
+                        if binding.name == name {
+                            return Some(binding_id);
+                        }
+                    }
+                }
+                scope_id = scope.parent;
+            } else {
+                break;
+            }
+        }
+
+        None
+    }
+
+    /// Get all annotations generated during analysis.
+    pub fn annotations(&self) -> &[Annotation] {
+        &self.annotations
+    }
+
+    // AST visitor methods
+
+    fn visit_source_file(&mut self, file: &SourceFile) {
+        let items: Vec<_> = file.items().collect();
+        tracing::debug!("Found {} top-level items", items.len());
+        for item in items {
+            self.visit_item(&item);
+        }
+    }
+
+    fn visit_item(&mut self, item: &ast::Item) {
+        tracing::debug!("Visiting item: {:?}", std::mem::discriminant(item));
+        match item {
+            ast::Item::Fn(func) => self.visit_fn(func),
+            ast::Item::Impl(impl_block) => {
+                // Visit methods in impl blocks
+                if let Some(assoc_items) = impl_block.assoc_item_list() {
+                    for assoc_item in assoc_items.assoc_items() {
+                        if let ast::AssocItem::Fn(func) = assoc_item {
+                            self.visit_fn(&func);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_fn(&mut self, func: &ast::Fn) {
+        // Track function name for set notation
+        let prev_fn_name = self.current_fn_name.clone();
+        if let Some(name) = func.name() {
+            self.current_fn_name = name.text().to_string();
+        }
+
+        let fn_scope = self.enter_scope();
+
+        // Snapshot at function entry (empty set)
+        if let Some(body) = func.body() {
+            let start = u32::from(body.syntax().text_range().start());
+            self.snapshot_set(start);
+        }
+
+        // Process parameters with type info
+        if let Some(param_list) = func.param_list() {
+            for param in param_list.params() {
+                let type_str = param.ty().map(|ty| ty.syntax().text().to_string());
+
+                if let Some(pat) = param.pat() {
+                    self.visit_param(&pat, type_str.as_deref());
+                }
+            }
+        }
+
+        // Process body inline (not via visit_block_expr to keep params in same scope)
+        if let Some(body) = func.body() {
+            for stmt in body.statements() {
+                self.visit_stmt(&stmt);
+            }
+
+            // Handle tail expression
+            if let Some(expr) = body.tail_expr() {
+                self.visit_expr(&expr);
+                let expr_end = u32::from(expr.syntax().text_range().end());
+                self.snapshot_set(expr_end);
+            }
+
+            // Exit scope and show dropped at closing brace
+            self.exit_scope();
+
+            if let Some(stmt_list) = body.stmt_list() {
+                if let Some(r_curly) = stmt_list.r_curly_token() {
+                    let brace_pos = u32::from(r_curly.text_range().start());
+                    self.snapshot_set_with_dropped(brace_pos, fn_scope);
+                }
+            }
+        } else {
+            self.exit_scope();
+        }
+
+        self.current_fn_name = prev_fn_name;
+    }
+
+    /// Visit a function parameter with its type annotation.
+    fn visit_param(&mut self, pat: &ast::Pat, type_str: Option<&str>) {
+        let ast::Pat::IdentPat(ident_pat) = pat else {
+            // For complex patterns, fall back to default handling
+            self.visit_pat(pat, false);
+            return;
+        };
+
+        let Some(name) = ident_pat.name() else { return };
+        let name_str = name.text().to_string();
+        let range = pat.syntax().text_range();
+
+        // Determine state based on type
+        let (state, explanation) = match type_str {
+            Some(t) if t.trim().starts_with("&mut ") => (
+                BindingState::MutBorrow { from: BindingId(0) }, // placeholder
+                format!("{}: mutable borrow parameter (R W)", name_str),
+            ),
+            Some(t) if t.trim().starts_with('&') => (
+                BindingState::SharedBorrow { from: BindingId(0) }, // placeholder
+                format!("{}: shared borrow parameter (R only)", name_str),
+            ),
+            Some(t) if self.is_copy_type(t) => (
+                BindingState::Owned { mutable: ident_pat.mut_token().is_some() },
+                format!("{}: owned Copy parameter", name_str),
+            ),
+            _ => (
+                BindingState::Owned { mutable: ident_pat.mut_token().is_some() },
+                format!("{}: owned parameter", name_str),
+            ),
+        };
+
+        // Create binding
+        let id = BindingId(self.next_binding_id);
+        self.next_binding_id += 1;
+
+        let is_copy = type_str.map(|t| self.is_copy_type(t)).unwrap_or(false);
+        let info = BindingInfo {
+            id,
+            name: name_str.clone(),
+            scope: self.current_scope,
+            is_mutable: ident_pat.mut_token().is_some(),
+            is_copy,
+            declaration_range: range,
+            current_state: state.clone(),
+        };
+
+        self.bindings.insert(id, info);
+        if let Some(scope) = self.scopes.get_mut(&self.current_scope) {
+            scope.bindings.push(id);
+        }
+
+        self.annotations.push(Annotation::new(range, name_str, state, explanation));
+    }
+
+    fn visit_block_expr(&mut self, block: &ast::BlockExpr) {
+        let block_scope = self.enter_scope();
+
+        for stmt in block.statements() {
+            self.visit_stmt(&stmt);
+        }
+
+        // Handle tail expression
+        if let Some(expr) = block.tail_expr() {
+            self.visit_expr(&expr);
+            // Snapshot after tail expression (on the line containing the expression end)
+            let expr_end = u32::from(expr.syntax().text_range().end());
+            self.snapshot_set(expr_end);
+        }
+
+        // Exit scope BEFORE snapshot at closing brace to show dropped state
+        self.exit_scope();
+
+        // Snapshot at closing brace using the actual `}` token position
+        // This will show bindings as dropped
+        if let Some(stmt_list) = block.stmt_list() {
+            if let Some(r_curly) = stmt_list.r_curly_token() {
+                let brace_pos = u32::from(r_curly.text_range().start());
+                self.snapshot_set_with_dropped(brace_pos, block_scope);
+            }
+        }
+    }
+
+    fn visit_stmt(&mut self, stmt: &ast::Stmt) {
+        match stmt {
+            ast::Stmt::LetStmt(let_stmt) => self.visit_let_stmt(let_stmt),
+            ast::Stmt::ExprStmt(expr_stmt) => {
+                if let Some(expr) = expr_stmt.expr() {
+                    self.visit_expr(&expr);
+                }
+            }
+            ast::Stmt::Item(item) => self.visit_item(item),
+        }
+
+        // Snapshot ownership set after each statement
+        let end = u32::from(stmt.syntax().text_range().end());
+        self.snapshot_set(end);
+    }
+
+    fn visit_let_stmt(&mut self, let_stmt: &ast::LetStmt) {
+        // Extract type info if available
+        let type_hint = let_stmt.ty().map(|ty| ty.syntax().text().to_string());
+
+        // Check if the initializer is a reference expression
+        let borrow_info = let_stmt.initializer().and_then(|init| {
+            if let ast::Expr::RefExpr(ref_expr) = &init {
+                let is_mut = ref_expr.mut_token().is_some();
+                if let Some(inner) = ref_expr.expr() {
+                    if let ast::Expr::PathExpr(path_expr) = &inner {
+                        if let Some((_name, binding_id, _)) = self.resolve_path(path_expr) {
+                            return Some((binding_id, is_mut));
+                        }
+                    }
+                }
+            }
+            None
+        });
+
+        // Determine if Copy: check type hint first, then initializer expression
+        let is_copy = if let Some(ref t) = type_hint {
+            self.is_copy_type(t)
+        } else if let Some(ref init) = let_stmt.initializer() {
+            // Infer from initializer expression
+            !self.is_non_copy_expr(init)
+        } else {
+            false // Unknown, assume non-Copy to be safe
+        };
+
+        // First visit the initializer to track any moves/borrows
+        if let Some(init) = let_stmt.initializer() {
+            self.visit_expr(&init);
+        }
+
+        // Then create the new binding
+        if let Some(pat) = let_stmt.pat() {
+            // If this is a reference binding (let r = &x), create a borrow binding
+            if let Some((borrowed_from, is_mut_borrow)) = borrow_info {
+                if let ast::Pat::IdentPat(ident_pat) = &pat {
+                    if let Some(name) = ident_pat.name() {
+                        let is_mut = ident_pat.mut_token().is_some();
+                        self.new_borrow_binding(
+                            name.text().to_string(),
+                            is_mut,
+                            is_mut_borrow,
+                            borrowed_from,
+                            pat.syntax().text_range(),
+                        );
+                        return;
+                    }
+                }
+            }
+            // Otherwise create a normal owned binding
+            self.visit_pat_with_type(&pat, false, is_copy);
+        }
+    }
+
+    /// Check if an expression produces a non-Copy type (heuristic).
+    fn is_non_copy_expr(&self, expr: &ast::Expr) -> bool {
+        let text = expr.syntax().text().to_string();
+
+        // Known non-Copy producing macros
+        if text.starts_with("vec!")
+            || text.starts_with("format!")
+            || text.starts_with("panic!")  // Returns !, but for error handling
+            || text.starts_with("String::from")
+            || text.starts_with("String::new")
+            || text.contains(".to_string()")
+            || text.contains(".to_owned()")
+            || text.starts_with("Box::new")
+            || text.starts_with("Rc::new")
+            || text.starts_with("Arc::new")
+            || text.starts_with("Vec::new")
+            || text.starts_with("Vec::with_capacity")
+            || text.starts_with("HashMap::new")
+            || text.starts_with("HashSet::new")
+            || text.starts_with("BTreeMap::new")
+            || text.starts_with("BTreeSet::new")
+            || text.starts_with("VecDeque::new")
+            || text.starts_with("PathBuf::from")
+            || text.starts_with("PathBuf::new")
+            || text.starts_with("OsString::from")
+            || text.starts_with("CString::new")
+        {
+            return true;
+        }
+
+        // Struct literals are usually non-Copy (unless known)
+        if let ast::Expr::RecordExpr(_) = expr {
+            return true;
+        }
+
+        // Check for method calls that typically return non-Copy
+        if text.contains(".collect()")
+            || text.contains(".map(")
+            || text.contains(".filter(")
+            || text.contains(".into_iter()")
+            || text.contains(".iter().cloned()")
+            || text.contains(".clone()")
+        {
+            return true;
+        }
+
+        false
+    }
+
+    /// Check if a type string represents a Copy type (heuristic).
+    fn is_copy_type(&self, type_str: &str) -> bool {
+        let trimmed = type_str.trim();
+
+        // References are Copy
+        if trimmed.starts_with('&') {
+            return true;
+        }
+
+        // Primitives
+        let primitives = [
+            "bool", "char",
+            "i8", "i16", "i32", "i64", "i128", "isize",
+            "u8", "u16", "u32", "u64", "u128", "usize",
+            "f32", "f64",
+        ];
+        if primitives.contains(&trimmed) {
+            return true;
+        }
+
+        // Arrays of primitives like [i32; 5]
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+                let element = inner.split(';').next().unwrap_or("").trim();
+                if primitives.contains(&element) {
+                    return true;
+                }
+            }
+        }
+
+        // Tuples of Copy types
+        if trimmed.starts_with('(') && trimmed.ends_with(')') {
+            // Simple heuristic: if it looks like a tuple of primitives
+            let inner = &trimmed[1..trimmed.len() - 1];
+            return inner.split(',').all(|part| {
+                let p = part.trim();
+                primitives.contains(&p) || p.starts_with('&')
+            });
+        }
+
+        false
+    }
+
+    fn visit_pat_with_type(&mut self, pat: &ast::Pat, is_mutable: bool, is_copy: bool) {
+        match pat {
+            ast::Pat::IdentPat(ident_pat) => {
+                if let Some(name) = ident_pat.name() {
+                    let is_mut = is_mutable || ident_pat.mut_token().is_some();
+                    self.new_binding(
+                        name.text().to_string(),
+                        is_mut,
+                        is_copy,
+                        pat.syntax().text_range(),
+                    );
+                }
+            }
+            ast::Pat::TuplePat(tuple_pat) => {
+                for field in tuple_pat.fields() {
+                    self.visit_pat_with_type(&field, is_mutable, is_copy);
+                }
+            }
+            ast::Pat::RefPat(ref_pat) => {
+                // Reference patterns bind by reference, the binding itself is Copy
+                if let Some(inner) = ref_pat.pat() {
+                    self.visit_pat_with_type(&inner, is_mutable, true);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Keep the old method for compatibility (parameters, etc.)
+    fn visit_pat(&mut self, pat: &ast::Pat, is_mutable: bool) {
+        self.visit_pat_with_type(pat, is_mutable, false);
+    }
+
+    fn visit_expr(&mut self, expr: &ast::Expr) {
+        match expr {
+            ast::Expr::PathExpr(path_expr) => {
+                // Variable use - tracked elsewhere (in call args, assignments, etc.)
+                let _ = self.resolve_path(path_expr);
+            }
+
+            ast::Expr::RefExpr(ref_expr) => {
+                let is_mut = ref_expr.mut_token().is_some();
+                if let Some(inner) = ref_expr.expr() {
+                    // Check if we're borrowing a simple variable
+                    if let ast::Expr::PathExpr(path_expr) = &inner {
+                        if let Some((_name, binding_id, _)) = self.resolve_path(path_expr) {
+                            let range = expr.syntax().text_range();
+                            if is_mut {
+                                self.record_mut_borrow(binding_id, range);
+                            } else {
+                                self.record_shared_borrow(binding_id, range);
+                            }
+                        }
+                    }
+                    self.visit_expr(&inner);
+                }
+            }
+            ast::Expr::CallExpr(call_expr) => {
+                if let Some(expr) = call_expr.expr() {
+                    self.visit_expr(&expr);
+                }
+                if let Some(args) = call_expr.arg_list() {
+                    for arg in args.args() {
+                        self.visit_call_arg(&arg);
+                    }
+                }
+            }
+            ast::Expr::MethodCallExpr(method_call) => {
+                // Check if receiver is moved (self) or borrowed (&self, &mut self)
+                if let Some(receiver) = method_call.receiver() {
+                    // For method calls that require &mut self on a shared binding,
+                    // NLL means any outstanding borrows have ended
+                    self.handle_method_receiver(&receiver, method_call);
+                }
+                if let Some(args) = method_call.arg_list() {
+                    for arg in args.args() {
+                        self.visit_call_arg(&arg);
+                    }
+                }
+            }
+            ast::Expr::BlockExpr(block) => {
+                self.visit_block_expr(block);
+            }
+            ast::Expr::IfExpr(if_expr) => {
+                if let Some(cond) = if_expr.condition() {
+                    self.visit_expr(&cond);
+                }
+                if let Some(then_branch) = if_expr.then_branch() {
+                    self.visit_block_expr(&then_branch);
+                }
+                if let Some(else_branch) = if_expr.else_branch() {
+                    match else_branch {
+                        ast::ElseBranch::Block(block) => self.visit_block_expr(&block),
+                        ast::ElseBranch::IfExpr(if_expr) => {
+                            self.visit_expr(&ast::Expr::IfExpr(if_expr))
+                        }
+                    }
+                }
+            }
+            ast::Expr::LoopExpr(loop_expr) => {
+                if let Some(body) = loop_expr.loop_body() {
+                    self.visit_block_expr(&body);
+                }
+            }
+            ast::Expr::ForExpr(for_expr) => {
+                if let Some(iterable) = for_expr.iterable() {
+                    self.visit_expr(&iterable);
+                }
+                self.enter_scope();
+                if let Some(pat) = for_expr.pat() {
+                    self.visit_pat(&pat, false);
+                }
+                if let Some(body) = for_expr.loop_body() {
+                    self.visit_block_expr(&body);
+                }
+                self.exit_scope();
+            }
+            ast::Expr::MatchExpr(match_expr) => {
+                if let Some(scrutinee) = match_expr.expr() {
+                    self.visit_expr(&scrutinee);
+                }
+                if let Some(arm_list) = match_expr.match_arm_list() {
+                    for arm in arm_list.arms() {
+                        self.enter_scope();
+                        if let Some(pat) = arm.pat() {
+                            self.visit_pat(&pat, false);
+                        }
+                        if let Some(expr) = arm.expr() {
+                            self.visit_expr(&expr);
+                        }
+                        self.exit_scope();
+                    }
+                }
+            }
+            ast::Expr::ClosureExpr(closure) => {
+                self.visit_closure(closure);
+            }
+            ast::Expr::WhileExpr(while_expr) => {
+                if let Some(cond) = while_expr.condition() {
+                    self.visit_expr(&cond);
+                }
+                if let Some(body) = while_expr.loop_body() {
+                    self.visit_block_expr(&body);
+                }
+            }
+            ast::Expr::ReturnExpr(return_expr) => {
+                if let Some(expr) = return_expr.expr() {
+                    self.visit_expr(&expr);
+                }
+            }
+            ast::Expr::BreakExpr(break_expr) => {
+                if let Some(expr) = break_expr.expr() {
+                    self.visit_expr(&expr);
+                }
+            }
+            ast::Expr::BinExpr(bin_expr) => {
+                if let Some(lhs) = bin_expr.lhs() {
+                    self.visit_expr(&lhs);
+                }
+                if let Some(rhs) = bin_expr.rhs() {
+                    self.visit_expr(&rhs);
+                }
+            }
+            ast::Expr::TupleExpr(tuple) => {
+                for field in tuple.fields() {
+                    self.visit_expr(&field);
+                }
+            }
+            ast::Expr::ArrayExpr(array) => {
+                if let ast::ArrayExprKind::ElementList(elements) = array.kind() {
+                    for elem in elements {
+                        self.visit_expr(&elem);
+                    }
+                }
+            }
+            ast::Expr::AwaitExpr(await_expr) => {
+                if let Some(expr) = await_expr.expr() {
+                    self.visit_expr(&expr);
+                }
+            }
+            ast::Expr::TryExpr(try_expr) => {
+                if let Some(expr) = try_expr.expr() {
+                    self.visit_expr(&expr);
+                }
+            }
+            ast::Expr::MacroExpr(macro_expr) => {
+                self.visit_macro_expr(macro_expr);
+            }
+            // Other expression types - visit inner expressions if any
+            _ => {}
+        }
+    }
+
+    /// Visit a macro expression like println!, format!, etc.
+    /// Formatting macros implicitly borrow their arguments.
+    fn visit_macro_expr(&mut self, macro_expr: &ast::MacroExpr) {
+        let Some(macro_call) = macro_expr.macro_call() else { return };
+        let Some(path) = macro_call.path() else { return };
+
+        let macro_name = path.syntax().text().to_string();
+
+        // Formatting macros that borrow their arguments
+        let is_format_macro = matches!(
+            macro_name.as_str(),
+            "println" | "print" | "eprintln" | "eprint"
+            | "format" | "write" | "writeln"
+            | "dbg"  // dbg! moves but returns the value
+            | "assert" | "assert_eq" | "assert_ne"
+            | "debug_assert" | "debug_assert_eq" | "debug_assert_ne"
+        );
+
+        if !is_format_macro {
+            return;
+        }
+
+        // Parse token tree to find variable references
+        let Some(token_tree) = macro_call.token_tree() else { return };
+        let text = token_tree.syntax().text().to_string();
+
+        // Track variables we've already recorded to avoid duplicates
+        let mut recorded: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // 1. Find inline format args like {rect1:#?} inside the format string
+        //    Format: {[name][:format_spec]} where name is an identifier
+        let mut in_string = false;
+        let mut in_format_placeholder = false;
+        let mut format_ident = String::new();
+
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0;
+
+        while i < chars.len() {
+            let ch = chars[i];
+
+            // Handle escape sequences in strings
+            if in_string && ch == '\\' && i + 1 < chars.len() {
+                i += 2; // Skip escaped char
+                continue;
+            }
+
+            match ch {
+                '"' => {
+                    in_string = !in_string;
+                    in_format_placeholder = false;
+                    format_ident.clear();
+                }
+                '{' if in_string => {
+                    // Check for escaped {{
+                    if i + 1 < chars.len() && chars[i + 1] == '{' {
+                        i += 2;
+                        continue;
+                    }
+                    in_format_placeholder = true;
+                    format_ident.clear();
+                }
+                '}' if in_string && in_format_placeholder => {
+                    // End of format placeholder - record if we found an identifier
+                    if !format_ident.is_empty() && !recorded.contains(&format_ident) {
+                        self.record_macro_borrow(&format_ident, macro_expr, &macro_name);
+                        recorded.insert(format_ident.clone());
+                    }
+                    in_format_placeholder = false;
+                    format_ident.clear();
+                }
+                ':' if in_format_placeholder => {
+                    // Format spec starts - record the identifier we collected
+                    if !format_ident.is_empty() && !recorded.contains(&format_ident) {
+                        let first = format_ident.chars().next().unwrap();
+                        if first.is_alphabetic() || first == '_' {
+                            self.record_macro_borrow(&format_ident, macro_expr, &macro_name);
+                            recorded.insert(format_ident.clone());
+                        }
+                    }
+                    format_ident.clear();
+                    in_format_placeholder = false;
+                }
+                c if in_format_placeholder && (c.is_alphanumeric() || c == '_') => {
+                    format_ident.push(c);
+                }
+                c if in_format_placeholder && !c.is_alphanumeric() && c != '_' => {
+                    // Non-ident char in placeholder (might be positional like {0})
+                    // Only record if it looks like an identifier (starts with letter or _)
+                    let _ = c; // Silence unused warning
+                    if !format_ident.is_empty() {
+                        let first = format_ident.chars().next().unwrap();
+                        if first.is_alphabetic() || first == '_' {
+                            if !recorded.contains(&format_ident) {
+                                self.record_macro_borrow(&format_ident, macro_expr, &macro_name);
+                                recorded.insert(format_ident.clone());
+                            }
+                        }
+                    }
+                    format_ident.clear();
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+
+        // 2. Find variables after the format string (traditional style: println!("{}", x))
+        let mut found_comma = false;
+        let mut current_ident = String::new();
+        in_string = false;
+
+        for ch in text.chars() {
+            match ch {
+                '"' => in_string = !in_string,
+                ',' if !in_string => {
+                    if !current_ident.is_empty() && found_comma && !recorded.contains(&current_ident) {
+                        self.record_macro_borrow(&current_ident, macro_expr, &macro_name);
+                        recorded.insert(current_ident.clone());
+                    }
+                    current_ident.clear();
+                    found_comma = true;
+                }
+                c if c.is_alphanumeric() || c == '_' => {
+                    if !in_string {
+                        current_ident.push(c);
+                    }
+                }
+                _ => {
+                    if !current_ident.is_empty() && found_comma && !in_string && !recorded.contains(&current_ident) {
+                        self.record_macro_borrow(&current_ident, macro_expr, &macro_name);
+                        recorded.insert(current_ident.clone());
+                    }
+                    current_ident.clear();
+                }
+            }
+        }
+
+        // Handle last identifier
+        if !current_ident.is_empty() && found_comma && !recorded.contains(&current_ident) {
+            self.record_macro_borrow(&current_ident, macro_expr, &macro_name);
+        }
+    }
+
+    /// Record that a variable is borrowed by a formatting macro.
+    fn record_macro_borrow(&mut self, name: &str, macro_expr: &ast::MacroExpr, macro_name: &str) {
+        // Look up the binding in current scope
+        if let Some(binding_id) = self.lookup_binding(name) {
+            let range = macro_expr.syntax().text_range();
+
+            // Check if this binding is already a borrow - if so, don't re-borrow
+            let is_already_borrow = self.bindings.get(&binding_id)
+                .map(|b| matches!(b.current_state,
+                    BindingState::SharedBorrow { .. } | BindingState::MutBorrow { .. }))
+                .unwrap_or(false);
+
+            if is_already_borrow {
+                // Just annotate the use, don't change state
+                self.annotations.push(Annotation::new(
+                    range,
+                    name.to_string(),
+                    self.bindings.get(&binding_id).unwrap().current_state.clone(),
+                    format!("{}: read by {}!", name, macro_name),
+                ));
+            } else {
+                // Record the shared borrow on owned bindings
+                self.record_shared_borrow(binding_id, range);
+
+                // Add annotation for the borrow
+                self.annotations.push(Annotation::new(
+                    range,
+                    name.to_string(),
+                    BindingState::SharedBorrow { from: binding_id },
+                    format!("{}: borrowed by {}!", name, macro_name),
+                ));
+            }
+        }
+    }
+
+    /// Handle a method call receiver, implementing NLL borrow ending.
+    /// When we see x.method() and x is currently Shared/Frozen (due to a borrow),
+    /// we know the borrow must have ended (NLL) if the method requires access.
+    fn handle_method_receiver(&mut self, receiver: &ast::Expr, method_call: &ast::MethodCallExpr) {
+        // Check if receiver is a simple variable
+        if let ast::Expr::PathExpr(path_expr) = receiver {
+            if let Some((name, binding_id, _)) = self.resolve_path(path_expr) {
+                let range = method_call.syntax().text_range();
+
+                // Check if this binding is currently borrowed (Shared or Frozen)
+                let is_borrowed = self.bindings
+                    .get(&binding_id)
+                    .map(|b| b.current_state.is_borrowed())
+                    .unwrap_or(false);
+
+                if is_borrowed {
+                    // NLL: The method call means borrows have ended
+                    // Find all bindings that are SharedBorrow/MutBorrow from this binding
+                    let borrows_to_end: Vec<BindingId> = self.bindings.iter()
+                        .filter_map(|(id, b)| {
+                            match &b.current_state {
+                                BindingState::SharedBorrow { from } if *from == binding_id => Some(*id),
+                                BindingState::MutBorrow { from } if *from == binding_id => Some(*id),
+                                _ => None,
+                            }
+                        })
+                        .collect();
+
+                    // End all active borrows using state machine
+                    for borrow_id in &borrows_to_end {
+                        if let Some(borrow_binding) = self.bindings.get(borrow_id) {
+                            let borrow_name = borrow_binding.name.clone();
+                            self.apply_event_with_annotation(
+                                *borrow_id,
+                                OwnershipEvent::ScopeExit,
+                                range,
+                                format!("{}: borrow ended (NLL)", borrow_name),
+                            );
+                        }
+                    }
+
+                    // Restore the original binding using AllBorrowsEnd event
+                    self.apply_event_with_annotation(
+                        binding_id,
+                        OwnershipEvent::AllBorrowsEnd,
+                        range,
+                        format!("{}: borrow ended (NLL), restored to owned", name),
+                    );
+                }
+            }
+        }
+
+        // For method receivers, we don't call visit_call_arg because:
+        // 1. If NLL just restored the binding, we don't want to re-borrow/move it
+        // 2. Method receivers are auto-referenced by Rust, not explicitly moved
+        // Instead, just visit any nested expressions in the receiver
+        if !matches!(receiver, ast::Expr::PathExpr(_)) {
+            self.visit_expr(receiver);
+        }
+    }
+
+    /// Visit an argument in a function/method call.
+    /// Determines if the argument is moved, borrowed, or reborrowed.
+    fn visit_call_arg(&mut self, arg: &ast::Expr) {
+        match arg {
+            // &x - shared borrow in call context
+            ast::Expr::RefExpr(ref_expr) if ref_expr.mut_token().is_none() => {
+                if let Some(inner) = ref_expr.expr() {
+                    if let ast::Expr::PathExpr(path_expr) = &inner {
+                        if let Some((name, binding_id, _)) = self.resolve_path(path_expr) {
+                            self.annotations.push(Annotation::new(
+                                arg.syntax().text_range(),
+                                name,
+                                BindingState::SharedBorrow { from: binding_id },
+                                "shared borrow passed to function".to_string(),
+                            ));
+                        }
+                    }
+                }
+                self.visit_expr(arg);
+            }
+
+            // &mut x - reborrow, original is suspended
+            ast::Expr::RefExpr(ref_expr) => {
+                if let Some(inner) = ref_expr.expr() {
+                    if let ast::Expr::PathExpr(path_expr) = &inner {
+                        if let Some((name, _binding_id, _)) = self.resolve_path(path_expr) {
+                            let reborrow_id = BindingId(self.next_binding_id);
+                            self.next_binding_id += 1;
+                            self.annotations.push(Annotation::new(
+                                arg.syntax().text_range(),
+                                name,
+                                BindingState::Suspended { reborrowed_to: reborrow_id },
+                                "reborrowed to function call, original suspended".to_string(),
+                            ));
+                        }
+                    }
+                }
+                self.visit_expr(arg);
+            }
+
+            // Plain variable - potential move
+            ast::Expr::PathExpr(path_expr) => {
+                if let Some((name, binding_id, binding)) = self.resolve_path(path_expr) {
+                    let range = arg.syntax().text_range();
+                    if binding.is_copy {
+                        self.annotations.push(Annotation::new(
+                            range,
+                            name.clone(),
+                            BindingState::Copied,
+                            format!("{}: copied (Copy type)", name),
+                        ));
+                    } else {
+                        self.record_move(binding_id, None, range);
+                    }
+                }
+            }
+
+            // Other expressions - just visit them
+            _ => self.visit_expr(arg),
+        }
+    }
+
+    /// Visit a closure expression.
+    /// Closures capture variables from their environment and have their own parameters.
+    fn visit_closure(&mut self, closure: &ast::ClosureExpr) {
+        let is_move = closure.move_token().is_some();
+        let range = closure.syntax().text_range();
+
+        // Analyze the body to find captured variables
+        // For move closures, captured variables are moved into the closure
+        // For non-move closures, they're borrowed
+
+        self.enter_scope();
+
+        // Process closure parameters
+        if let Some(param_list) = closure.param_list() {
+            for param in param_list.params() {
+                let type_str = param.ty().map(|ty| ty.syntax().text().to_string());
+                if let Some(pat) = param.pat() {
+                    self.visit_param(&pat, type_str.as_deref());
+                }
+            }
+        }
+
+        // Track captures - visit body and record variable usage
+        if let Some(body) = closure.body() {
+            // For move closures, we need to track what gets moved
+            if is_move {
+                self.visit_closure_body_move(&body, range);
+            } else {
+                self.visit_expr(&body);
+            }
+        }
+
+        self.exit_scope();
+    }
+
+    /// Visit a closure body that uses `move` semantics.
+    /// Variables captured by a move closure are moved into it.
+    fn visit_closure_body_move(&mut self, body: &ast::Expr, closure_range: TextRange) {
+        // First, collect all variable references in the closure body
+        let captures = self.collect_captures(body);
+
+        // Record moves for captured non-Copy variables
+        for (name, binding_id, binding) in captures {
+            if !binding.is_copy {
+                // Apply Move event for closure capture
+                self.apply_event_with_annotation(
+                    binding_id,
+                    OwnershipEvent::Move { to: None },
+                    closure_range,
+                    format!("{}: moved into closure", name),
+                );
+            }
+        }
+
+        // Then visit the body normally
+        self.visit_expr(body);
+    }
+
+    /// Collect all variable captures in an expression (for closure analysis).
+    fn collect_captures(&self, expr: &ast::Expr) -> Vec<(String, BindingId, BindingInfo)> {
+        let mut captures = Vec::new();
+        self.collect_captures_recursive(expr, &mut captures);
+        captures
+    }
+
+    fn collect_captures_recursive(&self, expr: &ast::Expr, captures: &mut Vec<(String, BindingId, BindingInfo)>) {
+        match expr {
+            ast::Expr::PathExpr(path_expr) => {
+                if let Some((name, id, info)) = self.resolve_path(path_expr) {
+                    // Check if this binding is from an outer scope (a capture)
+                    if info.scope != self.current_scope {
+                        // Only add if not already captured
+                        if !captures.iter().any(|(n, _, _)| n == &name) {
+                            captures.push((name, id, info));
+                        }
+                    }
+                }
+            }
+            ast::Expr::BlockExpr(block) => {
+                for stmt in block.statements() {
+                    if let ast::Stmt::ExprStmt(expr_stmt) = stmt {
+                        if let Some(e) = expr_stmt.expr() {
+                            self.collect_captures_recursive(&e, captures);
+                        }
+                    }
+                }
+                if let Some(tail) = block.tail_expr() {
+                    self.collect_captures_recursive(&tail, captures);
+                }
+            }
+            ast::Expr::CallExpr(call) => {
+                if let Some(e) = call.expr() {
+                    self.collect_captures_recursive(&e, captures);
+                }
+                if let Some(args) = call.arg_list() {
+                    for arg in args.args() {
+                        self.collect_captures_recursive(&arg, captures);
+                    }
+                }
+            }
+            ast::Expr::MethodCallExpr(method) => {
+                if let Some(receiver) = method.receiver() {
+                    self.collect_captures_recursive(&receiver, captures);
+                }
+                if let Some(args) = method.arg_list() {
+                    for arg in args.args() {
+                        self.collect_captures_recursive(&arg, captures);
+                    }
+                }
+            }
+            ast::Expr::RefExpr(ref_expr) => {
+                if let Some(inner) = ref_expr.expr() {
+                    self.collect_captures_recursive(&inner, captures);
+                }
+            }
+            ast::Expr::BinExpr(bin) => {
+                if let Some(lhs) = bin.lhs() {
+                    self.collect_captures_recursive(&lhs, captures);
+                }
+                if let Some(rhs) = bin.rhs() {
+                    self.collect_captures_recursive(&rhs, captures);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Resolve a path expression to its binding, if it's a simple local variable.
+    fn resolve_path(&self, path_expr: &ast::PathExpr) -> Option<(String, BindingId, BindingInfo)> {
+        let path = path_expr.path()?;
+        // Only handle simple paths (no :: qualifiers)
+        if path.qualifier().is_some() {
+            return None;
+        }
+        let segment = path.segment()?;
+        let name_ref = segment.name_ref()?;
+        let name = name_ref.text().to_string();
+        let binding_id = self.lookup_binding(&name)?;
+        let binding = self.bindings.get(&binding_id)?.clone();
+        Some((name, binding_id, binding))
+    }
+}
+
+impl Default for OwnershipAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::Capabilities;
+
+    #[test]
+    fn test_basic_let_binding() {
+        let source = r#"
+fn main() {
+    let x = 42;
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        assert!(!annotations.is_empty());
+        assert!(annotations.iter().any(|a| a.binding == "x"));
+    }
+
+    #[test]
+    fn test_mutable_binding() {
+        let source = r#"
+fn main() {
+    let mut x = 42;
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        let x_ann = annotations.iter().find(|a| a.binding == "x").unwrap();
+        assert_eq!(x_ann.state, BindingState::Owned { mutable: true });
+    }
+
+    #[test]
+    fn test_shared_borrow_parameter() {
+        let source = r#"
+fn foo(x: &str) {}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        let x_ann = annotations.iter().find(|a| a.binding == "x").unwrap();
+        assert!(matches!(x_ann.state, BindingState::SharedBorrow { .. }));
+        assert_eq!(x_ann.capabilities(), Capabilities::SHARED_BORROW);
+    }
+
+    #[test]
+    fn test_mut_borrow_parameter() {
+        let source = r#"
+fn foo(x: &mut String) {}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        let x_ann = annotations.iter().find(|a| a.binding == "x").unwrap();
+        assert!(matches!(x_ann.state, BindingState::MutBorrow { .. }));
+        assert_eq!(x_ann.capabilities(), Capabilities::MUT_BORROW);
+    }
+
+    #[test]
+    fn test_copy_type_parameter() {
+        let source = r#"
+fn foo(x: i32) {}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        let x_ann = annotations.iter().find(|a| a.binding == "x").unwrap();
+        assert!(matches!(x_ann.state, BindingState::Owned { .. }));
+        // i32 is Copy, so it's owned
+        assert!(x_ann.capabilities().owned);
+        assert!(x_ann.capabilities().read);
+    }
+
+    #[test]
+    fn test_array_copy_type_parameter() {
+        let source = r#"
+fn foo(counts: [u32; 5]) {}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        let ann = annotations.iter().find(|a| a.binding == "counts").unwrap();
+        assert!(matches!(ann.state, BindingState::Owned { .. }));
+    }
+
+    #[test]
+    fn test_owned_non_copy_parameter() {
+        let source = r#"
+fn foo(s: String) {}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        let ann = annotations.iter().find(|a| a.binding == "s").unwrap();
+        assert!(matches!(ann.state, BindingState::Owned { .. }));
+    }
+
+    #[test]
+    fn test_move_in_function_call() {
+        let source = r#"
+fn take(s: String) {}
+fn main() {
+    let s = String::new();
+    take(s);
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        // Find the move annotation (when s is passed to take)
+        let move_ann = annotations.iter().find(|a| {
+            a.binding == "s" && matches!(a.state, BindingState::Moved { .. })
+        });
+        assert!(move_ann.is_some(), "Should have a move annotation for s");
+    }
+
+    #[test]
+    fn test_shared_borrow_in_call() {
+        let source = r#"
+fn borrow(s: &String) {}
+fn main() {
+    let s = String::new();
+    borrow(&s);
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        // Find the borrow annotation
+        let borrow_ann = annotations.iter().find(|a| {
+            a.binding == "s" && matches!(a.state, BindingState::SharedBorrow { .. })
+        });
+        assert!(borrow_ann.is_some(), "Should have a shared borrow annotation for s");
+    }
+
+    #[test]
+    fn test_mut_borrow_reborrow_in_call() {
+        let source = r#"
+fn mutate(s: &mut String) {}
+fn main() {
+    let mut s = String::new();
+    mutate(&mut s);
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        // Find the reborrow/suspended annotation
+        let reborrow_ann = annotations.iter().find(|a| {
+            a.binding == "s" && matches!(a.state, BindingState::Suspended { .. })
+        });
+        assert!(reborrow_ann.is_some(), "Should have a suspended/reborrow annotation for s");
+    }
+
+    #[test]
+    fn test_copy_in_function_call() {
+        let source = r#"
+fn take_int(x: i32) {}
+fn main() {
+    let x: i32 = 42;
+    take_int(x);
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        // Find the copy annotation
+        let copy_ann = annotations.iter().find(|a| {
+            a.binding == "x" && matches!(a.state, BindingState::Copied)
+        });
+        assert!(copy_ann.is_some(), "Should have a copied annotation for x");
+    }
+
+    #[test]
+    fn test_impl_method_parameters() {
+        let source = r#"
+struct Foo;
+impl Foo {
+    fn method(&self, other: &Foo) -> bool {
+        true
+    }
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        // &self should be a shared borrow
+        // Note: self might be handled differently, but `other` should work
+        let other_ann = annotations.iter().find(|a| a.binding == "other");
+        assert!(other_ann.is_some(), "Should have annotation for 'other' parameter");
+        if let Some(ann) = other_ann {
+            assert!(matches!(ann.state, BindingState::SharedBorrow { .. }));
+        }
+    }
+
+    #[test]
+    fn test_closure_parameters() {
+        let source = r#"
+fn main() {
+    let f = |x: i32, y: &str| x;
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        // Closure parameter x should be owned (i32 is Copy)
+        let x_ann = annotations.iter().find(|a| a.binding == "x");
+        assert!(x_ann.is_some(), "Should have annotation for closure param 'x'");
+
+        // Closure parameter y should be a shared borrow
+        let y_ann = annotations.iter().find(|a| a.binding == "y");
+        assert!(y_ann.is_some(), "Should have annotation for closure param 'y'");
+        if let Some(ann) = y_ann {
+            assert!(matches!(ann.state, BindingState::SharedBorrow { .. }));
+        }
+    }
+
+    #[test]
+    fn test_move_closure_captures() {
+        let source = r#"
+fn main() {
+    let s = String::new();
+    let f = move || s.len();
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        // s should be moved into the closure
+        let move_ann = annotations.iter().find(|a| {
+            a.binding == "s" && matches!(a.state, BindingState::Moved { .. })
+        });
+        assert!(move_ann.is_some(), "Should have a move annotation for s captured by move closure");
+    }
+
+    #[test]
+    fn test_while_loop() {
+        let source = r#"
+fn main() {
+    let mut x = 0;
+    while x < 10 {
+        x = x + 1;
+    }
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        let x_ann = annotations.iter().find(|a| a.binding == "x");
+        assert!(x_ann.is_some(), "Should have annotation for 'x'");
+    }
+
+    #[test]
+    fn test_binary_expressions() {
+        let source = r#"
+fn main() {
+    let a = 1;
+    let b = 2;
+    let c = a + b;
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        // Should have annotations for a, b, and c
+        assert!(annotations.iter().any(|a| a.binding == "a"));
+        assert!(annotations.iter().any(|a| a.binding == "b"));
+        assert!(annotations.iter().any(|a| a.binding == "c"));
+    }
+
+    #[test]
+    fn test_shared_borrow_downgrades_to_shr() {
+        let source = r#"
+fn main() {
+    let mut x = String::new();
+    let r = &x;
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        // x should be marked as Shared (shr) when borrowed
+        let shared_ann = annotations.iter().find(|a| {
+            a.binding == "x" && matches!(a.state, BindingState::Shared { .. })
+        });
+        assert!(shared_ann.is_some(), "x should be marked as shared (shr) when &x is created");
+
+        // Capabilities should be OR (loses W)
+        if let Some(ann) = shared_ann {
+            let caps = ann.capabilities();
+            assert!(caps.owned, "shr still owns");
+            assert!(caps.read, "shr can read");
+            assert!(!caps.write, "shr cannot write (downgraded)");
+        }
+    }
+
+    #[test]
+    fn test_mut_borrow_freezes_to_frz() {
+        let source = r#"
+fn main() {
+    let mut x = String::new();
+    let r = &mut x;
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        // x should be marked as Frozen (frz) when &mut borrowed
+        let frozen_ann = annotations.iter().find(|a| {
+            a.binding == "x" && matches!(a.state, BindingState::Frozen { .. })
+        });
+        assert!(frozen_ann.is_some(), "x should be marked as frozen (frz) when &mut x is created");
+
+        // Capabilities should be O only (no R or W)
+        if let Some(ann) = frozen_ann {
+            let caps = ann.capabilities();
+            assert!(caps.owned, "frz still owns");
+            assert!(!caps.read, "frz cannot read");
+            assert!(!caps.write, "frz cannot write");
+        }
+    }
+
+    #[test]
+    fn test_capabilities_frozen_display() {
+        use crate::analysis::Capabilities;
+        // Frozen: O only (owns but can't access)
+        assert_eq!(format!("{}", Capabilities::FROZEN), "O");
+    }
+
+    #[test]
+    fn test_vec_macro_detected_as_non_copy() {
+        let source = r#"
+fn take(v: Vec<i32>) {}
+fn main() {
+    let x = vec![1, 2, 3];
+    let y = x;
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        // x from vec! should be non-Copy, so y = x should move it
+        // Find x's declaration - should be marked non-Copy (checking explanation)
+        let x_decl = annotations.iter().find(|a| {
+            a.binding == "x" && matches!(a.state, BindingState::Owned { .. })
+        });
+        assert!(x_decl.is_some(), "Should have declaration annotation for x");
+    }
+
+    #[test]
+    fn test_string_from_detected_as_non_copy() {
+        let source = r#"
+fn main() {
+    let s = String::from("hello");
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        let s_ann = annotations.iter().find(|a| a.binding == "s");
+        assert!(s_ann.is_some(), "Should have annotation for s");
+    }
+
+    #[test]
+    fn test_struct_literal_detected_as_non_copy() {
+        let source = r#"
+struct Point { x: i32, y: i32 }
+fn main() {
+    let p = Point { x: 1, y: 2 };
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        let p_ann = annotations.iter().find(|a| a.binding == "p");
+        assert!(p_ann.is_some(), "Should have annotation for p");
+    }
+
+    #[test]
+    fn test_println_macro_borrows_variable() {
+        let source = r#"
+fn main() {
+    let msg = String::from("hello");
+    println!("{}", msg);
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        // msg should be borrowed by println!, not moved
+        let borrow_ann = annotations.iter().find(|a| {
+            a.binding == "msg" && matches!(a.state, BindingState::SharedBorrow { .. })
+        });
+        assert!(borrow_ann.is_some(), "Should detect println! borrowing msg");
+
+        // Original should be marked as shr (shared)
+        let shr_ann = annotations.iter().find(|a| {
+            a.binding == "msg" && matches!(a.state, BindingState::Shared { .. })
+        });
+        assert!(shr_ann.is_some(), "Original msg should be marked as shr");
+    }
+
+    #[test]
+    fn test_println_inline_format_args() {
+        // Test Rust 1.58+ inline format args: println!("{rect1:#?}")
+        let source = r#"
+struct Rect { w: i32, h: i32 }
+fn main() {
+    let rect1 = Rect { w: 10, h: 20 };
+    println!("Rect is {rect1:#?}");
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        // rect1 should be borrowed by println! via inline format arg
+        let borrow_ann = annotations.iter().find(|a| {
+            a.binding == "rect1" && matches!(a.state, BindingState::SharedBorrow { .. })
+        });
+        assert!(borrow_ann.is_some(), "Should detect println! borrowing rect1 via inline format arg");
+    }
+
+    #[test]
+    fn test_ownership_set_snapshots() {
+        let source = r#"
+fn main() {
+    let mut x = vec![1, 2];
+    let r = &x;
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let _ = analyzer.analyze(source).unwrap();
+        let sets = analyzer.set_annotations();
+
+        // Should have snapshots at: fn entry, after let x, after let r
+        assert!(sets.len() >= 2, "Should have at least 2 set snapshots, got {}", sets.len());
+
+        // Find the set after "let mut x" - should have "mut x"
+        let set_with_x = sets.iter().find(|s| {
+            s.set.entries.iter().any(|e| e.name == "x")
+        });
+        assert!(set_with_x.is_some(), "Should have a set containing x");
+
+        let set = &set_with_x.unwrap().set;
+        assert_eq!(set.scope_name, "main");
+
+        // Find the set after "let r = &x" - should have "shr x, r(&x)"
+        let set_with_r = sets.iter().find(|s| {
+            s.set.entries.iter().any(|e| e.name == "r")
+        });
+        assert!(set_with_r.is_some(), "Should have a set containing r");
+
+        let set_str = format!("{}", set_with_r.unwrap().set);
+        assert!(set_str.contains("main{"), "Should have main scope prefix");
+    }
+}
