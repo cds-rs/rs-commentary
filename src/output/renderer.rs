@@ -3,9 +3,14 @@
 //! Provides a trait-based system for different output styles,
 //! making it easy to experiment with new visualizations.
 
-use crate::analysis::{OwnershipAnalyzer, OwnershipSet, SetAnnotation, SetEntry, SetEntryState};
+use crate::analysis::{
+    DiagnosticSeverity, OwnershipAnalyzer, OwnershipSet, RaDiagnostic, SemanticAnalyzer,
+    SemanticResult, SetAnnotation, SetEntry, SetEntryState,
+};
 use crate::util::{ChangeType, StateTimeline};
+use ra_ap_syntax::TextSize;
 use std::collections::HashMap;
+use std::path::Path;
 
 /// Renderer output category - determines syntactic validity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +42,14 @@ pub enum RenderStyle {
     // ─────────────────────────────────────────────────────────────────────
     /// Rustc-style diagnostic format with line numbers and underlines
     Diagnostic,
+    /// Set notation: `main{mut x, r(&x)}` - matches tutorial style
+    SetNotation,
+    /// Vertical borrow spans with box-drawing brackets
+    VerticalSpans,
+    /// Interactive HTML with Aquascope-inspired features
+    Html,
+    /// Validated output with rust-analyzer errors integrated
+    Validated,
 }
 
 impl RenderStyle {
@@ -46,6 +59,10 @@ impl RenderStyle {
             "columnar" | "columns" => Some(Self::Columnar),
             "grouped" | "transitions" => Some(Self::Grouped),
             "diagnostic" | "diag" | "rustc" => Some(Self::Diagnostic),
+            "set" | "set-notation" | "sets" => Some(Self::SetNotation),
+            "vertical" | "spans" | "vertical-spans" => Some(Self::VerticalSpans),
+            "html" => Some(Self::Html),
+            "validated" | "semantic" | "ra" => Some(Self::Validated),
             _ => None,
         }
     }
@@ -56,7 +73,11 @@ impl RenderStyle {
             // Valid Rust - can be compiled
             Self::Inline | Self::Columnar | Self::Grouped => RenderCategory::ValidRust,
             // Rich text - more typographical freedom
-            Self::Diagnostic => RenderCategory::RichText,
+            Self::Diagnostic
+            | Self::SetNotation
+            | Self::VerticalSpans
+            | Self::Html
+            | Self::Validated => RenderCategory::RichText,
         }
     }
 
@@ -65,12 +86,21 @@ impl RenderStyle {
         self.category() == RenderCategory::ValidRust
     }
 
+    /// Returns true if this style requires semantic analysis (rust-analyzer).
+    pub fn requires_semantic(&self) -> bool {
+        matches!(self, Self::Validated)
+    }
+
     pub fn all() -> &'static [(&'static str, &'static str, RenderCategory)] {
         &[
             ("inline", "Comments at end of line", RenderCategory::ValidRust),
             ("columnar", "Fixed columns with NLL transitions", RenderCategory::ValidRust),
             ("grouped", "Horizontal rules with blank lines", RenderCategory::ValidRust),
             ("diagnostic", "Rustc-style with line numbers and underlines", RenderCategory::RichText),
+            ("set-notation", "Set notation: main{mut x, r(&x)}", RenderCategory::RichText),
+            ("vertical-spans", "Vertical borrow spans with brackets", RenderCategory::RichText),
+            ("html", "Interactive HTML visualization", RenderCategory::RichText),
+            ("validated", "Ownership state + rust-analyzer errors", RenderCategory::RichText),
         ]
     }
 }
@@ -520,6 +550,737 @@ impl RichTextRenderer for DiagnosticRenderer {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SetNotation Renderer - matches tutorial style: main{mut x, r(&x)}
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Set notation renderer - displays ownership sets like `main{mut x, r(&x)}`.
+///
+/// Matches the notation used in NOTES/rules.md for teaching ownership concepts.
+pub struct SetNotationRenderer;
+
+impl RichTextRenderer for SetNotationRenderer {
+    fn render(&self, ctx: &mut RenderContext) -> String {
+        let mut output = String::new();
+        let mut current_scope = String::from("main");
+        let set_col = ctx.config.comment_column;
+
+        for (line_num, line) in ctx.lines.iter().enumerate() {
+            let line_num = line_num as u32;
+
+            // Detect function declarations to update scope name
+            if let Some(fn_name) = extract_function_name(line) {
+                current_scope = fn_name;
+            }
+
+            // Check for NLL drops before this line
+            let pending_drops = ctx.timeline.get_pending_drops(line_num);
+            if !pending_drops.is_empty() && !line.trim().is_empty() {
+                // Show the restored state after drops
+                if let Some(set) = ctx.sets_by_line.get(&line_num) {
+                    let entries = ctx.filter_entries(set);
+                    let drop_names: Vec<&str> =
+                        pending_drops.iter().map(|d| d.name.as_str()).collect();
+                    let set_str = format_set_notation(&current_scope, &entries, &drop_names);
+                    let drop_note: Vec<String> =
+                        pending_drops.iter().map(|d| format!("{}†", d.name)).collect();
+                    let padding = " ".repeat(set_col);
+                    output.push_str(&format!(
+                        "{}// {} ← {} (NLL)\n",
+                        padding,
+                        set_str,
+                        drop_note.join(", ")
+                    ));
+                }
+                for drop in &pending_drops {
+                    ctx.timeline.mark_drop_shown(&drop.name);
+                }
+            }
+
+            output.push_str(line);
+
+            // Add set notation comment
+            if let Some(set) = ctx.sets_by_line.get(&line_num) {
+                let entries = ctx.filter_entries(set);
+                let set_str = format_set_notation(&current_scope, &entries, &[]);
+                let padding = pad_to_column(line.len(), set_col);
+                output.push_str(&" ".repeat(padding));
+                output.push_str(&format!("// {}", set_str));
+            } else if line.trim().is_empty() || line.trim().starts_with("//") {
+                // Keep empty/comment lines as-is
+            } else if line.trim() == "}" {
+                // Scope end
+                let padding = pad_to_column(line.len(), set_col);
+                output.push_str(&" ".repeat(padding));
+                output.push_str(&format!("// {}{{}}", current_scope));
+            }
+
+            output.push('\n');
+        }
+
+        output
+    }
+}
+
+/// Format entries as set notation: `scope{mut x, r(&y)}`
+fn format_set_notation(scope: &str, entries: &[&SetEntry], exclude: &[&str]) -> String {
+    let parts: Vec<String> = entries
+        .iter()
+        .filter(|e| !exclude.contains(&e.name.as_str()))
+        .filter(|e| !matches!(e.state, SetEntryState::Dropped))
+        .map(|e| format_set_entry(e))
+        .collect();
+
+    if parts.is_empty() {
+        format!("{}{{}}", scope)
+    } else {
+        format!("{}{{{}}}", scope, parts.join(", "))
+    }
+}
+
+/// Format a single entry for set notation.
+fn format_set_entry(entry: &SetEntry) -> String {
+    match &entry.state {
+        SetEntryState::Owned => {
+            if entry.mutable {
+                format!("mut {}", entry.name)
+            } else {
+                entry.name.clone()
+            }
+        }
+        SetEntryState::Shared => format!("shr {}", entry.name),
+        SetEntryState::Frozen => format!("frz {}", entry.name),
+        SetEntryState::SharedBorrow => {
+            if let Some(from) = &entry.borrows_from {
+                format!("{}(&{})", entry.name, from)
+            } else {
+                format!("{}(&?)", entry.name)
+            }
+        }
+        SetEntryState::MutBorrow => {
+            if let Some(from) = &entry.borrows_from {
+                format!("{}(&mut {})", entry.name, from)
+            } else {
+                format!("{}(&mut ?)", entry.name)
+            }
+        }
+        SetEntryState::Dropped => format!("{}†", entry.name),
+    }
+}
+
+/// Extract function name from a line like `fn foo() {` or `fn bar(x: i32) -> bool {`
+fn extract_function_name(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("fn ") {
+        return None;
+    }
+    let after_fn = &trimmed[3..];
+    let name_end = after_fn.find(|c: char| c == '(' || c == '<' || c.is_whitespace())?;
+    Some(after_fn[..name_end].to_string())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VerticalSpans Renderer - shows borrow lifetimes with vertical brackets
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Vertical spans renderer - shows borrow extents with box-drawing characters.
+///
+/// ```text
+///     let mut x = vec![1, 2];         x ●●●
+///                                       ╭─── r
+///     let r = &x;                     x ●●○ │  r ○●○
+///     println!("{}", r);              x ●●○ │  r ○●○
+///                                       ╰─── r†
+///     x.push(3);                      x ●●●
+/// ```
+pub struct VerticalSpansRenderer;
+
+impl RichTextRenderer for VerticalSpansRenderer {
+    fn render(&self, ctx: &mut RenderContext) -> String {
+        // Track active borrows and their start lines
+        let mut active_borrows: Vec<ActiveBorrow> = Vec::new();
+        let mut output = String::new();
+        let state_col = ctx.config.comment_column;
+
+        for (line_num, line) in ctx.lines.iter().enumerate() {
+            let line_num = line_num as u32;
+
+            // Check for borrows that end before this line (NLL drops)
+            let pending_drops = ctx.timeline.get_pending_drops(line_num);
+            // Filter to only borrows that are currently active
+            let ending_borrows: Vec<String> = pending_drops
+                .iter()
+                .filter(|d| active_borrows.iter().any(|ab| ab.name == d.name))
+                .map(|d| d.name.clone())
+                .collect();
+
+            // Render borrow-end line if needed
+            if !ending_borrows.is_empty() && !line.trim().is_empty() {
+                let padding = " ".repeat(state_col);
+                for borrow_name in &ending_borrows {
+                    if let Some(pos) = active_borrows.iter().position(|b| &b.name == borrow_name) {
+                        let ab = &active_borrows[pos];
+                        output.push_str(&format!(
+                            "{}  {}╰─── {}†\n",
+                            padding,
+                            " ".repeat(ab.column * 5),
+                            borrow_name
+                        ));
+                        active_borrows.remove(pos);
+                    }
+                }
+                for drop in &pending_drops {
+                    ctx.timeline.mark_drop_shown(&drop.name);
+                }
+            }
+
+            // Check for new borrows on this line
+            let changes = ctx.timeline.get_changes(line_num);
+            let new_borrows: Vec<&crate::util::StateChange> = changes
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        c.state,
+                        SetEntryState::SharedBorrow | SetEntryState::MutBorrow
+                    )
+                })
+                .collect();
+
+            // Render borrow-start line if needed
+            for new_borrow in &new_borrows {
+                let col = active_borrows.len();
+                let padding = " ".repeat(state_col);
+                output.push_str(&format!(
+                    "{}  {}╭─── {}\n",
+                    padding,
+                    " ".repeat(col * 5),
+                    new_borrow.name
+                ));
+                active_borrows.push(ActiveBorrow {
+                    name: new_borrow.name.clone(),
+                    column: col,
+                });
+            }
+
+            // Render source line with state
+            output.push_str(line);
+
+            if let Some(set) = ctx.sets_by_line.get(&line_num) {
+                let entries = ctx.filter_entries(set);
+                if !entries.is_empty() {
+                    let state_str = format_vertical_state(&entries);
+                    let spans_str = format_active_spans(&active_borrows);
+                    let padding = pad_to_column(line.len(), state_col);
+                    output.push_str(&" ".repeat(padding));
+                    output.push_str(&state_str);
+                    if !spans_str.is_empty() {
+                        output.push_str(&spans_str);
+                    }
+                }
+            }
+
+            output.push('\n');
+        }
+
+        // Final drops at scope end
+        if let Some(last_state) = ctx
+            .timeline
+            .get(ctx.lines.len().saturating_sub(1) as u32)
+        {
+            let final_drops: Vec<&String> = last_state
+                .live
+                .iter()
+                .filter(|v| !ctx.timeline.is_drop_shown(v))
+                .collect();
+            if !final_drops.is_empty() {
+                let padding = " ".repeat(state_col);
+                for var in final_drops {
+                    output.push_str(&format!("{}{} †\n", padding, var));
+                }
+            }
+        }
+
+        output
+    }
+}
+
+struct ActiveBorrow {
+    name: String,
+    column: usize,
+}
+
+fn format_vertical_state(entries: &[&SetEntry]) -> String {
+    entries
+        .iter()
+        .filter(|e| !matches!(e.state, SetEntryState::Dropped))
+        .map(|e| format!("{} {}", e.name, format_capability_dots(e)))
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+fn format_active_spans(borrows: &[ActiveBorrow]) -> String {
+    if borrows.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("  ");
+    for (i, _) in borrows.iter().enumerate() {
+        if i > 0 {
+            s.push_str("    ");
+        }
+        s.push('│');
+    }
+    s
+}
+
+fn format_capability_dots(entry: &SetEntry) -> &'static str {
+    match &entry.state {
+        SetEntryState::Owned => {
+            if entry.mutable {
+                "●●●"
+            } else {
+                "●●○"
+            }
+        }
+        SetEntryState::Shared => "●●○",
+        SetEntryState::Frozen => "●○○",
+        SetEntryState::SharedBorrow => "○●○",
+        SetEntryState::MutBorrow => "○●●",
+        SetEntryState::Dropped => "───",
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HTML Renderer - interactive visualization inspired by Aquascope
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// HTML renderer - produces interactive HTML visualization.
+///
+/// Inspired by Aquascope, this renderer generates standalone HTML with:
+/// - Syntax-highlighted source code
+/// - Hover tooltips showing ownership state
+/// - Visual indicators for borrows and moves
+/// - Color-coded capability indicators
+pub struct HtmlRenderer;
+
+impl RichTextRenderer for HtmlRenderer {
+    fn render(&self, ctx: &mut RenderContext) -> String {
+        let mut lines_html = String::new();
+
+        for (line_num, line) in ctx.lines.iter().enumerate() {
+            let line_num = line_num as u32;
+            let escaped_line = html_escape(line);
+
+            // Get state for this line
+            let state_html = if let Some(set) = ctx.sets_by_line.get(&line_num) {
+                let entries = ctx.filter_entries(set);
+                format_html_state(&entries)
+            } else {
+                String::new()
+            };
+
+            // Get any drops for this line
+            let drops = ctx.timeline.get_pending_drops(line_num);
+            let drops_html = if !drops.is_empty() {
+                let drop_spans: Vec<String> = drops
+                    .iter()
+                    .map(|d| {
+                        format!(
+                            r#"<span class="drop" title="{} dropped (NLL)">{}†</span>"#,
+                            d.name, d.name
+                        )
+                    })
+                    .collect();
+                format!(r#"<div class="nll-drop">{}</div>"#, drop_spans.join(" "))
+            } else {
+                String::new()
+            };
+
+            lines_html.push_str(&format!(
+                r#"<div class="line" data-line="{}">
+  <span class="line-num">{}</span>
+  <code class="source">{}</code>
+  <span class="state">{}</span>
+  {}
+</div>
+"#,
+                line_num + 1,
+                line_num + 1,
+                escaped_line,
+                state_html,
+                drops_html
+            ));
+        }
+
+        format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Ownership Visualization</title>
+  <style>
+{CSS_STYLES}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="code-view">
+{lines_html}
+    </div>
+    <div class="legend">
+      <h3>Legend</h3>
+      <div class="legend-item"><span class="dot owned-mut"></span> Owned (mutable)</div>
+      <div class="legend-item"><span class="dot owned"></span> Owned (immutable)</div>
+      <div class="legend-item"><span class="dot shared"></span> Shared / Frozen</div>
+      <div class="legend-item"><span class="dot borrow"></span> Borrow active</div>
+      <div class="legend-item"><span class="dot dropped"></span> Dropped</div>
+    </div>
+  </div>
+  <script>
+{JS_SCRIPT}
+  </script>
+</body>
+</html>"#,
+            lines_html = lines_html,
+            CSS_STYLES = CSS_STYLES,
+            JS_SCRIPT = JS_SCRIPT
+        )
+    }
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn format_html_state(entries: &[&SetEntry]) -> String {
+    entries
+        .iter()
+        .filter(|e| !matches!(e.state, SetEntryState::Dropped))
+        .map(|e| {
+            let (class, title) = match &e.state {
+                SetEntryState::Owned => {
+                    if e.mutable {
+                        ("owned-mut", "Owned (mutable) - full access")
+                    } else {
+                        ("owned", "Owned (immutable) - read only")
+                    }
+                }
+                SetEntryState::Shared => ("shared", "Shared - read only while borrowed"),
+                SetEntryState::Frozen => ("frozen", "Frozen - no access while &mut active"),
+                SetEntryState::SharedBorrow => ("borrow", "Shared borrow (&T)"),
+                SetEntryState::MutBorrow => ("borrow-mut", "Mutable borrow (&mut T)"),
+                SetEntryState::Dropped => ("dropped", "Dropped"),
+            };
+            let borrow_info = if let Some(from) = &e.borrows_from {
+                format!(" (from {})", from)
+            } else {
+                String::new()
+            };
+            format!(
+                r#"<span class="var {}" title="{}{}">{} {}</span>"#,
+                class,
+                title,
+                borrow_info,
+                e.name,
+                format_capability_dots(e)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+const CSS_STYLES: &str = r#"
+    :root {
+      --bg: #1e1e2e;
+      --fg: #cdd6f4;
+      --line-num: #6c7086;
+      --owned-mut: #a6e3a1;
+      --owned: #94e2d5;
+      --shared: #f9e2af;
+      --frozen: #fab387;
+      --borrow: #89b4fa;
+      --borrow-mut: #cba6f7;
+      --dropped: #f38ba8;
+    }
+    body {
+      background: var(--bg);
+      color: var(--fg);
+      font-family: 'JetBrains Mono', 'Fira Code', monospace;
+      margin: 0;
+      padding: 20px;
+    }
+    .container {
+      display: flex;
+      gap: 40px;
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    .code-view {
+      flex: 1;
+      background: #181825;
+      border-radius: 8px;
+      padding: 16px;
+      overflow-x: auto;
+    }
+    .line {
+      display: flex;
+      align-items: baseline;
+      gap: 16px;
+      padding: 2px 0;
+      min-height: 1.5em;
+    }
+    .line:hover {
+      background: rgba(255,255,255,0.05);
+    }
+    .line-num {
+      color: var(--line-num);
+      min-width: 2em;
+      text-align: right;
+      user-select: none;
+    }
+    .source {
+      flex: 1;
+      white-space: pre;
+    }
+    .state {
+      display: flex;
+      gap: 12px;
+      font-size: 0.9em;
+    }
+    .var {
+      padding: 2px 6px;
+      border-radius: 4px;
+      cursor: help;
+    }
+    .var.owned-mut { background: rgba(166,227,161,0.2); color: var(--owned-mut); }
+    .var.owned { background: rgba(148,226,213,0.2); color: var(--owned); }
+    .var.shared { background: rgba(249,226,175,0.2); color: var(--shared); }
+    .var.frozen { background: rgba(250,179,135,0.2); color: var(--frozen); }
+    .var.borrow { background: rgba(137,180,250,0.2); color: var(--borrow); }
+    .var.borrow-mut { background: rgba(203,166,247,0.2); color: var(--borrow-mut); }
+    .nll-drop {
+      margin-left: 8px;
+    }
+    .drop {
+      color: var(--dropped);
+      font-size: 0.85em;
+      cursor: help;
+    }
+    .legend {
+      background: #181825;
+      border-radius: 8px;
+      padding: 16px;
+      min-width: 200px;
+    }
+    .legend h3 {
+      margin: 0 0 12px 0;
+      font-size: 1em;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 0;
+      font-size: 0.9em;
+    }
+    .dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+    }
+    .dot.owned-mut { background: var(--owned-mut); }
+    .dot.owned { background: var(--owned); }
+    .dot.shared { background: var(--shared); }
+    .dot.borrow { background: var(--borrow); }
+    .dot.dropped { background: var(--dropped); }
+"#;
+
+const JS_SCRIPT: &str = r#"
+    // Add interactivity - highlight related variables on hover
+    document.querySelectorAll('.var').forEach(el => {
+      el.addEventListener('mouseenter', () => {
+        const varName = el.textContent.split(' ')[0];
+        document.querySelectorAll('.var').forEach(other => {
+          if (other.textContent.startsWith(varName + ' ')) {
+            other.style.outline = '2px solid currentColor';
+          }
+        });
+      });
+      el.addEventListener('mouseleave', () => {
+        document.querySelectorAll('.var').forEach(other => {
+          other.style.outline = 'none';
+        });
+      });
+    });
+"#;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Validated Renderer - combines ownership state with rust-analyzer diagnostics
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Validated renderer - shows ownership state alongside rust-analyzer errors.
+///
+/// This renderer uses rust-analyzer's semantic analysis to show actual compiler
+/// errors inline with ownership state annotations. Invalid Rust is clearly marked.
+pub struct ValidatedRenderer;
+
+/// Context for validated rendering - includes diagnostics.
+pub struct ValidatedRenderContext<'a> {
+    pub base: RenderContext<'a>,
+    pub diagnostics: Vec<RaDiagnostic>,
+    /// Maps line numbers to diagnostics on that line.
+    pub diags_by_line: HashMap<u32, Vec<&'a RaDiagnostic>>,
+}
+
+impl<'a> ValidatedRenderContext<'a> {
+    pub fn new(
+        base: RenderContext<'a>,
+        diagnostics: &'a [RaDiagnostic],
+        source: &str,
+    ) -> Self {
+        // Map diagnostics to line numbers
+        let mut diags_by_line: HashMap<u32, Vec<&RaDiagnostic>> = HashMap::new();
+        for diag in diagnostics {
+            let line = offset_to_line(source, diag.range.start());
+            diags_by_line.entry(line).or_default().push(diag);
+        }
+
+        Self {
+            base,
+            diagnostics: diagnostics.to_vec(),
+            diags_by_line,
+        }
+    }
+}
+
+/// Convert a byte offset to a line number (0-indexed).
+fn offset_to_line(source: &str, offset: TextSize) -> u32 {
+    let offset = u32::from(offset) as usize;
+    source[..offset.min(source.len())]
+        .chars()
+        .filter(|&c| c == '\n')
+        .count() as u32
+}
+
+impl ValidatedRenderer {
+    pub fn render(ctx: &mut ValidatedRenderContext) -> String {
+        let mut output = String::new();
+        let line_num_width = ctx.base.lines.len().to_string().len().max(2);
+        let mut current_scope = String::from("main");
+
+        // Header showing analysis status
+        let error_count = ctx
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == DiagnosticSeverity::Error)
+            .count();
+        let warning_count = ctx
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == DiagnosticSeverity::Warning)
+            .count();
+
+        if error_count > 0 || warning_count > 0 {
+            output.push_str(&format!(
+                "╭─ rust-analyzer: {} error(s), {} warning(s)\n│\n",
+                error_count, warning_count
+            ));
+        } else {
+            output.push_str("╭─ rust-analyzer: ✓ no errors\n│\n");
+        }
+
+        for (line_num, line) in ctx.base.lines.iter().enumerate() {
+            let line_num_u32 = line_num as u32;
+            let display_num = line_num + 1;
+
+            // Detect function declarations
+            if let Some(fn_name) = extract_function_name(line) {
+                current_scope = fn_name;
+            }
+
+            // Check for NLL drops
+            let pending_drops = ctx.base.timeline.get_pending_drops(line_num_u32);
+            if !pending_drops.is_empty() && !line.trim().is_empty() {
+                let drop_names: Vec<String> =
+                    pending_drops.iter().map(|d| format!("{}†", d.name)).collect();
+                output.push_str(&format!(
+                    "{:>width$} │   ↳ {} (NLL drop)\n",
+                    "",
+                    drop_names.join(", "),
+                    width = line_num_width
+                ));
+                for drop in &pending_drops {
+                    ctx.base.timeline.mark_drop_shown(&drop.name);
+                }
+            }
+
+            // Print source line
+            output.push_str(&format!(
+                "{:>width$} │ {}\n",
+                display_num,
+                line,
+                width = line_num_width
+            ));
+
+            // Show ownership state
+            if let Some(set) = ctx.base.sets_by_line.get(&line_num_u32) {
+                let entries = ctx.base.filter_entries(set);
+                if !entries.is_empty() {
+                    let set_str = format_set_notation(&current_scope, &entries, &[]);
+                    output.push_str(&format!(
+                        "{:>width$} │   └─ {}\n",
+                        "",
+                        set_str,
+                        width = line_num_width
+                    ));
+                }
+            }
+
+            // Show diagnostics for this line
+            if let Some(diags) = ctx.diags_by_line.get(&line_num_u32) {
+                for diag in diags {
+                    let severity_icon = match diag.severity {
+                        DiagnosticSeverity::Error => "✗",
+                        DiagnosticSeverity::Warning => "⚠",
+                        DiagnosticSeverity::Info => "ℹ",
+                        DiagnosticSeverity::Hint => "•",
+                    };
+                    let severity_label = match diag.severity {
+                        DiagnosticSeverity::Error => "error",
+                        DiagnosticSeverity::Warning => "warning",
+                        DiagnosticSeverity::Info => "info",
+                        DiagnosticSeverity::Hint => "hint",
+                    };
+                    output.push_str(&format!(
+                        "{:>width$} │   {} {}: {}\n",
+                        "",
+                        severity_icon,
+                        severity_label,
+                        diag.message,
+                        width = line_num_width
+                    ));
+                    if !diag.code.is_empty() {
+                        output.push_str(&format!(
+                            "{:>width$} │     ╰─ [{}]\n",
+                            "",
+                            diag.code,
+                            width = line_num_width
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Footer
+        output.push_str(&format!("{:>width$} │\n", "", width = line_num_width));
+        output.push_str(&format!("{:>width$} ╰─\n", "", width = line_num_width));
+
+        output
+    }
+}
+
 /// Find the position of a variable name in a line of code.
 /// Prioritizes declaration patterns over usage.
 fn find_var_position(line: &str, var_name: &str) -> Option<usize> {
@@ -709,6 +1470,9 @@ fn format_entries_compact(entries: &[&SetEntry], timeline: &StateTimeline) -> St
 ///
 /// Returns annotated source code. Check `style.category()` to determine
 /// whether the output is valid Rust or rich text.
+///
+/// Note: For `RenderStyle::Validated`, use `render_source_semantic` instead
+/// which provides rust-analyzer diagnostics.
 pub fn render_source(source: &str, style: RenderStyle, config: RenderConfig) -> String {
     let mut analyzer = OwnershipAnalyzer::new();
 
@@ -726,5 +1490,69 @@ pub fn render_source(source: &str, style: RenderStyle, config: RenderConfig) -> 
         RenderStyle::Grouped => ValidRustRenderer::render(&GroupedRenderer, &mut ctx),
         // RichTextRenderer implementations
         RenderStyle::Diagnostic => RichTextRenderer::render(&DiagnosticRenderer, &mut ctx),
+        RenderStyle::SetNotation => RichTextRenderer::render(&SetNotationRenderer, &mut ctx),
+        RenderStyle::VerticalSpans => RichTextRenderer::render(&VerticalSpansRenderer, &mut ctx),
+        RenderStyle::Html => RichTextRenderer::render(&HtmlRenderer, &mut ctx),
+        // Validated requires semantic analysis - fallback to SetNotation
+        RenderStyle::Validated => {
+            // Without file path, we can't load rust-analyzer
+            // Fall back to SetNotation with a warning
+            let mut output = String::from(
+                "╭─ rust-analyzer: ⚠ semantic analysis requires file path\n│  use render_source_semantic() instead\n│\n",
+            );
+            output.push_str(&RichTextRenderer::render(&SetNotationRenderer, &mut ctx));
+            output
+        }
     }
+}
+
+/// Render source with semantic analysis from rust-analyzer.
+///
+/// This loads the cargo workspace and provides actual compiler diagnostics
+/// alongside ownership state annotations.
+///
+/// Returns `None` if the file is not part of a cargo project or loading fails.
+pub fn render_source_semantic(
+    file_path: &Path,
+    source: &str,
+    style: RenderStyle,
+    config: RenderConfig,
+) -> Option<String> {
+    // Load semantic analysis
+    let analyzer = match SemanticAnalyzer::load(file_path) {
+        SemanticResult::Available(a) => a,
+        SemanticResult::NotCargoProject => return None,
+        SemanticResult::LoadFailed => return None,
+    };
+
+    let file_id = analyzer.file_id(file_path)?;
+    let diagnostics = analyzer.diagnostics(file_id);
+
+    // Run ownership analysis
+    let mut ownership_analyzer = OwnershipAnalyzer::new();
+    let Ok(_) = ownership_analyzer.analyze(source) else {
+        return None;
+    };
+
+    let set_annotations = ownership_analyzer.set_annotations();
+    let base_ctx = RenderContext::new(source, set_annotations, config);
+
+    // For Validated style, use the special renderer
+    if matches!(style, RenderStyle::Validated) {
+        let mut validated_ctx = ValidatedRenderContext::new(base_ctx, &diagnostics, source);
+        return Some(ValidatedRenderer::render(&mut validated_ctx));
+    }
+
+    // For other styles, just use the regular renderer
+    let mut ctx = RenderContext::new(source, ownership_analyzer.set_annotations(), RenderConfig::default());
+    Some(match style {
+        RenderStyle::Inline => ValidRustRenderer::render(&InlineRenderer, &mut ctx),
+        RenderStyle::Columnar => ValidRustRenderer::render(&ColumnarRenderer, &mut ctx),
+        RenderStyle::Grouped => ValidRustRenderer::render(&GroupedRenderer, &mut ctx),
+        RenderStyle::Diagnostic => RichTextRenderer::render(&DiagnosticRenderer, &mut ctx),
+        RenderStyle::SetNotation => RichTextRenderer::render(&SetNotationRenderer, &mut ctx),
+        RenderStyle::VerticalSpans => RichTextRenderer::render(&VerticalSpansRenderer, &mut ctx),
+        RenderStyle::Html => RichTextRenderer::render(&HtmlRenderer, &mut ctx),
+        RenderStyle::Validated => unreachable!(),
+    })
 }

@@ -1,7 +1,8 @@
 use anyhow::Result;
-use rs_commentary::output::{render_source, RenderConfig, RenderStyle};
+use rs_commentary::output::{render_source, render_source_semantic, RenderConfig, RenderStyle};
 use std::env;
 use std::fs;
+use std::path::Path;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 fn main() -> Result<()> {
@@ -14,20 +15,37 @@ fn main() -> Result<()> {
                 let style = parse_style_arg(&args).unwrap_or(RenderStyle::Diagnostic);
 
                 let is_flag = |s: &str| s.starts_with('-');
-                let source = if args.len() >= 3 && !is_flag(&args[2]) {
-                    fs::read_to_string(&args[2])?
+                let (source, file_path) = if args.len() >= 3 && !is_flag(&args[2]) {
+                    (fs::read_to_string(&args[2])?, Some(args[2].clone()))
                 } else if args.len() == 2 || args[2..].iter().all(|s| is_flag(s)) {
                     use std::io::Read;
                     let mut source = String::new();
                     std::io::stdin().read_to_string(&mut source)?;
-                    source
+                    (source, None)
                 } else {
                     eprintln!("Usage: rs-commentary annotate [file.rs] [--style <STYLE>]");
                     std::process::exit(1);
                 };
 
                 let config = RenderConfig::new().with_filter_copy(!no_filter);
-                print!("{}", render_source(&source, style, config));
+
+                // Use semantic analysis for Validated style when file path is available
+                let output = if style.requires_semantic() {
+                    if let Some(ref path) = file_path {
+                        render_source_semantic(Path::new(path), &source, style, config.clone())
+                            .unwrap_or_else(|| {
+                                eprintln!("Warning: semantic analysis failed, falling back to AST-only");
+                                render_source(&source, style, config)
+                            })
+                    } else {
+                        eprintln!("Warning: semantic analysis requires file path, falling back to AST-only");
+                        render_source(&source, style, config)
+                    }
+                } else {
+                    render_source(&source, style, config)
+                };
+
+                print!("{}", output);
                 return Ok(());
             }
             "help" | "-h" | "--help" => {
@@ -78,15 +96,22 @@ OPTIONS:
     -s, --style <STYLE>    Output style (default: diagnostic)
     --all                  Show all variables (include Copy types)
 
-STYLES:
-    diagnostic  Rustc-style with line numbers and underlines (default)
+STYLES (valid Rust output):
     inline      Comments at end of each line
     columnar    Fixed columns per variable
     grouped     Horizontal rules between state changes
 
+STYLES (rich text):
+    diagnostic  Rustc-style with line numbers and underlines (default)
+    set-notation  Tutorial-style: main{{mut x, r(&x)}}
+    vertical-spans  Box-drawing brackets showing borrow lifetimes
+    html        Interactive HTML visualization
+    validated   Ownership state + rust-analyzer errors (requires cargo project)
+
 EXAMPLES:
     rs-commentary annotate src/main.rs
     rs-commentary annotate src/main.rs --style=inline
+    rs-commentary annotate src/main.rs --style=validated
     cat file.rs | rs-commentary annotate --style grouped
 
 NOTATION:

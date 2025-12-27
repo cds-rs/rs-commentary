@@ -9,5 +9,6 @@ mod renderer;
 pub use hover::format_hover;
 pub use inlay_hints::format_inlay_hints;
 pub use renderer::{
-    render_source, RenderCategory, RenderConfig, RenderStyle, RichTextRenderer, ValidRustRenderer,
+    render_source, render_source_semantic, RenderCategory, RenderConfig, RenderStyle,
+    RichTextRenderer, ValidRustRenderer,
 };

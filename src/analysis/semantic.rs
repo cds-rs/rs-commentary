@@ -7,12 +7,40 @@
 
 use crate::analysis::state::{Annotation, BindingState};
 use anyhow::{Context, Result};
-use ra_ap_ide::{AnalysisHost, FileId, HoverConfig, HoverDocFormat, FileRange, SubstTyLen};
+use ra_ap_ide::{
+    AnalysisHost, AssistResolveStrategy, DiagnosticsConfig, FileId, FileRange, HoverConfig,
+    HoverDocFormat, SubstTyLen,
+};
 use ra_ap_load_cargo::{load_workspace_at, LoadCargoConfig, ProcMacroServerChoice};
 use ra_ap_project_model::CargoConfig;
-use ra_ap_syntax::{ast::{self, HasModuleItem, HasName}, AstNode, SourceFile, TextRange, TextSize};
+use ra_ap_syntax::{
+    ast::{self, HasModuleItem, HasName},
+    AstNode, SourceFile, TextRange, TextSize,
+};
 use ra_ap_vfs::Vfs;
 use std::path::{Path, PathBuf};
+
+/// A diagnostic from rust-analyzer.
+#[derive(Debug, Clone)]
+pub struct RaDiagnostic {
+    /// The error/warning message.
+    pub message: String,
+    /// The source range this applies to.
+    pub range: TextRange,
+    /// Severity level.
+    pub severity: DiagnosticSeverity,
+    /// The diagnostic code (e.g., "E0382" for use after move).
+    pub code: String,
+}
+
+/// Diagnostic severity levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticSeverity {
+    Error,
+    Warning,
+    Info,
+    Hint,
+}
 
 /// Result of attempting to load semantic analysis.
 pub enum SemanticResult {
@@ -133,6 +161,38 @@ impl SemanticAnalyzer {
 
         let hover = analysis.hover(&hover_config, range).ok()??;
         Some(hover.info.markup.as_str().to_string())
+    }
+
+    /// Get rust-analyzer diagnostics for a file.
+    ///
+    /// Returns borrow checker errors, type mismatches, and other semantic errors.
+    pub fn diagnostics(&self, file_id: FileId) -> Vec<RaDiagnostic> {
+        let analysis = self.host.analysis();
+
+        // Use the test_sample config which has sensible defaults
+        let config = DiagnosticsConfig::test_sample();
+
+        let Ok(diags) = analysis.full_diagnostics(&config, AssistResolveStrategy::None, file_id) else {
+            return Vec::new();
+        };
+
+        diags
+            .into_iter()
+            .map(|d| {
+                let severity = match d.severity {
+                    ra_ap_ide::Severity::Error => DiagnosticSeverity::Error,
+                    ra_ap_ide::Severity::Warning => DiagnosticSeverity::Warning,
+                    ra_ap_ide::Severity::WeakWarning => DiagnosticSeverity::Info,
+                    _ => DiagnosticSeverity::Hint,
+                };
+                RaDiagnostic {
+                    message: d.message,
+                    range: d.range.range,
+                    severity,
+                    code: d.code.as_str().to_string(),
+                }
+            })
+            .collect()
     }
 
     /// Analyze a file with full semantic info.
