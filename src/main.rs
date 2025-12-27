@@ -52,6 +52,10 @@ fn main() -> Result<()> {
                 print_help();
                 return Ok(());
             }
+            "version" | "-V" | "--version" => {
+                print_version();
+                return Ok(());
+            }
             _ => {
                 eprintln!("Unknown command: {}", args[1]);
                 print_help();
@@ -83,9 +87,17 @@ fn parse_style_arg(args: &[String]) -> Option<RenderStyle> {
     None
 }
 
+fn print_version() {
+    println!(
+        "rs-commentary {} (rust-analyzer {})",
+        env!("CARGO_PKG_VERSION"),
+        "0.0.266"
+    );
+}
+
 fn print_help() {
     eprintln!(
-        r#"rs-commentary - Rust ownership state visualizer
+        "rs-commentary {} - Rust ownership state visualizer
 
 USAGE:
     rs-commentary                     Start LSP server
@@ -93,6 +105,7 @@ USAGE:
 
 OPTIONS:
     -h, --help             Show this help
+    -V, --version          Show version info
     -s, --style <STYLE>    Output style (default: diagnostic)
     --all                  Show all variables (include Copy types)
 
@@ -118,6 +131,7 @@ NOTATION:
     ●●●  Owned mutable (O+R+W)     ○●○  Shared borrow (R only)
     ●●○  Owned immutable (O+R)     ○●●  Mutable borrow (R+W)
     ●○○  Frozen by &mut (O only)   var† Variable dropped
-"#
+",
+        env!("CARGO_PKG_VERSION")
     );
 }
