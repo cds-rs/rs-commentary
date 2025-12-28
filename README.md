@@ -63,6 +63,11 @@ cat file.rs | rs-commentary annotate
 rs-commentary annotate file.rs --style=inline
 rs-commentary annotate file.rs --style=columnar
 rs-commentary annotate file.rs --style=grouped
+rs-commentary annotate file.rs --style=html
+
+# Serve HTML visualization in browser
+rs-commentary annotate file.rs --style=html --serve
+rs-commentary annotate file.rs --style=html --serve --port 3000
 
 # Include Copy types (normally filtered)
 rs-commentary annotate file.rs --all
@@ -74,25 +79,38 @@ rs-commentary annotate file.rs --all
 
 ### Output Styles
 
-- **diagnostic** (default): Rustc-style with line numbers and underlines
-- **inline**: Comments at end of each line
-- **columnar**: Fixed columns per variable with NLL transitions
-- **grouped**: Horizontal rules between state changes
+| Style | Description | Valid Rust? |
+|-------|-------------|-------------|
+| `diagnostic` | Rustc-style with line numbers and underlines (default) | No |
+| `inline` | Comments at end of each line | Yes |
+| `columnar` | Fixed columns per variable | Yes |
+| `grouped` | Horizontal rules between changes | Yes |
+| `set-notation` | Tutorial-style: `main{mut x, r(&x)}` | No |
+| `vertical-spans` | Box-drawing brackets for borrow lifetimes | No |
+| `html` | Interactive browser visualization | N/A |
+| `validated` | Ownership state + rust-analyzer errors | No |
+
+"Valid Rust" styles can be compiled - annotations are in `//` comments.
 
 ## Features
 
-- **CLI annotation**: Multiple output styles (diagnostic, inline, columnar, grouped)
+- **CLI annotation**: Multiple output styles (diagnostic, inline, columnar, html, etc.)
+- **HTML visualization**: Interactive browser view with `--serve`
 - **LSP server**: Inlay hints and hover documentation
-- **NLL-style drops**: Tracks when variables are dropped at last use
-- **Macro support**: Tracks borrows in `println!`, `format!`, etc. (including inline format args like `{x:#?}`)
+- **NLL-aware drops**: Tracks when variables are dropped at last use (via rust-analyzer)
+- **Accurate Copy detection**: Uses rust-analyzer's type system
+- **Macro support**: Tracks borrows in `println!`, `format!`, etc.
 - **State transitions**: Shows when ownership state changes (borrowed, frozen, moved)
 
 ## Runs alongside rust-analyzer
 
 rs-commentary complements rust-analyzer. Both can run simultaneously - rust-analyzer provides completions, diagnostics, and go-to-definition, while rs-commentary adds ownership visualization.
 
+## Requirements
+
+- Files must be part of a Cargo project (uses rust-analyzer for analysis)
+
 ## Limitations
 
-- Uses heuristics for Copy/non-Copy detection (not 100% accurate)
 - Single-file analysis only (no cross-function tracking)
 - Best suited for learning, not production diagnostics
