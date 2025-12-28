@@ -218,6 +218,14 @@ impl<'a> RenderContext<'a> {
             })
             .collect()
     }
+
+    /// Set semantic last-use data for accurate NLL drop detection.
+    ///
+    /// Takes a map from variable name to the line where it was last used.
+    /// When set, this overrides heuristic drop detection.
+    pub fn set_semantic_last_uses(&mut self, last_uses: std::collections::HashMap<String, u32>) {
+        self.timeline.set_semantic_last_uses(last_uses);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -395,7 +403,6 @@ impl RichTextRenderer for DiagnosticRenderer {
     fn render(&self, ctx: &mut RenderContext) -> String {
         let mut output = String::new();
         let line_num_width = ctx.lines.len().to_string().len().max(2);
-        let mut prev_line: Option<&str> = None;
 
         // Header
         output.push_str(&format!("{:>width$} ╭─\n", "", width = line_num_width));
@@ -403,37 +410,6 @@ impl RichTextRenderer for DiagnosticRenderer {
         for (line_num, line) in ctx.lines.iter().enumerate() {
             let line_num_u32 = line_num as u32;
             let display_num = line_num + 1;
-
-            // Get pending drops from timeline (shown before the line)
-            let pending_drops = ctx.timeline.get_pending_drops(line_num_u32);
-
-            // Show NLL drop annotation pointing to where var appeared on PREVIOUS line
-            if !pending_drops.is_empty() && !line.trim().is_empty() {
-                if let Some(prev) = prev_line {
-                    for drop in &pending_drops {
-                        if let Some(pos) = find_var_position(prev, &drop.name) {
-                            // Build a line with ^ at the variable position
-                            let max_pos = prev.chars().count();
-                            let mut marker_chars: Vec<char> = vec![' '; max_pos];
-                            let var_len = drop.name.chars().count();
-                            for i in 0..var_len {
-                                if pos + i < marker_chars.len() {
-                                    marker_chars[pos + i] = '^';
-                                }
-                            }
-                            let marker: String = marker_chars.iter().collect();
-                            output.push_str(&format!(
-                                "{:>width$} │ {} note: `{}` dropped (last use)\n",
-                                "",
-                                marker.trim_end(),
-                                drop.name,
-                                width = line_num_width
-                            ));
-                        }
-                        ctx.timeline.mark_drop_shown(&drop.name);
-                    }
-                }
-            }
 
             // Print the source line with line number
             output.push_str(&format!(
@@ -446,27 +422,31 @@ impl RichTextRenderer for DiagnosticRenderer {
             // Get state changes from timeline
             let changes = ctx.timeline.get_changes(line_num_u32);
 
-            // Collect annotations for this line
-            let mut annotations: Vec<(String, usize, String)> = Vec::new(); // (var_name, position, label)
+            // Get pending drops for the NEXT line (drops happen after this line)
+            let pending_drops = ctx.timeline.get_pending_drops(line_num_u32 + 1);
+
+            // Collect annotations for this line: (var_name, position, label, has_drop)
+            let mut annotations: Vec<(String, usize, String, bool)> = Vec::new();
 
             for change in &changes {
-                // Find position of variable in the line
                 if let Some(pos) = find_var_position(line, &change.name) {
                     let label = format_change_label(change);
-                    annotations.push((change.name.clone(), pos, label));
+                    // Check if this variable has a pending drop
+                    let has_drop = pending_drops.iter().any(|d| d.name == change.name);
+                    annotations.push((change.name.clone(), pos, label, has_drop));
                 }
             }
 
             // Render underline annotations
             if !annotations.is_empty() {
                 // Sort by position (rightmost first for rendering order)
-                annotations.sort_by_key(|(_, pos, _)| std::cmp::Reverse(*pos));
+                annotations.sort_by_key(|(_, pos, _, _)| std::cmp::Reverse(*pos));
 
                 // Build underline line with ─ under each variable
                 let max_pos = line.chars().count();
                 let mut underline_chars: Vec<char> = vec![' '; max_pos];
 
-                for (name, pos, _) in &annotations {
+                for (name, pos, _, _) in &annotations {
                     let var_len = name.chars().count();
                     for i in 0..var_len {
                         if pos + i < underline_chars.len() {
@@ -484,16 +464,16 @@ impl RichTextRenderer for DiagnosticRenderer {
                 ));
 
                 // Print labels from right to left
-                // For all but the last (leftmost), we need to show | connectors
-                for (idx, (name, pos, label)) in annotations.iter().enumerate() {
+                // For each variable: show its state, then its drop note if applicable
+                for (idx, (name, pos, label, has_drop)) in annotations.iter().enumerate() {
                     let is_last = idx == annotations.len() - 1;
 
-                    // Build the connector line
+                    // Build the connector line for the state annotation
                     let mut connector_chars: Vec<char> = vec![' '; max_pos];
 
-                    // Add | for all annotations to the left of this one (which are later in the sorted list)
+                    // Add | for all annotations to the left of this one
                     if !is_last {
-                        for (_, other_pos, _) in annotations.iter().skip(idx + 1) {
+                        for (_, other_pos, _, _) in annotations.iter().skip(idx + 1) {
                             if *other_pos < connector_chars.len() {
                                 connector_chars[*other_pos] = '|';
                             }
@@ -508,6 +488,7 @@ impl RichTextRenderer for DiagnosticRenderer {
                     let connector: String = connector_chars.iter().collect();
                     let connector_trimmed = connector.trim_end();
 
+                    // Print the state annotation
                     output.push_str(&format!(
                         "{:>width$} │ {}─ {}: {}\n",
                         "",
@@ -516,10 +497,94 @@ impl RichTextRenderer for DiagnosticRenderer {
                         label,
                         width = line_num_width
                     ));
+
+                    // If this variable has a drop, print it on the next line
+                    if *has_drop {
+                        // Build connector for drop note (same position, but use └─ for drop)
+                        let mut drop_connector_chars: Vec<char> = vec![' '; max_pos];
+
+                        // Add | for annotations to the left
+                        if !is_last {
+                            for (_, other_pos, _, _) in annotations.iter().skip(idx + 1) {
+                                if *other_pos < drop_connector_chars.len() {
+                                    drop_connector_chars[*other_pos] = '|';
+                                }
+                            }
+                        }
+
+                        // Add └─ at current position for the drop
+                        if *pos < drop_connector_chars.len() {
+                            drop_connector_chars[*pos] = '└';
+                        }
+
+                        let drop_connector: String = drop_connector_chars.iter().collect();
+                        let drop_connector_trimmed = drop_connector.trim_end();
+
+                        output.push_str(&format!(
+                            "{:>width$} │ {}─ note: `{}` dropped (last use)\n",
+                            "",
+                            drop_connector_trimmed,
+                            name,
+                            width = line_num_width
+                        ));
+
+                        ctx.timeline.mark_drop_shown(name);
+                    }
+
+                    // Add blank connector line between variables (except after the last one)
+                    if !is_last {
+                        let mut blank_connector_chars: Vec<char> = vec![' '; max_pos];
+                        for (_, other_pos, _, _) in annotations.iter().skip(idx + 1) {
+                            if *other_pos < blank_connector_chars.len() {
+                                blank_connector_chars[*other_pos] = '|';
+                            }
+                        }
+                        let blank_connector: String = blank_connector_chars.iter().collect();
+                        let blank_trimmed = blank_connector.trim_end();
+                        if !blank_trimmed.is_empty() {
+                            output.push_str(&format!(
+                                "{:>width$} │ {}\n",
+                                "",
+                                blank_trimmed,
+                                width = line_num_width
+                            ));
+                        }
+                    }
                 }
             }
 
-            prev_line = Some(line);
+            // Handle drops for variables not annotated on this line
+            // (e.g., variables that appear but don't have state changes)
+            let mut had_standalone_drops = false;
+            for drop in &pending_drops {
+                if !ctx.timeline.is_drop_shown(&drop.name) {
+                    if let Some(pos) = find_var_position(line, &drop.name) {
+                        let max_pos = line.chars().count();
+                        let mut marker_chars: Vec<char> = vec![' '; max_pos];
+                        let var_len = drop.name.chars().count();
+                        for i in 0..var_len {
+                            if pos + i < marker_chars.len() {
+                                marker_chars[pos + i] = '^';
+                            }
+                        }
+                        let marker: String = marker_chars.iter().collect();
+                        output.push_str(&format!(
+                            "{:>width$} │ {} note: `{}` dropped (last use)\n",
+                            "",
+                            marker.trim_end(),
+                            drop.name,
+                            width = line_num_width
+                        ));
+                        ctx.timeline.mark_drop_shown(&drop.name);
+                        had_standalone_drops = true;
+                    }
+                }
+            }
+
+            // Add blank line after annotation block for readability
+            if !annotations.is_empty() || had_standalone_drops {
+                output.push_str(&format!("{:>width$} │\n", "", width = line_num_width));
+            }
         }
 
         // Footer with final drops
@@ -1509,7 +1574,8 @@ pub fn render_source(source: &str, style: RenderStyle, config: RenderConfig) -> 
 /// Render source with semantic analysis from rust-analyzer.
 ///
 /// This loads the cargo workspace and provides actual compiler diagnostics
-/// alongside ownership state annotations.
+/// alongside ownership state annotations. Uses accurate NLL drop detection
+/// based on rust-analyzer's reference analysis.
 ///
 /// Returns `None` if the file is not part of a cargo project or loading fails.
 pub fn render_source_semantic(
@@ -1528,6 +1594,14 @@ pub fn render_source_semantic(
     let file_id = analyzer.file_id(file_path)?;
     let diagnostics = analyzer.diagnostics(file_id);
 
+    // Get semantic last-use data for accurate NLL drops
+    // Uses drop_line which accounts for loop boundaries
+    let last_uses = analyzer.find_all_last_uses(file_id, source);
+    let semantic_drops: std::collections::HashMap<String, u32> = last_uses
+        .values()
+        .map(|info| (info.name.clone(), info.drop_line))
+        .collect();
+
     // Run ownership analysis
     let mut ownership_analyzer = OwnershipAnalyzer::new();
     let Ok(_) = ownership_analyzer.analyze(source) else {
@@ -1535,7 +1609,8 @@ pub fn render_source_semantic(
     };
 
     let set_annotations = ownership_analyzer.set_annotations();
-    let base_ctx = RenderContext::new(source, set_annotations, config);
+    let mut base_ctx = RenderContext::new(source, set_annotations, config.clone());
+    base_ctx.set_semantic_last_uses(semantic_drops.clone());
 
     // For Validated style, use the special renderer
     if matches!(style, RenderStyle::Validated) {
@@ -1543,8 +1618,10 @@ pub fn render_source_semantic(
         return Some(ValidatedRenderer::render(&mut validated_ctx));
     }
 
-    // For other styles, just use the regular renderer
-    let mut ctx = RenderContext::new(source, ownership_analyzer.set_annotations(), RenderConfig::default());
+    // For other styles, use the regular renderer with semantic drops
+    let mut ctx = RenderContext::new(source, ownership_analyzer.set_annotations(), config);
+    ctx.set_semantic_last_uses(semantic_drops);
+
     Some(match style {
         RenderStyle::Inline => ValidRustRenderer::render(&InlineRenderer, &mut ctx),
         RenderStyle::Columnar => ValidRustRenderer::render(&ColumnarRenderer, &mut ctx),

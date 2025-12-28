@@ -98,18 +98,15 @@ fn main() -> Result<()> {
 
             let config = RenderConfig::new().with_filter_copy(!all);
 
-            let output = if render_style.requires_semantic() {
-                if let Some(ref path) = file_path {
-                    render_source_semantic(path, &source, render_style, config.clone())
-                        .unwrap_or_else(|| {
-                            eprintln!("Warning: semantic analysis failed, falling back to AST-only");
-                            render_source(&source, render_style, config)
-                        })
-                } else {
-                    eprintln!("Warning: semantic analysis requires file path, falling back to AST-only");
-                    render_source(&source, render_style, config)
-                }
+            // Try semantic analysis first for accurate NLL drop detection
+            let output = if let Some(ref path) = file_path {
+                render_source_semantic(path, &source, render_style, config.clone())
+                    .unwrap_or_else(|| {
+                        // Fall back to AST-only analysis
+                        render_source(&source, render_style, config)
+                    })
             } else {
+                // No file path - use AST-only analysis
                 render_source(&source, render_style, config)
             };
 

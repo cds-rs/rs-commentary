@@ -8,16 +8,17 @@
 use crate::analysis::state::{Annotation, BindingState};
 use anyhow::{Context, Result};
 use ra_ap_ide::{
-    AnalysisHost, AssistResolveStrategy, DiagnosticsConfig, FileId, FileRange, HoverConfig,
-    HoverDocFormat, SubstTyLen,
+    AnalysisHost, AssistResolveStrategy, DiagnosticsConfig, FileId, FilePosition, FileRange,
+    HoverConfig, HoverDocFormat, SubstTyLen,
 };
 use ra_ap_load_cargo::{load_workspace_at, LoadCargoConfig, ProcMacroServerChoice};
 use ra_ap_project_model::CargoConfig;
 use ra_ap_syntax::{
-    ast::{self, HasModuleItem, HasName},
+    ast::{self, HasLoopBody, HasModuleItem, HasName},
     AstNode, SourceFile, TextRange, TextSize,
 };
 use ra_ap_vfs::Vfs;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// A diagnostic from rust-analyzer.
@@ -50,6 +51,23 @@ pub enum SemanticResult {
     NotCargoProject,
     /// Failed to load (error logged)
     LoadFailed,
+}
+
+/// Information about the last use of a binding.
+#[derive(Debug, Clone)]
+pub struct LastUseInfo {
+    /// The binding name.
+    pub name: String,
+    /// Line where the binding was declared (0-indexed).
+    pub decl_line: u32,
+    /// Line where the binding was last used (0-indexed).
+    pub last_use_line: u32,
+    /// Offset where the binding was last used.
+    pub last_use_offset: TextSize,
+    /// Line where the drop annotation should appear (0-indexed).
+    /// This may differ from last_use_line when the last use is inside a loop
+    /// but the variable is declared outside the loop.
+    pub drop_line: u32,
 }
 
 /// Semantic analyzer backed by rust-analyzer.
@@ -195,6 +213,253 @@ impl SemanticAnalyzer {
             .collect()
     }
 
+    /// Find the last use of a binding in a file.
+    ///
+    /// Given the offset where a binding is declared, finds all references
+    /// and returns the offset of the last use (for NLL drop detection).
+    pub fn find_last_use(&self, file_id: FileId, binding_offset: TextSize) -> Option<TextSize> {
+        let analysis = self.host.analysis();
+
+        let position = FilePosition {
+            file_id,
+            offset: binding_offset,
+        };
+
+        // Search everywhere - we filter by file_id in results
+        let refs = analysis.find_all_refs(position, None).ok()??;
+
+        // Find the reference with the maximum end offset (last use) in this file
+        refs.iter()
+            .flat_map(|result| {
+                result
+                    .references
+                    .iter()
+                    .filter(|(fid, _)| **fid == file_id)
+                    .flat_map(|(_, ranges)| ranges.iter().map(|(range, _)| range.end()))
+            })
+            .max()
+    }
+
+    /// Find last uses for all bindings in a file.
+    ///
+    /// Returns a map from binding declaration offset to last use offset.
+    /// This is more efficient than calling find_last_use for each binding.
+    pub fn find_all_last_uses(
+        &self,
+        file_id: FileId,
+        source: &str,
+    ) -> HashMap<TextSize, LastUseInfo> {
+        let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
+        let file = parse.tree();
+        let mut result = HashMap::new();
+
+        // First, collect all loop boundaries (start_line, end_line)
+        let mut loop_ranges: Vec<(u32, u32)> = Vec::new();
+        for item in file.items() {
+            collect_loop_ranges(&item, source, &mut loop_ranges);
+        }
+
+        // Walk AST to find all let bindings and parameters
+        for item in file.items() {
+            self.collect_bindings_last_uses(&item, file_id, source, &loop_ranges, &mut result);
+        }
+
+        result
+    }
+
+    fn collect_bindings_last_uses(
+        &self,
+        item: &ast::Item,
+        file_id: FileId,
+        source: &str,
+        loop_ranges: &[(u32, u32)],
+        result: &mut HashMap<TextSize, LastUseInfo>,
+    ) {
+        match item {
+            ast::Item::Fn(f) => {
+                // Collect parameter bindings
+                if let Some(param_list) = f.param_list() {
+                    for param in param_list.params() {
+                        if let Some(pat) = param.pat() {
+                            self.collect_pat_last_uses(&pat, file_id, source, loop_ranges, result);
+                        }
+                    }
+                }
+                // Collect bindings in body
+                if let Some(body) = f.body() {
+                    self.collect_block_last_uses(&body, file_id, source, loop_ranges, result);
+                }
+            }
+            ast::Item::Impl(i) => {
+                if let Some(items) = i.assoc_item_list() {
+                    for item in items.assoc_items() {
+                        if let ast::AssocItem::Fn(f) = item {
+                            self.collect_bindings_last_uses(
+                                &ast::Item::Fn(f),
+                                file_id,
+                                source,
+                                loop_ranges,
+                                result,
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_block_last_uses(
+        &self,
+        block: &ast::BlockExpr,
+        file_id: FileId,
+        source: &str,
+        loop_ranges: &[(u32, u32)],
+        result: &mut HashMap<TextSize, LastUseInfo>,
+    ) {
+        for stmt in block.statements() {
+            match &stmt {
+                ast::Stmt::LetStmt(let_stmt) => {
+                    if let Some(pat) = let_stmt.pat() {
+                        self.collect_pat_last_uses(&pat, file_id, source, loop_ranges, result);
+                    }
+                }
+                ast::Stmt::ExprStmt(expr_stmt) => {
+                    if let Some(expr) = expr_stmt.expr() {
+                        self.collect_expr_last_uses(&expr, file_id, source, loop_ranges, result);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(tail) = block.tail_expr() {
+            self.collect_expr_last_uses(&tail, file_id, source, loop_ranges, result);
+        }
+    }
+
+    fn collect_expr_last_uses(
+        &self,
+        expr: &ast::Expr,
+        file_id: FileId,
+        source: &str,
+        loop_ranges: &[(u32, u32)],
+        result: &mut HashMap<TextSize, LastUseInfo>,
+    ) {
+        match expr {
+            ast::Expr::BlockExpr(block) => {
+                self.collect_block_last_uses(block, file_id, source, loop_ranges, result);
+            }
+            ast::Expr::IfExpr(if_expr) => {
+                if let Some(then_branch) = if_expr.then_branch() {
+                    self.collect_block_last_uses(&then_branch, file_id, source, loop_ranges, result);
+                }
+                if let Some(else_branch) = if_expr.else_branch() {
+                    match else_branch {
+                        ast::ElseBranch::Block(block) => {
+                            self.collect_block_last_uses(&block, file_id, source, loop_ranges, result);
+                        }
+                        ast::ElseBranch::IfExpr(nested) => {
+                            self.collect_expr_last_uses(
+                                &ast::Expr::IfExpr(nested),
+                                file_id,
+                                source,
+                                loop_ranges,
+                                result,
+                            );
+                        }
+                    }
+                }
+            }
+            ast::Expr::LoopExpr(loop_expr) => {
+                if let Some(body) = loop_expr.loop_body() {
+                    self.collect_block_last_uses(&body, file_id, source, loop_ranges, result);
+                }
+            }
+            ast::Expr::WhileExpr(while_expr) => {
+                if let Some(body) = while_expr.loop_body() {
+                    self.collect_block_last_uses(&body, file_id, source, loop_ranges, result);
+                }
+            }
+            ast::Expr::ForExpr(for_expr) => {
+                if let Some(pat) = for_expr.pat() {
+                    self.collect_pat_last_uses(&pat, file_id, source, loop_ranges, result);
+                }
+                if let Some(body) = for_expr.loop_body() {
+                    self.collect_block_last_uses(&body, file_id, source, loop_ranges, result);
+                }
+            }
+            ast::Expr::MatchExpr(match_expr) => {
+                if let Some(arm_list) = match_expr.match_arm_list() {
+                    for arm in arm_list.arms() {
+                        if let Some(pat) = arm.pat() {
+                            self.collect_pat_last_uses(&pat, file_id, source, loop_ranges, result);
+                        }
+                        if let Some(expr) = arm.expr() {
+                            self.collect_expr_last_uses(&expr, file_id, source, loop_ranges, result);
+                        }
+                    }
+                }
+            }
+            ast::Expr::ClosureExpr(closure) => {
+                if let Some(param_list) = closure.param_list() {
+                    for param in param_list.params() {
+                        if let Some(pat) = param.pat() {
+                            self.collect_pat_last_uses(&pat, file_id, source, loop_ranges, result);
+                        }
+                    }
+                }
+                if let Some(body) = closure.body() {
+                    self.collect_expr_last_uses(&body, file_id, source, loop_ranges, result);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_pat_last_uses(
+        &self,
+        pat: &ast::Pat,
+        file_id: FileId,
+        source: &str,
+        loop_ranges: &[(u32, u32)],
+        result: &mut HashMap<TextSize, LastUseInfo>,
+    ) {
+        match pat {
+            ast::Pat::IdentPat(ident) => {
+                if let Some(name) = ident.name() {
+                    let offset = name.syntax().text_range().start();
+                    let name_str = name.text().to_string();
+
+                    if let Some(last_use_offset) = self.find_last_use(file_id, offset) {
+                        let last_use_line = offset_to_line(source, last_use_offset);
+                        let decl_line = offset_to_line(source, offset);
+
+                        // Compute drop_line: if last use is in a loop but decl is outside,
+                        // the drop should be after the loop ends
+                        let drop_line = compute_drop_line(decl_line, last_use_line, loop_ranges);
+
+                        result.insert(
+                            offset,
+                            LastUseInfo {
+                                name: name_str,
+                                decl_line,
+                                last_use_line,
+                                last_use_offset,
+                                drop_line,
+                            },
+                        );
+                    }
+                }
+            }
+            ast::Pat::TuplePat(tuple) => {
+                for field in tuple.fields() {
+                    self.collect_pat_last_uses(&field, file_id, source, loop_ranges, result);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Analyze a file with full semantic info.
     pub fn analyze(&self, file_path: &Path, source: &str) -> Result<Vec<Annotation>> {
         let file_id = self.file_id(file_path)
@@ -292,6 +557,146 @@ fn is_primitive_in_hover(text: &str) -> bool {
                  "u8", "u16", "u32", "u64", "u128", "usize",
                  "f32", "f64", "bool", "char"];
     prims.iter().any(|p| text.contains(p))
+}
+
+/// Convert a byte offset to a line number (0-indexed).
+fn offset_to_line(source: &str, offset: TextSize) -> u32 {
+    let offset = u32::from(offset) as usize;
+    source[..offset.min(source.len())]
+        .chars()
+        .filter(|&c| c == '\n')
+        .count() as u32
+}
+
+/// Collect all loop ranges (start_line, end_line) from an AST item.
+fn collect_loop_ranges(item: &ast::Item, source: &str, ranges: &mut Vec<(u32, u32)>) {
+    match item {
+        ast::Item::Fn(f) => {
+            if let Some(body) = f.body() {
+                collect_loop_ranges_in_block(&body, source, ranges);
+            }
+        }
+        ast::Item::Impl(i) => {
+            if let Some(items) = i.assoc_item_list() {
+                for item in items.assoc_items() {
+                    if let ast::AssocItem::Fn(f) = item {
+                        collect_loop_ranges(&ast::Item::Fn(f), source, ranges);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_loop_ranges_in_block(block: &ast::BlockExpr, source: &str, ranges: &mut Vec<(u32, u32)>) {
+    for stmt in block.statements() {
+        if let ast::Stmt::ExprStmt(expr_stmt) = &stmt {
+            if let Some(expr) = expr_stmt.expr() {
+                collect_loop_ranges_in_expr(&expr, source, ranges);
+            }
+        }
+    }
+    if let Some(tail) = block.tail_expr() {
+        collect_loop_ranges_in_expr(&tail, source, ranges);
+    }
+}
+
+fn collect_loop_ranges_in_expr(expr: &ast::Expr, source: &str, ranges: &mut Vec<(u32, u32)>) {
+    match expr {
+        ast::Expr::LoopExpr(loop_expr) => {
+            let range = loop_expr.syntax().text_range();
+            let start_line = offset_to_line(source, range.start());
+            let end_line = offset_to_line(source, range.end());
+            ranges.push((start_line, end_line));
+            if let Some(body) = loop_expr.loop_body() {
+                collect_loop_ranges_in_block(&body, source, ranges);
+            }
+        }
+        ast::Expr::WhileExpr(while_expr) => {
+            let range = while_expr.syntax().text_range();
+            let start_line = offset_to_line(source, range.start());
+            let end_line = offset_to_line(source, range.end());
+            ranges.push((start_line, end_line));
+            if let Some(body) = while_expr.loop_body() {
+                collect_loop_ranges_in_block(&body, source, ranges);
+            }
+        }
+        ast::Expr::ForExpr(for_expr) => {
+            let range = for_expr.syntax().text_range();
+            let start_line = offset_to_line(source, range.start());
+            let end_line = offset_to_line(source, range.end());
+            ranges.push((start_line, end_line));
+            if let Some(body) = for_expr.loop_body() {
+                collect_loop_ranges_in_block(&body, source, ranges);
+            }
+        }
+        ast::Expr::BlockExpr(block) => {
+            collect_loop_ranges_in_block(block, source, ranges);
+        }
+        ast::Expr::IfExpr(if_expr) => {
+            if let Some(then_branch) = if_expr.then_branch() {
+                collect_loop_ranges_in_block(&then_branch, source, ranges);
+            }
+            if let Some(else_branch) = if_expr.else_branch() {
+                match else_branch {
+                    ast::ElseBranch::Block(block) => {
+                        collect_loop_ranges_in_block(&block, source, ranges);
+                    }
+                    ast::ElseBranch::IfExpr(nested) => {
+                        collect_loop_ranges_in_expr(&ast::Expr::IfExpr(nested), source, ranges);
+                    }
+                }
+            }
+        }
+        ast::Expr::MatchExpr(match_expr) => {
+            if let Some(arm_list) = match_expr.match_arm_list() {
+                for arm in arm_list.arms() {
+                    if let Some(expr) = arm.expr() {
+                        collect_loop_ranges_in_expr(&expr, source, ranges);
+                    }
+                }
+            }
+        }
+        ast::Expr::ClosureExpr(closure) => {
+            if let Some(body) = closure.body() {
+                collect_loop_ranges_in_expr(&body, source, ranges);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Compute the drop line for a variable.
+///
+/// If the last use is inside a loop but the declaration is outside,
+/// the drop should happen after the loop ends. Otherwise, drop happens
+/// after the last use.
+fn compute_drop_line(decl_line: u32, last_use_line: u32, loop_ranges: &[(u32, u32)]) -> u32 {
+    // Find the innermost loop that contains the last use but not the declaration
+    let mut best_loop_end: Option<u32> = None;
+
+    for &(loop_start, loop_end) in loop_ranges {
+        // Check if last_use is inside this loop
+        let last_use_in_loop = last_use_line >= loop_start && last_use_line <= loop_end;
+        // Check if decl is outside this loop
+        let decl_outside_loop = decl_line < loop_start;
+
+        if last_use_in_loop && decl_outside_loop {
+            // This variable's last use is in a loop it wasn't declared in
+            // Use the innermost such loop (smallest range)
+            match best_loop_end {
+                None => best_loop_end = Some(loop_end),
+                Some(current_end) if loop_end < current_end => {
+                    best_loop_end = Some(loop_end);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // If we found a loop that contains the last use but not decl, drop after the loop
+    best_loop_end.unwrap_or(last_use_line)
 }
 
 #[cfg(test)]

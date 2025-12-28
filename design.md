@@ -46,7 +46,7 @@ When borrowed, the original binding's capabilities are temporarily reduced:
 │    textDocument/inlayHint, textDocument/hover               │
 ├─────────────────────────────────────────────────────────────┤
 │  Output Layer (src/output/)                                 │
-│    Renderer trait + 4 styles                                │
+│    Renderer trait + multiple styles                         │
 │    RenderContext builds from analysis                       │
 ├─────────────────────────────────────────────────────────────┤
 │  Utilities (src/util/)                                      │
@@ -55,11 +55,14 @@ When borrowed, the original binding's capabilities are temporarily reduced:
 ├─────────────────────────────────────────────────────────────┤
 │  Analysis Engine (src/analysis/)                            │
 │    OwnershipAnalyzer - AST visitor, state tracking          │
+│    SemanticAnalyzer - rust-analyzer integration             │
+│      └─ find_all_last_uses() for NLL drop detection         │
+│      └─ Loop-aware drop line computation                    │
 │    BindingState - state machine with transitions            │
 │    SetAnnotation - per-line ownership snapshots             │
 ├─────────────────────────────────────────────────────────────┤
-│  ra_ap_syntax                                               │
-│    Rust parser from rust-analyzer                           │
+│  ra_ap_syntax / ra_ap_ide                                   │
+│    Rust parser and IDE features from rust-analyzer          │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -121,6 +124,9 @@ let drops = timeline.get_pending_drops(line_num);
 
 // Rewind for re-processing
 timeline.rewind_to(3);
+
+// Set semantic drop data from rust-analyzer
+timeline.set_semantic_last_uses(last_uses_map);
 ```
 
 Key features:
@@ -128,6 +134,7 @@ Key features:
 - Drop detection (variables in prev but not current)
 - Change detection (new vars, state transitions)
 - Scope-aware queries (don't compare across functions)
+- Semantic drop override when rust-analyzer data available
 
 ## Renderer Framework (src/output/renderer.rs)
 
@@ -156,18 +163,26 @@ pub trait Renderer {
  2 │     let mut x = String::from("hello");
    │             ─
    │             └─ x: ●●● owned mut
+   │
  3 │     let r = &x;
-   │         ─    ─
+   │         ─    ──
    │         |    └─ x: ●●○ shared (borrowed) (was owned)
+   │         |
    │         └─ r: ○●○ &x
+   │         └─ note: `r` dropped (last use)
+   │
  4 │     println!("{}", r);
-   │                    ^ note: `r` dropped (last use)
  5 │     x.push_str(" world");
    │     ─
    │     └─ x: ●●● owned mut (was shared)
+   │
  6 │ }
    ╰─
 ```
+
+Drop annotations are integrated with variable annotations, showing right-to-left
+with vertical connectors between variables. A blank line separates annotation
+blocks from the next source line.
 
 ### Adding a Renderer
 
@@ -211,9 +226,37 @@ Borrows end at last use, not scope end:
 ```rust
 let r = &x;           // r created, x shared
 println!("{}", r);    // last use of r
-                      // ^ note: `r` dropped (last use)
+                      // └─ note: `r` dropped (last use)
 x.push_str("!");      // x restored to ●●●
 ```
+
+### Semantic Drop Detection (src/analysis/semantic.rs)
+
+When analyzing files in a cargo project, rs-commentary uses rust-analyzer's
+`find_all_refs` API to find the actual last use of each binding:
+
+```rust
+// SemanticAnalyzer finds accurate last-use locations
+let last_uses = analyzer.find_all_last_uses(file_id, source);
+```
+
+This provides accurate NLL drop points instead of heuristic detection.
+
+### Loop-Aware Drops
+
+Variables declared outside a loop but last used inside should drop after the
+loop ends, not at their last textual use:
+
+```rust
+let digit_count = num.ilog10() + 1;  // declared here
+while n > 0 {
+    sum += (n % 10).pow(digit_count); // used here
+    n /= 10;
+}                                     // digit_count drops HERE, not inside loop
+```
+
+The `compute_drop_line()` function detects when a variable's last use is
+inside a loop it wasn't declared in, and moves the drop to after the loop.
 
 ## Design Principles
 
@@ -231,7 +274,7 @@ x.push_str("!");      // x restored to ●●●
 
 ## Future Directions
 
-- ra_ap_hir integration for accurate Copy detection
-- Control flow tracking through if/match
+- Control flow tracking through if/match branches
 - Struct field tracking (`x.field` moved independently)
 - Semantic tokens for color-coding by state
+- Improved Copy type detection via ra_ap_hir

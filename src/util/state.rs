@@ -41,12 +41,48 @@ pub struct StateTimeline {
     shown_dropped: HashSet<String>,
     /// Scope boundaries (function starts) for reset points.
     scope_starts: Vec<u32>,
+    /// Semantic last-use data: map from variable name to last-use line (0-indexed).
+    /// When present, this overrides heuristic drop detection.
+    semantic_last_uses: HashMap<String, u32>,
 }
 
 impl StateTimeline {
     /// Create a new empty timeline.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set semantic last-use data from rust-analyzer.
+    ///
+    /// When set, this overrides heuristic drop detection with accurate
+    /// NLL drop points based on actual last-use analysis.
+    pub fn set_semantic_last_uses(&mut self, last_uses: HashMap<String, u32>) {
+        self.semantic_last_uses = last_uses;
+    }
+
+    /// Check if semantic drop data is available.
+    pub fn has_semantic_drops(&self) -> bool {
+        !self.semantic_last_uses.is_empty()
+    }
+
+    /// Get the line where a variable should be shown as dropped.
+    ///
+    /// Uses semantic last-use data from rust-analyzer when available.
+    /// Returns `Some(line)` if the variable should be dropped after `line`,
+    /// or `None` if no semantic data is available for this variable.
+    pub fn get_semantic_drop_line(&self, name: &str) -> Option<u32> {
+        self.semantic_last_uses.get(name).copied()
+    }
+
+    /// Check if a variable should be shown as dropped at this line.
+    ///
+    /// Uses semantic data when available: drop shows on line after last use.
+    /// Returns `None` if no semantic data exists (caller should use heuristic).
+    pub fn should_show_drop_at(&self, name: &str, line_num: u32) -> Option<bool> {
+        self.semantic_last_uses.get(name).map(|&last_use_line| {
+            // Drop annotation appears on the line AFTER last use
+            last_use_line + 1 == line_num && !self.shown_dropped.contains(name)
+        })
     }
 
     /// Check if a line is a function boundary that starts a new scope.
@@ -133,7 +169,28 @@ impl StateTimeline {
     }
 
     /// Get drops that occurred before this line.
+    ///
+    /// When semantic data is available, uses accurate NLL drop points.
+    /// Otherwise falls back to heuristic state-transition detection.
     pub fn get_pending_drops(&self, line_num: u32) -> Vec<VariableDrop> {
+        let mut drops = Vec::new();
+
+        // Check semantic drops first
+        for (name, &last_use_line) in &self.semantic_last_uses {
+            if let Some(true) = self.should_show_drop_at(name, line_num) {
+                drops.push(VariableDrop {
+                    name: name.clone(),
+                    last_seen_line: last_use_line,
+                });
+            }
+        }
+
+        // If we have semantic data, use only that
+        if !self.semantic_last_uses.is_empty() {
+            return drops;
+        }
+
+        // Fallback to heuristic detection
         self.get(line_num)
             .map(|state| {
                 state

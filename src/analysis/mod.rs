@@ -21,7 +21,7 @@ pub use state::{
     Scope, SetAnnotation, SetEntry, SetEntryState, TransitionError,
 };
 pub use engine::OwnershipAnalyzer;
-pub use semantic::{DiagnosticSeverity, RaDiagnostic, SemanticAnalyzer, SemanticResult};
+pub use semantic::{DiagnosticSeverity, LastUseInfo, RaDiagnostic, SemanticAnalyzer, SemanticResult};
 pub use layers::{AstStateMachine, AstEvent, VarState, TypeOracle, CopyStatus};
 pub use composer::{LayeredAnalyzer, NoOpOracle};
 pub use oracle::{RaTypeOracle, TypeOracleQuery, HeuristicOracle};
