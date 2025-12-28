@@ -743,6 +743,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore] // Slow: loads full cargo workspace with sysroot (~60s)
     fn test_semantic_load_in_cargo_project() {
         let test_file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
         println!("Testing: {}", test_file.display());
