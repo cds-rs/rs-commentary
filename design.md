@@ -54,17 +54,27 @@ When borrowed, the original binding's capabilities are temporarily reduced:
 │    Position utilities - offset/line conversion              │
 ├─────────────────────────────────────────────────────────────┤
 │  Analysis Engine (src/analysis/)                            │
-│    OwnershipAnalyzer - AST visitor, state tracking          │
-│    SemanticAnalyzer - rust-analyzer integration             │
-│      └─ find_all_last_uses() for NLL drop detection         │
-│      └─ Loop-aware drop line computation                    │
-│    BindingState - state machine with transitions            │
-│    SetAnnotation - per-line ownership snapshots             │
+│    engine.rs - OwnershipAnalyzer, AST visitor               │
+│    semantic.rs - rust-analyzer integration                  │
+│      └─ Type::is_copy() for Copy detection                  │
+│      └─ find_all_refs() for NLL drop detection              │
+│    state.rs - BindingState machine, SetAnnotation           │
 ├─────────────────────────────────────────────────────────────┤
-│  ra_ap_syntax / ra_ap_ide                                   │
-│    Rust parser and IDE features from rust-analyzer          │
+│  ra_ap_syntax / ra_ap_ide / ra_ap_hir                       │
+│    Rust parser, IDE features, and HIR from rust-analyzer    │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### Analysis Module Structure
+
+| File | Purpose |
+|------|---------|
+| `engine.rs` | AST-based ownership analyzer, tracks state transitions |
+| `semantic.rs` | rust-analyzer integration for accurate type info |
+| `state.rs` | Core state machine types (`BindingState`, `OwnershipEvent`) |
+
+The engine assumes all types are non-Copy; the semantic layer corrects this
+using `Type::is_copy()` from rust-analyzer's HIR.
 
 ## State Machine
 
@@ -200,20 +210,25 @@ rs-commentary annotate file.rs --style=grouped
 rs-commentary annotate file.rs --all              # include Copy types
 ```
 
-## Heuristics
+## Copy Type Detection
 
-Without full type inference, we use pattern matching:
+rs-commentary uses rust-analyzer's HIR (High-level Intermediate Representation)
+for accurate Copy trait detection via `Type::is_copy()`. This requires:
 
-**Copy types** (not tracked):
-- Primitives: `i32`, `bool`, `char`, etc.
-- References: `&T`
-- Arrays of primitives: `[u32; 5]`
+1. **Cargo project**: The file must be part of a cargo workspace
+2. **Sysroot loading**: Standard library is auto-discovered for trait resolution
 
-**Non-Copy** (tracked):
-- `String::from(...)`, `String::new()`
-- `vec![...]`, `Vec::new()`
-- `.to_string()`, `.to_owned()`
-- Struct literals `Foo { ... }`
+```rust
+// SemanticAnalyzer checks if binding implements Copy
+let is_copy = sema.type_of_binding_in_pat(pat)?.is_copy(db);
+```
+
+By default, Copy types are filtered from output. Use `--all` to show them:
+
+```bash
+rs-commentary annotate file.rs         # Non-Copy types only (default)
+rs-commentary annotate file.rs --all   # Include Copy types
+```
 
 **Macro handling**:
 - `println!`, `format!`, `dbg!` etc. implicitly borrow
@@ -260,14 +275,14 @@ inside a loop it wasn't declared in, and moves the drop to after the loop.
 
 ## Design Principles
 
-1. **Show state, not rules** - Concrete examples over abstract explanations
-2. **Annotate changes** - Mark where state transitions happen
-3. **Local reasoning** - One function at a time, no cross-function analysis
-4. **Good enough** - Heuristics acceptable for educational use
+1. **Cargo projects only** - Require rust-analyzer for accurate analysis
+2. **Show state, not rules** - Concrete examples over abstract explanations
+3. **Annotate changes** - Mark where state transitions happen
+4. **Local reasoning** - One function at a time, no cross-function analysis
 
 ## Non-Goals
 
-- Perfect accuracy (heuristics have edge cases)
+- Standalone file analysis (must be in cargo project)
 - Cross-function analysis
 - Lifetime bound visualization
 - Replacing rust-analyzer
@@ -277,4 +292,3 @@ inside a loop it wasn't declared in, and moves the drop to after the loop.
 - Control flow tracking through if/match branches
 - Struct field tracking (`x.field` moved independently)
 - Semantic tokens for color-coding by state
-- Improved Copy type detection via ra_ap_hir

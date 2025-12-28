@@ -1,18 +1,19 @@
-//! Semantic analysis using rust-analyzer's ra_ap_ide.
+//! Semantic analysis using rust-analyzer's ra_ap_ide and ra_ap_hir.
 //!
 //! When a file is part of a cargo project, this provides:
 //! - Accurate type inference
 //! - Macro expansion
-//! - Copy/Drop trait detection
+//! - Copy/Drop trait detection via `Type::is_copy()`
 
 use crate::analysis::state::{Annotation, BindingState};
 use anyhow::{Context, Result};
+use ra_ap_hir::Semantics;
 use ra_ap_ide::{
     AnalysisHost, AssistResolveStrategy, DiagnosticsConfig, FileId, FilePosition, FileRange,
-    HoverConfig, HoverDocFormat, SubstTyLen,
+    HoverConfig, HoverDocFormat, RootDatabase, SubstTyLen,
 };
 use ra_ap_load_cargo::{load_workspace_at, LoadCargoConfig, ProcMacroServerChoice};
-use ra_ap_project_model::CargoConfig;
+use ra_ap_project_model::{CargoConfig, RustLibSource};
 use ra_ap_syntax::{
     ast::{self, HasLoopBody, HasModuleItem, HasName},
     AstNode, SourceFile, TextRange, TextSize,
@@ -68,6 +69,8 @@ pub struct LastUseInfo {
     /// This may differ from last_use_line when the last use is inside a loop
     /// but the variable is declared outside the loop.
     pub drop_line: u32,
+    /// Whether this binding's type implements Copy.
+    pub is_copy: bool,
 }
 
 /// Semantic analyzer backed by rust-analyzer.
@@ -86,7 +89,10 @@ impl SemanticAnalyzer {
 
         tracing::info!("Loading cargo workspace from: {}", manifest.display());
 
-        let cargo_config = CargoConfig::default();
+        // Configure to load sysroot for standard library (needed for Copy trait detection)
+        let mut cargo_config = CargoConfig::default();
+        cargo_config.sysroot = Some(RustLibSource::Discover);
+
         let load_config = LoadCargoConfig {
             load_out_dirs_from_check: false,  // Faster startup
             with_proc_macro_server: ProcMacroServerChoice::None,
@@ -123,11 +129,31 @@ impl SemanticAnalyzer {
         None
     }
 
-    /// Check if a type at a position implements Copy.
+    /// Check if a binding implements Copy using HIR.
+    ///
+    /// Uses `Type::is_copy()` for accurate trait checking.
+    /// The AST node must come from the same Semantics instance (parsed through it).
+    fn is_copy_binding_sema<'db>(
+        &self,
+        sema: &Semantics<'db, RootDatabase>,
+        pat: &ast::IdentPat,
+    ) -> Option<bool> {
+        let db = self.host.raw_database();
+        // Get the type of this binding - pat must be from sema's parsed file
+        let ty = match sema.type_of_binding_in_pat(pat) {
+            Some(t) => t,
+            None => {
+                return None;
+            }
+        };
+        Some(ty.is_copy(db))
+    }
+
+    /// Check if a type at a position implements Copy (fallback using hover).
     pub fn is_copy_at(&self, file_id: FileId, offset: TextSize) -> Option<bool> {
         let analysis = self.host.analysis();
 
-        // Use hover to get type info (simpler than full semantic query)
+        // Use hover to get type info
         let hover_config = HoverConfig {
             links_in_hover: false,
             memory_layout: None,
@@ -249,8 +275,11 @@ impl SemanticAnalyzer {
         file_id: FileId,
         source: &str,
     ) -> HashMap<TextSize, LastUseInfo> {
-        let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
-        let file = parse.tree();
+        let db = self.host.raw_database();
+        let sema = Semantics::new(db);
+
+        // Parse the file through Semantics so AST nodes are connected to the database
+        let file = sema.parse_guess_edition(file_id);
         let mut result = HashMap::new();
 
         // First, collect all loop boundaries (start_line, end_line)
@@ -261,14 +290,15 @@ impl SemanticAnalyzer {
 
         // Walk AST to find all let bindings and parameters
         for item in file.items() {
-            self.collect_bindings_last_uses(&item, file_id, source, &loop_ranges, &mut result);
+            self.collect_bindings_last_uses_with_sema(&sema, &item, file_id, source, &loop_ranges, &mut result);
         }
 
         result
     }
 
-    fn collect_bindings_last_uses(
+    fn collect_bindings_last_uses_with_sema<'db>(
         &self,
+        sema: &Semantics<'db, ra_ap_ide::RootDatabase>,
         item: &ast::Item,
         file_id: FileId,
         source: &str,
@@ -281,20 +311,21 @@ impl SemanticAnalyzer {
                 if let Some(param_list) = f.param_list() {
                     for param in param_list.params() {
                         if let Some(pat) = param.pat() {
-                            self.collect_pat_last_uses(&pat, file_id, source, loop_ranges, result);
+                            self.collect_pat_last_uses_with_sema(sema, &pat, file_id, source, loop_ranges, result);
                         }
                     }
                 }
                 // Collect bindings in body
                 if let Some(body) = f.body() {
-                    self.collect_block_last_uses(&body, file_id, source, loop_ranges, result);
+                    self.collect_block_last_uses_with_sema(sema, &body, file_id, source, loop_ranges, result);
                 }
             }
             ast::Item::Impl(i) => {
                 if let Some(items) = i.assoc_item_list() {
                     for item in items.assoc_items() {
                         if let ast::AssocItem::Fn(f) = item {
-                            self.collect_bindings_last_uses(
+                            self.collect_bindings_last_uses_with_sema(
+                                sema,
                                 &ast::Item::Fn(f),
                                 file_id,
                                 source,
@@ -309,8 +340,9 @@ impl SemanticAnalyzer {
         }
     }
 
-    fn collect_block_last_uses(
+    fn collect_block_last_uses_with_sema<'db>(
         &self,
+        sema: &Semantics<'db, ra_ap_ide::RootDatabase>,
         block: &ast::BlockExpr,
         file_id: FileId,
         source: &str,
@@ -321,24 +353,25 @@ impl SemanticAnalyzer {
             match &stmt {
                 ast::Stmt::LetStmt(let_stmt) => {
                     if let Some(pat) = let_stmt.pat() {
-                        self.collect_pat_last_uses(&pat, file_id, source, loop_ranges, result);
+                        self.collect_pat_last_uses_with_sema(sema, &pat, file_id, source, loop_ranges, result);
                     }
                 }
                 ast::Stmt::ExprStmt(expr_stmt) => {
                     if let Some(expr) = expr_stmt.expr() {
-                        self.collect_expr_last_uses(&expr, file_id, source, loop_ranges, result);
+                        self.collect_expr_last_uses_with_sema(sema, &expr, file_id, source, loop_ranges, result);
                     }
                 }
                 _ => {}
             }
         }
         if let Some(tail) = block.tail_expr() {
-            self.collect_expr_last_uses(&tail, file_id, source, loop_ranges, result);
+            self.collect_expr_last_uses_with_sema(sema, &tail, file_id, source, loop_ranges, result);
         }
     }
 
-    fn collect_expr_last_uses(
+    fn collect_expr_last_uses_with_sema<'db>(
         &self,
+        sema: &Semantics<'db, ra_ap_ide::RootDatabase>,
         expr: &ast::Expr,
         file_id: FileId,
         source: &str,
@@ -347,19 +380,20 @@ impl SemanticAnalyzer {
     ) {
         match expr {
             ast::Expr::BlockExpr(block) => {
-                self.collect_block_last_uses(block, file_id, source, loop_ranges, result);
+                self.collect_block_last_uses_with_sema(sema, block, file_id, source, loop_ranges, result);
             }
             ast::Expr::IfExpr(if_expr) => {
                 if let Some(then_branch) = if_expr.then_branch() {
-                    self.collect_block_last_uses(&then_branch, file_id, source, loop_ranges, result);
+                    self.collect_block_last_uses_with_sema(sema, &then_branch, file_id, source, loop_ranges, result);
                 }
                 if let Some(else_branch) = if_expr.else_branch() {
                     match else_branch {
                         ast::ElseBranch::Block(block) => {
-                            self.collect_block_last_uses(&block, file_id, source, loop_ranges, result);
+                            self.collect_block_last_uses_with_sema(sema, &block, file_id, source, loop_ranges, result);
                         }
                         ast::ElseBranch::IfExpr(nested) => {
-                            self.collect_expr_last_uses(
+                            self.collect_expr_last_uses_with_sema(
+                                sema,
                                 &ast::Expr::IfExpr(nested),
                                 file_id,
                                 source,
@@ -372,30 +406,30 @@ impl SemanticAnalyzer {
             }
             ast::Expr::LoopExpr(loop_expr) => {
                 if let Some(body) = loop_expr.loop_body() {
-                    self.collect_block_last_uses(&body, file_id, source, loop_ranges, result);
+                    self.collect_block_last_uses_with_sema(sema, &body, file_id, source, loop_ranges, result);
                 }
             }
             ast::Expr::WhileExpr(while_expr) => {
                 if let Some(body) = while_expr.loop_body() {
-                    self.collect_block_last_uses(&body, file_id, source, loop_ranges, result);
+                    self.collect_block_last_uses_with_sema(sema, &body, file_id, source, loop_ranges, result);
                 }
             }
             ast::Expr::ForExpr(for_expr) => {
                 if let Some(pat) = for_expr.pat() {
-                    self.collect_pat_last_uses(&pat, file_id, source, loop_ranges, result);
+                    self.collect_pat_last_uses_with_sema(sema, &pat, file_id, source, loop_ranges, result);
                 }
                 if let Some(body) = for_expr.loop_body() {
-                    self.collect_block_last_uses(&body, file_id, source, loop_ranges, result);
+                    self.collect_block_last_uses_with_sema(sema, &body, file_id, source, loop_ranges, result);
                 }
             }
             ast::Expr::MatchExpr(match_expr) => {
                 if let Some(arm_list) = match_expr.match_arm_list() {
                     for arm in arm_list.arms() {
                         if let Some(pat) = arm.pat() {
-                            self.collect_pat_last_uses(&pat, file_id, source, loop_ranges, result);
+                            self.collect_pat_last_uses_with_sema(sema, &pat, file_id, source, loop_ranges, result);
                         }
                         if let Some(expr) = arm.expr() {
-                            self.collect_expr_last_uses(&expr, file_id, source, loop_ranges, result);
+                            self.collect_expr_last_uses_with_sema(sema, &expr, file_id, source, loop_ranges, result);
                         }
                     }
                 }
@@ -404,20 +438,21 @@ impl SemanticAnalyzer {
                 if let Some(param_list) = closure.param_list() {
                     for param in param_list.params() {
                         if let Some(pat) = param.pat() {
-                            self.collect_pat_last_uses(&pat, file_id, source, loop_ranges, result);
+                            self.collect_pat_last_uses_with_sema(sema, &pat, file_id, source, loop_ranges, result);
                         }
                     }
                 }
                 if let Some(body) = closure.body() {
-                    self.collect_expr_last_uses(&body, file_id, source, loop_ranges, result);
+                    self.collect_expr_last_uses_with_sema(sema, &body, file_id, source, loop_ranges, result);
                 }
             }
             _ => {}
         }
     }
 
-    fn collect_pat_last_uses(
+    fn collect_pat_last_uses_with_sema<'db>(
         &self,
+        sema: &Semantics<'db, ra_ap_ide::RootDatabase>,
         pat: &ast::Pat,
         file_id: FileId,
         source: &str,
@@ -438,6 +473,9 @@ impl SemanticAnalyzer {
                         // the drop should be after the loop ends
                         let drop_line = compute_drop_line(decl_line, last_use_line, loop_ranges);
 
+                        // Check if this binding's type implements Copy using Semantics
+                        let is_copy = self.is_copy_binding_sema(sema, ident).unwrap_or(false);
+
                         result.insert(
                             offset,
                             LastUseInfo {
@@ -446,6 +484,7 @@ impl SemanticAnalyzer {
                                 last_use_line,
                                 last_use_offset,
                                 drop_line,
+                                is_copy,
                             },
                         );
                     }
@@ -453,7 +492,7 @@ impl SemanticAnalyzer {
             }
             ast::Pat::TuplePat(tuple) => {
                 for field in tuple.fields() {
-                    self.collect_pat_last_uses(&field, file_id, source, loop_ranges, result);
+                    self.collect_pat_last_uses_with_sema(sema, &field, file_id, source, loop_ranges, result);
                 }
             }
             _ => {}

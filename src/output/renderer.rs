@@ -145,6 +145,9 @@ pub struct RenderContext<'a> {
     pub config: RenderConfig,
     /// Pre-built timeline with all state transitions recorded.
     pub timeline: StateTimeline,
+    /// Semantic Copy type info: maps variable name to whether it implements Copy.
+    /// When set, this overrides heuristic Copy detection.
+    semantic_copy_types: HashMap<String, bool>,
 }
 
 impl<'a> RenderContext<'a> {
@@ -152,6 +155,19 @@ impl<'a> RenderContext<'a> {
         source: &'a str,
         set_annotations: &'a [SetAnnotation],
         config: RenderConfig,
+    ) -> Self {
+        Self::new_with_semantic(source, set_annotations, config, HashMap::new())
+    }
+
+    /// Create a render context with semantic Copy type information.
+    ///
+    /// The `copy_types` map contains variable names and whether they implement Copy.
+    /// This enables accurate filtering of Copy types.
+    pub fn new_with_semantic(
+        source: &'a str,
+        set_annotations: &'a [SetAnnotation],
+        config: RenderConfig,
+        copy_types: HashMap<String, bool>,
     ) -> Self {
         let lines: Vec<&str> = source.lines().collect();
 
@@ -161,13 +177,18 @@ impl<'a> RenderContext<'a> {
             sets_by_line.insert(set_ann.line, &set_ann.set);
         }
 
+        // Helper to check if a variable is Copy
+        let is_copy = |name: &str| -> bool {
+            copy_types.get(name).copied().unwrap_or(false)
+        };
+
         // Collect all variables in declaration order
         let mut all_vars: Vec<String> = Vec::new();
         for set_ann in set_annotations {
             for entry in &set_ann.set.entries {
                 if !all_vars.contains(&entry.name) {
                     // Filter Copy types if configured
-                    if config.filter_copy_types && is_likely_copy_type(&entry.name, entry) {
+                    if config.filter_copy_types && is_copy(&entry.name) {
                         continue;
                     }
                     all_vars.push(entry.name.clone());
@@ -183,7 +204,7 @@ impl<'a> RenderContext<'a> {
                     .entries
                     .iter()
                     .filter(|e| {
-                        if config.filter_copy_types && is_likely_copy_type(&e.name, e) {
+                        if config.filter_copy_types && is_copy(&e.name) {
                             return false;
                         }
                         true
@@ -203,7 +224,15 @@ impl<'a> RenderContext<'a> {
             all_vars,
             config,
             timeline,
+            semantic_copy_types: copy_types,
         }
+    }
+
+    /// Check if a variable is a Copy type.
+    ///
+    /// Uses semantic info when available, otherwise returns false (don't filter).
+    fn is_copy_type(&self, name: &str) -> bool {
+        self.semantic_copy_types.get(name).copied().unwrap_or(false)
     }
 
     /// Filter a set's entries based on config.
@@ -211,7 +240,7 @@ impl<'a> RenderContext<'a> {
         set.entries
             .iter()
             .filter(|e| {
-                if self.config.filter_copy_types && is_likely_copy_type(&e.name, e) {
+                if self.config.filter_copy_types && self.is_copy_type(&e.name) {
                     return false;
                 }
                 true
@@ -225,6 +254,14 @@ impl<'a> RenderContext<'a> {
     /// When set, this overrides heuristic drop detection.
     pub fn set_semantic_last_uses(&mut self, last_uses: std::collections::HashMap<String, u32>) {
         self.timeline.set_semantic_last_uses(last_uses);
+    }
+
+    /// Set semantic Copy type info for accurate filtering.
+    ///
+    /// Takes a map from variable name to whether it implements Copy.
+    /// When set, this overrides heuristic Copy detection.
+    pub fn set_semantic_copy_types(&mut self, copy_types: HashMap<String, bool>) {
+        self.semantic_copy_types = copy_types;
     }
 }
 
@@ -1428,12 +1465,6 @@ fn pad_to_column(current: usize, target: usize) -> usize {
     }
 }
 
-fn is_likely_copy_type(_name: &str, _entry: &SetEntry) -> bool {
-    // TODO: Implement proper type inference to detect Copy types
-    // For now, don't filter anything - show all variables
-    false
-}
-
 fn format_entry_short(entry: &SetEntry) -> String {
     match &entry.state {
         SetEntryState::Owned => {
@@ -1597,9 +1628,17 @@ pub fn render_source_semantic(
     // Get semantic last-use data for accurate NLL drops
     // Uses drop_line which accounts for loop boundaries
     let last_uses = analyzer.find_all_last_uses(file_id, source);
+
+    // Extract drop lines for NLL tracking
     let semantic_drops: std::collections::HashMap<String, u32> = last_uses
         .values()
         .map(|info| (info.name.clone(), info.drop_line))
+        .collect();
+
+    // Extract Copy type info for accurate filtering
+    let copy_types: HashMap<String, bool> = last_uses
+        .values()
+        .map(|info| (info.name.clone(), info.is_copy))
         .collect();
 
     // Run ownership analysis
@@ -1609,18 +1648,16 @@ pub fn render_source_semantic(
     };
 
     let set_annotations = ownership_analyzer.set_annotations();
-    let mut base_ctx = RenderContext::new(source, set_annotations, config.clone());
-    base_ctx.set_semantic_last_uses(semantic_drops.clone());
+
+    // Create context with semantic Copy info for accurate filtering
+    let mut ctx = RenderContext::new_with_semantic(source, set_annotations, config.clone(), copy_types.clone());
+    ctx.set_semantic_last_uses(semantic_drops.clone());
 
     // For Validated style, use the special renderer
     if matches!(style, RenderStyle::Validated) {
-        let mut validated_ctx = ValidatedRenderContext::new(base_ctx, &diagnostics, source);
+        let mut validated_ctx = ValidatedRenderContext::new(ctx, &diagnostics, source);
         return Some(ValidatedRenderer::render(&mut validated_ctx));
     }
-
-    // For other styles, use the regular renderer with semantic drops
-    let mut ctx = RenderContext::new(source, ownership_analyzer.set_annotations(), config);
-    ctx.set_semantic_last_uses(semantic_drops);
 
     Some(match style {
         RenderStyle::Inline => ValidRustRenderer::render(&InlineRenderer, &mut ctx),

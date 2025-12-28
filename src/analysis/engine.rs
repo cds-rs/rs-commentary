@@ -18,12 +18,10 @@ use std::collections::HashMap;
 /// Information about a tracked binding.
 #[derive(Debug, Clone)]
 pub struct BindingInfo {
-    pub id: BindingId,
     pub name: String,
     pub scope: ScopeId,
     pub is_mutable: bool,
-    pub is_copy: bool, // Whether the type implements Copy
-    pub declaration_range: TextRange,
+    pub is_copy: bool,
     pub current_state: BindingState,
 }
 
@@ -239,12 +237,10 @@ impl OwnershipAnalyzer {
         self.next_binding_id += 1;
 
         let info = BindingInfo {
-            id,
             name: name.clone(),
             scope: self.current_scope,
             is_mutable,
             is_copy,
-            declaration_range: range,
             current_state: BindingState::Owned { mutable: is_mutable },
         };
 
@@ -293,12 +289,10 @@ impl OwnershipAnalyzer {
             .unwrap_or_else(|| "?".to_string());
 
         let info = BindingInfo {
-            id,
             name: name.clone(),
             scope: self.current_scope,
             is_mutable,
             is_copy: true, // References are Copy
-            declaration_range: range,
             current_state: state.clone(),
         };
 
@@ -591,12 +585,10 @@ impl OwnershipAnalyzer {
 
         let is_copy = type_str.map(|t| self.is_copy_type(t)).unwrap_or(false);
         let info = BindingInfo {
-            id,
             name: name_str.clone(),
             scope: self.current_scope,
             is_mutable: ident_pat.mut_token().is_some(),
             is_copy,
-            declaration_range: range,
             current_state: state.clone(),
         };
 
@@ -709,96 +701,21 @@ impl OwnershipAnalyzer {
         }
     }
 
-    /// Check if an expression produces a non-Copy type (heuristic).
-    fn is_non_copy_expr(&self, expr: &ast::Expr) -> bool {
-        let text = expr.syntax().text().to_string();
-
-        // Known non-Copy producing macros
-        if text.starts_with("vec!")
-            || text.starts_with("format!")
-            || text.starts_with("panic!")  // Returns !, but for error handling
-            || text.starts_with("String::from")
-            || text.starts_with("String::new")
-            || text.contains(".to_string()")
-            || text.contains(".to_owned()")
-            || text.starts_with("Box::new")
-            || text.starts_with("Rc::new")
-            || text.starts_with("Arc::new")
-            || text.starts_with("Vec::new")
-            || text.starts_with("Vec::with_capacity")
-            || text.starts_with("HashMap::new")
-            || text.starts_with("HashSet::new")
-            || text.starts_with("BTreeMap::new")
-            || text.starts_with("BTreeSet::new")
-            || text.starts_with("VecDeque::new")
-            || text.starts_with("PathBuf::from")
-            || text.starts_with("PathBuf::new")
-            || text.starts_with("OsString::from")
-            || text.starts_with("CString::new")
-        {
-            return true;
-        }
-
-        // Struct literals are usually non-Copy (unless known)
-        if let ast::Expr::RecordExpr(_) = expr {
-            return true;
-        }
-
-        // Check for method calls that typically return non-Copy
-        if text.contains(".collect()")
-            || text.contains(".map(")
-            || text.contains(".filter(")
-            || text.contains(".into_iter()")
-            || text.contains(".iter().cloned()")
-            || text.contains(".clone()")
-        {
-            return true;
-        }
-
-        false
+    /// Check if an expression produces a non-Copy type.
+    ///
+    /// Assumes non-Copy by default. The semantic layer (rust-analyzer)
+    /// provides accurate Copy detection and overrides this in rendering.
+    fn is_non_copy_expr(&self, _expr: &ast::Expr) -> bool {
+        true // Assume non-Copy; semantic layer corrects this
     }
 
-    /// Check if a type string represents a Copy type (heuristic).
+    /// Check if a type string represents a Copy type.
+    ///
+    /// Only detects references as Copy (they always are).
+    /// The semantic layer provides accurate Copy detection.
     fn is_copy_type(&self, type_str: &str) -> bool {
-        let trimmed = type_str.trim();
-
-        // References are Copy
-        if trimmed.starts_with('&') {
-            return true;
-        }
-
-        // Primitives
-        let primitives = [
-            "bool", "char",
-            "i8", "i16", "i32", "i64", "i128", "isize",
-            "u8", "u16", "u32", "u64", "u128", "usize",
-            "f32", "f64",
-        ];
-        if primitives.contains(&trimmed) {
-            return true;
-        }
-
-        // Arrays of primitives like [i32; 5]
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-                let element = inner.split(';').next().unwrap_or("").trim();
-                if primitives.contains(&element) {
-                    return true;
-                }
-            }
-        }
-
-        // Tuples of Copy types
-        if trimmed.starts_with('(') && trimmed.ends_with(')') {
-            // Simple heuristic: if it looks like a tuple of primitives
-            let inner = &trimmed[1..trimmed.len() - 1];
-            return inner.split(',').all(|part| {
-                let p = part.trim();
-                primitives.contains(&p) || p.starts_with('&')
-            });
-        }
-
-        false
+        // References are always Copy
+        type_str.trim().starts_with('&')
     }
 
     fn visit_pat_with_type(&mut self, pat: &ast::Pat, is_mutable: bool, is_copy: bool) {
@@ -1600,7 +1517,9 @@ fn main() {
     }
 
     #[test]
-    fn test_copy_in_function_call() {
+    fn test_primitive_treated_as_move() {
+        // Note: Engine treats all non-reference types as non-Copy (move).
+        // Accurate Copy detection is handled by the semantic layer (rust-analyzer).
         let source = r#"
 fn take_int(x: i32) {}
 fn main() {
@@ -1611,11 +1530,11 @@ fn main() {
         let mut analyzer = OwnershipAnalyzer::new();
         let annotations = analyzer.analyze(source).unwrap();
 
-        // Find the copy annotation
-        let copy_ann = annotations.iter().find(|a| {
-            a.binding == "x" && matches!(a.state, BindingState::Copied)
+        // Engine treats i32 as moved (semantic layer will correct this)
+        let move_ann = annotations.iter().find(|a| {
+            a.binding == "x" && matches!(a.state, BindingState::Moved { .. })
         });
-        assert!(copy_ann.is_some(), "Should have a copied annotation for x");
+        assert!(move_ann.is_some(), "Engine should treat primitive as moved");
     }
 
     #[test]
