@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use rs_commentary::output::{render_source, render_source_semantic, RenderConfig, RenderStyle};
 use std::fs;
@@ -33,6 +33,14 @@ enum Commands {
         /// Show all variables including Copy types
         #[arg(long)]
         all: bool,
+
+        /// Serve HTML output via local HTTP server (only with --style=html)
+        #[arg(long)]
+        serve: bool,
+
+        /// Port for HTTP server (default: 8080)
+        #[arg(long, default_value = "8080")]
+        port: u16,
     },
 
     /// Start LSP server (default when no command given)
@@ -83,7 +91,12 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Annotate { file, style, all }) => {
+        Some(Commands::Annotate { file, style, all, serve, port }) => {
+            // Validate --serve is only used with HTML
+            if serve && style != Style::Html {
+                bail!("--serve can only be used with --style=html");
+            }
+
             let render_style: RenderStyle = style.into();
 
             let (source, file_path) = match file {
@@ -110,7 +123,11 @@ fn main() -> Result<()> {
                 render_source(&source, render_style, config)
             };
 
-            print!("{}", output);
+            if serve {
+                serve_html(&output, port)?;
+            } else {
+                print!("{}", output);
+            }
         }
 
         Some(Commands::Lsp) | None => {
@@ -124,6 +141,32 @@ fn main() -> Result<()> {
             tracing::info!("Starting rs-commentary LSP server");
             rs_commentary::lsp::run_server()?;
         }
+    }
+
+    Ok(())
+}
+
+fn serve_html(html: &str, port: u16) -> Result<()> {
+    let addr = format!("127.0.0.1:{}", port);
+    let server = tiny_http::Server::http(&addr)
+        .map_err(|e| anyhow::anyhow!("Failed to start server: {}", e))?;
+
+    let url = format!("http://{}", addr);
+    eprintln!("Serving at {} (Ctrl+C to stop)", url);
+
+    // Open browser
+    if let Err(e) = open::that(&url) {
+        eprintln!("Could not open browser: {}", e);
+    }
+
+    let html = html.to_string();
+    for request in server.incoming_requests() {
+        let response = tiny_http::Response::from_string(&html)
+            .with_header(
+                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
+                    .unwrap(),
+            );
+        let _ = request.respond(response);
     }
 
     Ok(())
