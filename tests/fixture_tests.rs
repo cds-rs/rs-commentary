@@ -7,6 +7,7 @@
 //! real, compilable Rust crates. This allows rs-commentary to analyze
 //! them with full rust-analyzer support.
 
+use rs_commentary::analysis::{SemanticAnalyzer, SemanticResult};
 use rs_commentary::output::{render_source_semantic, RenderConfig, RenderStyle};
 use std::path::PathBuf;
 
@@ -72,5 +73,37 @@ fn test_drop_removes_variable_from_subsequent_lines() {
     assert!(
         !after_drop_section.contains("●●●") || !after_drop_section.contains(">x<"),
         "x should not appear as Owned after drop(x)"
+    );
+}
+
+#[test]
+fn test_param_last_use_detection() {
+    // Verify that function parameters are correctly tracked:
+    // their last use should be in the function body, not at the declaration.
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("test-fixtures/drop_test/src/allergies.rs");
+    let source = std::fs::read_to_string(&path).expect("allergies.rs should exist");
+
+    let analyzer = match SemanticAnalyzer::load(&path) {
+        SemanticResult::Available(a) => a,
+        SemanticResult::NotCargoProject => panic!("Not a cargo project"),
+        SemanticResult::LoadFailed => panic!("Load failed"),
+    };
+
+    let file_id = analyzer.file_id(&path).expect("should get file_id");
+    let last_uses = analyzer.find_all_last_uses(file_id, &source);
+
+    // Find 'score' parameter in fn new(score: u32)
+    let score_info = last_uses.values().find(|i| i.name == "score");
+    assert!(score_info.is_some(), "Should find 'score' parameter");
+    let score = score_info.unwrap();
+
+    // score is declared on line 28 (0-indexed), used on line 30 (score as u8)
+    // last_use_line should be 30, not 28
+    assert!(
+        score.last_use_line > score.decl_line,
+        "score's last use ({}) should be after declaration ({})",
+        score.last_use_line,
+        score.decl_line
     );
 }

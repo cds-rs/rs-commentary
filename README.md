@@ -1,12 +1,14 @@
 # rs-commentary
 
-An experimental Rust ownership state visualizer. Shows O/R/W (Ownership/Read/Write) capabilities for every binding, helping you understand what the borrow checker sees.
+A Rust ownership state visualizer. Shows O/R/W (Ownership/Read/Write) capabilities for every binding, helping you understand what the borrow checker sees.
 
 ## Status
 
-Experimental and unsupported. This project is for educational purposes.
+Experimental. This project is for educational purposes and learning Rust's ownership model.
 
 ## What it does
+
+Annotates Rust code with ownership state at each line:
 
 ```
    ╭─
@@ -16,7 +18,7 @@ Experimental and unsupported. This project is for educational purposes.
    │         └─ s: ●●○ owned
  3 │     let r = &s;
    │         ─    ─
-   │         |    └─ s: ●●○ shared (borrowed) (was owned)
+   │         |    └─ s: ●●○ shared (borrowed)
    │         └─ r: ○●○ shared borrow
  4 │     println!("{}", r);
    │     ^^^^^^^^^^^^^^ note: `r` dropped (last use)
@@ -42,12 +44,11 @@ Experimental and unsupported. This project is for educational purposes.
 ## Installation
 
 ```bash
-# Install from local source
 cargo install --path .
 
 # Or build without installing
 cargo build --release
-# Binary is at target/release/rs-commentary
+# Binary at target/release/rs-commentary
 ```
 
 ## CLI Usage
@@ -65,17 +66,13 @@ rs-commentary annotate file.rs --style=columnar
 rs-commentary annotate file.rs --style=grouped
 rs-commentary annotate file.rs --style=html
 
-# Serve HTML visualization in browser
+# Interactive HTML visualization in browser
 rs-commentary annotate file.rs --style=html --serve
 rs-commentary annotate file.rs --style=html --serve --port 3000
 
-# Include Copy types (normally filtered)
+# Include Copy types (normally filtered out)
 rs-commentary annotate file.rs --all
 ```
-
-## Editor integration
-
-- [ ] TODO!
 
 ### Output Styles
 
@@ -87,30 +84,83 @@ rs-commentary annotate file.rs --all
 | `grouped` | Horizontal rules between changes | Yes |
 | `set-notation` | Tutorial-style: `main{mut x, r(&x)}` | No |
 | `vertical-spans` | Box-drawing brackets for borrow lifetimes | No |
-| `html` | Interactive browser visualization | N/A |
-| `validated` | Ownership state + rust-analyzer errors | No |
+| `html` | Interactive reveal.js slides with state panels | N/A |
+| `validated` | Ownership state + rust-analyzer diagnostics | No |
 
-"Valid Rust" styles can be compiled - annotations are in `//` comments.
+"Valid Rust" styles produce compilable output; annotations live in `//` comments.
+
+### HTML Visualization
+
+The `--style=html --serve` option launches an interactive slideshow:
+
+- Step through code line by line with arrow keys
+- Side panel shows current ownership state for all tracked variables
+- Highlights state transitions: new bindings, borrows, drops
+- Uses reveal.js for smooth navigation
+
+## LSP Server
+
+rs-commentary includes an LSP server for editor integration:
+
+```bash
+# Start LSP server (also the default when no command given)
+rs-commentary lsp
+```
+
+Provides:
+- Inlay hints showing ownership state inline
+- Hover documentation with O/R/W capabilities
+
+Configure your editor to use `rs-commentary lsp` as a language server alongside rust-analyzer.
 
 ## Features
 
-- **CLI annotation**: Multiple output styles (diagnostic, inline, columnar, html, etc.)
-- **HTML visualization**: Interactive browser view with `--serve`
-- **LSP server**: Inlay hints and hover documentation
-- **NLL-aware drops**: Tracks when variables are dropped at last use (via rust-analyzer)
-- **Accurate Copy detection**: Uses rust-analyzer's type system
-- **Macro support**: Tracks borrows in `println!`, `format!`, etc.
-- **State transitions**: Shows when ownership state changes (borrowed, frozen, moved)
+- **Multiple output styles**: Terminal, HTML slides, LSP hints
+- **NLL-aware drops**: Tracks when variables are dropped at last use via rust-analyzer
+- **Accurate Copy detection**: Uses rust-analyzer's type system to filter Copy types
+- **Macro support**: Tracks borrows in `println!`, `format!`, `vec!`, etc.
+- **State transitions**: Shows when ownership state changes (borrowed, frozen, restored)
+- **Borrow tracking**: Visualizes when borrows end and owners regain capabilities
 
-## Runs alongside rust-analyzer
+## Architecture
 
-rs-commentary complements rust-analyzer. Both can run simultaneously - rust-analyzer provides completions, diagnostics, and go-to-definition, while rs-commentary adds ownership visualization.
+```
+src/
+├── analysis/       # Ownership analysis engine
+│   ├── engine.rs   # Core state machine and AST visitor
+│   ├── semantic.rs # rust-analyzer integration for NLL drops
+│   └── state.rs    # Binding states and transitions
+├── output/         # Rendering
+│   ├── renderers/  # Each output style (html, inline, columnar, etc.)
+│   ├── context.rs  # RenderContext with StateTimeline
+│   └── lsp/        # Hover and inlay hint formatters
+├── util/
+│   └── state.rs    # StateTimeline: single source of truth for state tracking
+└── lsp/            # LSP server implementation
+```
 
 ## Requirements
 
-- Files must be part of a Cargo project (uses rust-analyzer for analysis)
+- Files should be part of a Cargo project for full semantic analysis
+- Standalone files work but without NLL drop detection or Copy type filtering
 
 ## Limitations
 
-- Single-file analysis only (no cross-function tracking)
+- Single-file analysis only; no cross-function ownership tracking
 - Best suited for learning, not production diagnostics
+- Some complex patterns (async, unsafe) may not be fully represented
+
+## Testing
+
+Integration tests use a separate fixtures workspace with real Rust code:
+
+```bash
+cargo test                           # Run all tests
+cargo test --test fixture_tests      # Run integration tests only
+```
+
+The `test-fixtures/` directory contains compilable Rust crates that exercise the full analysis pipeline including rust-analyzer semantic analysis.
+
+## Runs alongside rust-analyzer
+
+rs-commentary complements rust-analyzer. Both can run simultaneously: rust-analyzer provides completions, diagnostics, and navigation; rs-commentary adds ownership visualization.

@@ -1,75 +1,50 @@
 use anyhow::{bail, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use bpaf::Bpaf;
 use rs_commentary::output::{render_source, render_source_semantic, RenderConfig, RenderStyle};
 use std::fs;
 use std::path::PathBuf;
+use std::str::FromStr;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-/// Rust ownership state visualizer - annotates code with move/borrow/ownership state
-#[derive(Parser)]
-#[command(name = "rs-commentary")]
-#[command(version, about, long_about = None)]
-#[command(after_help = "NOTATION:
-    ●●●  Owned mutable (O+R+W)     ○●○  Shared borrow (R only)
-    ●●○  Owned immutable (O+R)     ○●●  Mutable borrow (R+W)
-    ●○○  Frozen by &mut (O only)   var† Variable dropped")]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Annotate source with ownership state
-    #[command(visible_alias = "a")]
-    Annotate {
-        /// Input file (reads from stdin if not provided)
-        file: Option<PathBuf>,
-
-        /// Output style
-        #[arg(short, long, value_enum, default_value = "diagnostic")]
-        style: Style,
-
-        /// Show all variables including Copy types
-        #[arg(long)]
-        all: bool,
-
-        /// Serve HTML output via local HTTP server (only with --style=html)
-        #[arg(long)]
-        serve: bool,
-
-        /// Port for HTTP server (default: 8080)
-        #[arg(long, default_value = "8080")]
-        port: u16,
-    },
-
-    /// Start LSP server (default when no command given)
-    Lsp,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+/// Output style for annotations
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Style {
-    // Valid Rust output
-    /// Comments at end of each line
     Inline,
-    /// Fixed columns per variable
     Columnar,
-    /// Horizontal rules between state changes
     Grouped,
-
-    // Rich text output
-    /// Rustc-style with line numbers and underlines
     Diagnostic,
-    /// Tutorial-style: main{mut x, r(&x)}
-    #[value(name = "set-notation")]
     SetNotation,
-    /// Box-drawing brackets showing borrow lifetimes
-    #[value(name = "vertical-spans")]
     VerticalSpans,
-    /// Interactive HTML visualization
     Html,
-    /// Ownership state + rust-analyzer errors
     Validated,
+}
+
+impl FromStr for Style {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "inline" => Ok(Style::Inline),
+            "columnar" => Ok(Style::Columnar),
+            "grouped" => Ok(Style::Grouped),
+            "diagnostic" => Ok(Style::Diagnostic),
+            "set-notation" => Ok(Style::SetNotation),
+            "vertical-spans" => Ok(Style::VerticalSpans),
+            "html" => Ok(Style::Html),
+            "validated" => Ok(Style::Validated),
+            _ => Err(format!(
+                "unknown style '{}'; expected: inline, columnar, grouped, diagnostic, \
+                 set-notation, vertical-spans, html, validated",
+                s
+            )),
+        }
+    }
+}
+
+impl Default for Style {
+    fn default() -> Self {
+        Style::Diagnostic
+    }
 }
 
 impl From<Style> for RenderStyle {
@@ -87,12 +62,49 @@ impl From<Style> for RenderStyle {
     }
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
+#[derive(Debug, Clone, Bpaf)]
+#[bpaf(options, version)]
+/// Rust ownership state visualizer: annotates code with move/borrow/ownership state
+///
+/// NOTATION:
+///     ●●●  Owned mutable (O+R+W)     ○●○  Shared borrow (R only)
+///     ●●○  Owned immutable (O+R)     ○●●  Mutable borrow (R+W)
+///     ●○○  Frozen by &mut (O only)   var† Variable dropped
+enum Cmd {
+    /// Annotate source with ownership state
+    #[bpaf(command)]
+    Annotate {
+        /// Output style
+        #[bpaf(short, long, argument("STYLE"), fallback(Style::default()))]
+        style: Style,
 
-    match cli.command {
-        Some(Commands::Annotate { file, style, all, serve, port }) => {
-            // Validate --serve is only used with HTML
+        /// Show all variables including Copy types
+        #[bpaf(short, long)]
+        all: bool,
+
+        /// Serve HTML output via local HTTP server (only with --style=html)
+        #[bpaf(long)]
+        serve: bool,
+
+        /// Port for HTTP server
+        #[bpaf(long, argument("PORT"), fallback(8080u16))]
+        port: u16,
+
+        /// Input file (reads from stdin if not provided)
+        #[bpaf(positional("FILE"))]
+        file: Option<PathBuf>,
+    },
+
+    /// Start LSP server
+    #[bpaf(command)]
+    Lsp,
+}
+
+fn main() -> Result<()> {
+    let cmd = cmd().run();
+
+    match cmd {
+        Cmd::Annotate { file, style, all, serve, port } => {
             if serve && style != Style::Html {
                 bail!("--serve can only be used with --style=html");
             }
@@ -109,18 +121,12 @@ fn main() -> Result<()> {
                 }
             };
 
-            let config = RenderConfig::new()
-                .with_filter_copy(!all);
+            let config = RenderConfig::new().with_filter_copy(!all);
 
-            // Try semantic analysis first for accurate NLL drop detection
             let output = if let Some(ref path) = file_path {
                 render_source_semantic(path, &source, render_style, config.clone())
-                    .unwrap_or_else(|| {
-                        // Fall back to AST-only analysis
-                        render_source(&source, render_style, config)
-                    })
+                    .unwrap_or_else(|| render_source(&source, render_style, config))
             } else {
-                // No file path - use AST-only analysis
                 render_source(&source, render_style, config)
             };
 
@@ -131,7 +137,7 @@ fn main() -> Result<()> {
             }
         }
 
-        Some(Commands::Lsp) | None => {
+        Cmd::Lsp => {
             let filter = EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("info"));
             tracing_subscriber::registry()
@@ -155,18 +161,16 @@ fn serve_html(html: &str, port: u16) -> Result<()> {
     let url = format!("http://{}", addr);
     eprintln!("Serving at {} (Ctrl+C to stop)", url);
 
-    // Open browser
     if let Err(e) = open::that(&url) {
         eprintln!("Could not open browser: {}", e);
     }
 
     let html = html.to_string();
     for request in server.incoming_requests() {
-        let response = tiny_http::Response::from_string(&html)
-            .with_header(
-                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
-                    .unwrap(),
-            );
+        let response = tiny_http::Response::from_string(&html).with_header(
+            tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
+                .unwrap(),
+        );
         let _ = request.respond(response);
     }
 
