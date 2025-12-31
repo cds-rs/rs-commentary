@@ -127,13 +127,15 @@ Configure your editor to use `rs-commentary lsp` as a language server alongside 
 ```
 src/
 ├── analysis/       # Ownership analysis engine
-│   ├── engine.rs   # Core state machine and AST visitor
+│   ├── engine/     # Core analyzer (split into modules)
+│   │   ├── mod.rs  # OwnershipAnalyzer, AST visitor, state machine
+│   │   └── macros.rs # Format macro analysis (println!, format!, etc.)
 │   ├── semantic.rs # rust-analyzer integration for NLL drops
 │   └── state.rs    # Binding states and transitions
 ├── output/         # Rendering
 │   ├── renderers/  # Each output style (html, inline, columnar, etc.)
 │   ├── context.rs  # RenderContext with StateTimeline
-│   └── lsp/        # Hover and inlay hint formatters
+│   └── helpers.rs  # Shared annotation utilities
 ├── util/
 │   └── state.rs    # StateTimeline: single source of truth for state tracking
 └── lsp/            # LSP server implementation

@@ -69,12 +69,14 @@ When borrowed, the original binding's capabilities are temporarily reduced:
 
 | File | Purpose |
 |------|---------|
-| `engine.rs` | AST-based ownership analyzer, tracks state transitions |
+| `engine/mod.rs` | AST-based ownership analyzer, tracks state transitions |
+| `engine/macros.rs` | Format macro parsing (println!, format!, dbg!, etc.) |
 | `semantic.rs` | rust-analyzer integration for accurate type info |
 | `state.rs` | Core state machine types (`BindingState`, `OwnershipEvent`) |
 
 The engine assumes all types are non-Copy; the semantic layer corrects this
-using `Type::is_copy()` from rust-analyzer's HIR.
+using `Type::is_copy()` from rust-analyzer's HIR. The semantic module uses
+`SemanticContext` to bundle common parameters (sema, file_id, source, loop_ranges).
 
 ## State Machine
 
