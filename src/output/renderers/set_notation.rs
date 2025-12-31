@@ -3,9 +3,9 @@
 //! Matches the notation used in NOTES/rules.md for teaching ownership concepts.
 
 use crate::analysis::{SetEntry, SetEntryState};
-use super::context::RenderContext;
-use super::helpers::{extract_function_name, pad_to_column};
-use super::traits::RichTextRenderer;
+use crate::output::context::RenderContext;
+use crate::output::helpers::{extract_function_name, pad_to_column};
+use crate::output::traits::RichTextRenderer;
 
 /// Set notation renderer - displays ownership sets like `main{mut x, r(&x)}`.
 pub struct SetNotationRenderer;

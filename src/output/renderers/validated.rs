@@ -4,10 +4,10 @@
 //! errors inline with ownership state annotations. Invalid Rust is clearly marked.
 
 use crate::analysis::{DiagnosticSeverity, RaDiagnostic};
+use crate::output::context::RenderContext;
+use crate::output::helpers::extract_function_name;
 use ra_ap_syntax::TextSize;
 use std::collections::HashMap;
-use super::context::RenderContext;
-use super::helpers::extract_function_name;
 use super::set_notation::format_set_notation;
 
 /// Validated renderer - shows ownership state alongside rust-analyzer errors.

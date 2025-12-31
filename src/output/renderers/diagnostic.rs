@@ -1,8 +1,8 @@
 //! Diagnostic renderer - rustc-style with line numbers and underlines.
 
-use super::context::RenderContext;
-use super::helpers::{find_var_position, format_change_label};
-use super::traits::RichTextRenderer;
+use crate::output::context::RenderContext;
+use crate::output::helpers::{find_var_position, format_change_label};
+use crate::output::traits::RichTextRenderer;
 
 /// Diagnostic renderer - rustc-style with line numbers and underline annotations.
 pub struct DiagnosticRenderer;

@@ -2,9 +2,9 @@
 //!
 //! These renderers use `//` comments for annotations, so output can be compiled.
 
-use super::context::RenderContext;
-use super::helpers::{format_entries_columnar, format_entries_compact, format_entries_inline, pad_to_column};
-use super::traits::ValidRustRenderer;
+use crate::output::context::RenderContext;
+use crate::output::helpers::{format_entries_columnar, format_entries_compact, format_entries_inline, pad_to_column};
+use crate::output::traits::ValidRustRenderer;
 
 /// Inline renderer - comments at end of each line.
 pub struct InlineRenderer;

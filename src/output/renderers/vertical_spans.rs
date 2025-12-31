@@ -10,9 +10,9 @@
 //! ```
 
 use crate::analysis::{SetEntry, SetEntryState};
-use super::context::RenderContext;
-use super::helpers::{format_capability_dots, pad_to_column};
-use super::traits::RichTextRenderer;
+use crate::output::context::RenderContext;
+use crate::output::helpers::{format_capability_dots, pad_to_column};
+use crate::output::traits::RichTextRenderer;
 
 /// Vertical spans renderer - shows borrow extents with box-drawing characters.
 pub struct VerticalSpansRenderer;

@@ -11,9 +11,9 @@
 
 use crate::analysis::SetEntryState;
 use crate::execution::FunctionView;
+use crate::output::context::RenderContext;
+use crate::output::traits::RichTextRenderer;
 use crate::util::{Boundary, BoundaryState, TransitionReason};
-use super::context::RenderContext;
-use super::traits::RichTextRenderer;
 
 /// HTML renderer - produces reveal.js step-through presentation.
 pub struct HtmlRenderer;
