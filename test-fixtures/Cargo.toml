@@ -1,0 +1,8 @@
+# Separate workspace for test fixtures
+# These are real Rust crates that rs-commentary analyzes to test the full pipeline
+# (including rust-analyzer semantic analysis)
+[workspace]
+resolver = "2"
+members = [
+    "drop_test",
+]

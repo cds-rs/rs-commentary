@@ -13,7 +13,7 @@ use crate::analysis::SetEntryState;
 use crate::execution::FunctionView;
 use crate::output::context::RenderContext;
 use crate::output::traits::RichTextRenderer;
-use crate::util::{Boundary, BoundaryState, TransitionReason};
+use crate::util::{BoundaryState, TransitionReason};
 
 /// HTML renderer - produces reveal.js step-through presentation.
 pub struct HtmlRenderer;
@@ -146,14 +146,14 @@ fn build_function_slide(
     // Build code panel - show only this function's lines, with current highlighted
     let code_html = build_code_panel_for_function(ctx, func, current_line);
 
-    // Get boundary state for state panel and description
-    let boundary_state = ctx.ownership_timeline.at(current_line, Boundary::Post);
+    // Get boundary state for state panel and description (computed from timeline diff)
+    let boundary_state = ctx.timeline.boundary_state(current_line);
 
     // Build state panel
-    let state_html = build_state_panel(ctx, boundary_state);
+    let state_html = build_state_panel(ctx, boundary_state.as_ref());
 
     // Build description
-    let desc = build_description(boundary_state, ctx, current_line);
+    let desc = build_description(boundary_state.as_ref(), ctx, current_line);
 
     // Add data attribute for first slide to enable navigation
     let first_attr = if is_first {

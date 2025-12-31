@@ -493,6 +493,168 @@ impl StateTimeline {
         self.shown_dropped.clear();
         self.scope_starts.clear();
     }
+
+    /// Check if a variable was already dropped before this line.
+    ///
+    /// Uses semantic last-use data: if the drop line (last_use + 1) is before
+    /// the current line, the variable was already dropped.
+    fn is_already_dropped(&self, name: &str, line_num: u32) -> bool {
+        if let Some(&last_use_line) = self.semantic_last_uses.get(name) {
+            // Drop shows on line after last use
+            let drop_line = last_use_line + 1;
+            // If drop line is before current line, variable is already gone
+            drop_line < line_num
+        } else {
+            false
+        }
+    }
+
+    /// Compute BoundaryState by diffing this line's state with the previous line.
+    ///
+    /// This derives the rich boundary information (new_vars, delta_vars, dropped_vars)
+    /// from the timeline's state snapshots, computing the diff on-demand.
+    pub fn boundary_state(&self, line_num: u32) -> Option<BoundaryState> {
+        let curr = self.get(line_num)?;
+        let prev = self.find_prev_in_scope(line_num);
+        let scope = self.line_to_scope.get(&line_num).cloned().unwrap_or_default();
+
+        // Compute dropped_vars FIRST so we can exclude them from variables
+        let drops = self.get_pending_drops(line_num);
+        let drop_names: HashSet<&str> = drops.iter().map(|d| d.name.as_str()).collect();
+
+        let dropped_vars: Vec<VarSnapshot> = drops
+            .iter()
+            .map(|d| {
+                // Try to get state from previous line, or default to Owned
+                let state = prev
+                    .and_then(|p| p.states.get(&d.name))
+                    .map(|(s, _)| s.clone())
+                    .unwrap_or(SetEntryState::Owned);
+                let mutable = prev
+                    .and_then(|p| p.states.get(&d.name))
+                    .map(|(_, m)| *m)
+                    .unwrap_or(false);
+                VarSnapshot {
+                    name: d.name.clone(),
+                    state,
+                    mutable,
+                }
+            })
+            .collect();
+
+        // Build current variable snapshots, excluding dropped vars (current and past)
+        let variables: Vec<VarSnapshot> = curr
+            .states
+            .iter()
+            .filter(|(name, (state, _))| {
+                !matches!(state, SetEntryState::Dropped)
+                    && !drop_names.contains(name.as_str())
+                    && !self.is_already_dropped(name, line_num)
+            })
+            .map(|(name, (state, mutable))| VarSnapshot {
+                name: name.clone(),
+                state: state.clone(),
+                mutable: *mutable,
+            })
+            .collect();
+
+        // Compute new_vars: in curr but not in prev (also exclude dropped)
+        let new_vars: Vec<VarSnapshot> = curr
+            .states
+            .iter()
+            .filter(|(name, (state, _))| {
+                !matches!(state, SetEntryState::Dropped)
+                    && !drop_names.contains(name.as_str())
+                    && !self.is_already_dropped(name, line_num)
+                    && prev.map(|p| !p.states.contains_key(*name)).unwrap_or(true)
+            })
+            .map(|(name, (state, mutable))| VarSnapshot {
+                name: name.clone(),
+                state: state.clone(),
+                mutable: *mutable,
+            })
+            .collect();
+
+        // Compute delta_vars: in both but state changed (exclude dropped)
+        let mut delta_vars = HashMap::new();
+        if let Some(prev_state) = prev {
+            for (name, (curr_st, _)) in &curr.states {
+                if drop_names.contains(name.as_str()) || self.is_already_dropped(name, line_num) {
+                    continue;
+                }
+                if let Some((prev_st, _)) = prev_state.states.get(name) {
+                    if prev_st != curr_st && !matches!(curr_st, SetEntryState::Dropped) {
+                        let reason = self.infer_transition_reason(name, prev_st, curr_st, curr);
+                        delta_vars.insert(
+                            name.clone(),
+                            StateTransition {
+                                from: prev_st.clone(),
+                                to: curr_st.clone(),
+                                reason,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        Some(BoundaryState {
+            line: line_num,
+            scope,
+            new_vars,
+            delta_vars,
+            dropped_vars,
+            variables,
+        })
+    }
+
+    /// Infer why a state transition occurred.
+    fn infer_transition_reason(
+        &self,
+        name: &str,
+        from: &SetEntryState,
+        to: &SetEntryState,
+        curr_state: &LineState,
+    ) -> TransitionReason {
+        match (from, to) {
+            // Owned -> Shared: shared borrow taken
+            (SetEntryState::Owned, SetEntryState::Shared) => {
+                // Find the borrow that references this variable
+                if let Some(borrow_name) = self.find_borrow_of(name, curr_state) {
+                    TransitionReason::SharedBorrowTaken { borrow_name }
+                } else {
+                    TransitionReason::Other
+                }
+            }
+            // Owned -> Frozen: mutable borrow taken
+            (SetEntryState::Owned, SetEntryState::Frozen) => {
+                if let Some(borrow_name) = self.find_borrow_of(name, curr_state) {
+                    TransitionReason::MutBorrowTaken { borrow_name }
+                } else {
+                    TransitionReason::Other
+                }
+            }
+            // Shared/Frozen -> Owned: borrow ended
+            (SetEntryState::Shared, SetEntryState::Owned)
+            | (SetEntryState::Frozen, SetEntryState::Owned) => {
+                TransitionReason::BorrowEnded {
+                    borrow_name: String::new(),
+                }
+            }
+            // Anything -> Dropped
+            (_, SetEntryState::Dropped) => TransitionReason::ExplicitDrop,
+            _ => TransitionReason::Other,
+        }
+    }
+
+    /// Find a variable that borrows from the given source.
+    fn find_borrow_of(&self, source: &str, state: &LineState) -> Option<String> {
+        state
+            .borrows_from
+            .iter()
+            .find(|(_, src)| *src == source)
+            .map(|(borrow_name, _)| borrow_name.clone())
+    }
 }
 
 /// A detected state change for a variable.
@@ -515,6 +677,88 @@ pub enum ChangeType {
     New,
     /// State changed from a previous state.
     StateChanged { from: SetEntryState },
+}
+
+// ============================================================================
+// BoundaryState types (derived from timeline diffs)
+// ============================================================================
+
+/// Why a state transition occurred.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransitionReason {
+    /// A shared borrow was taken: Owned -> Shared
+    SharedBorrowTaken { borrow_name: String },
+    /// A mutable borrow was taken: Owned -> Frozen
+    MutBorrowTaken { borrow_name: String },
+    /// A borrow ended (NLL): Shared/Frozen -> Owned
+    BorrowEnded { borrow_name: String },
+    /// Value was moved
+    Moved,
+    /// Explicit drop() call
+    ExplicitDrop,
+    /// Scope exit (automatic drop)
+    ScopeExit,
+    /// State changed for other/unknown reason
+    Other,
+}
+
+/// A state transition with from/to states and reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateTransition {
+    pub from: SetEntryState,
+    pub to: SetEntryState,
+    pub reason: TransitionReason,
+}
+
+/// Variable snapshot at a boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VarSnapshot {
+    pub name: String,
+    pub state: SetEntryState,
+    pub mutable: bool,
+}
+
+/// State at a specific line boundary (computed from timeline diff).
+#[derive(Debug, Clone)]
+pub struct BoundaryState {
+    /// The line number this state applies to.
+    pub line: u32,
+    /// Function scope name.
+    pub scope: String,
+
+    /// Variables newly introduced at this boundary.
+    pub new_vars: Vec<VarSnapshot>,
+
+    /// Existing variables whose state changed at this boundary.
+    pub delta_vars: std::collections::HashMap<String, StateTransition>,
+
+    /// Variables dropped at this boundary.
+    pub dropped_vars: Vec<VarSnapshot>,
+
+    /// Complete variable state at this boundary (for rendering).
+    pub variables: Vec<VarSnapshot>,
+}
+
+impl BoundaryState {
+    /// Check if a variable was introduced at this boundary.
+    pub fn is_new(&self, name: &str) -> bool {
+        self.new_vars.iter().any(|v| v.name == name)
+    }
+
+    /// Check if a variable was dropped at this boundary.
+    pub fn is_dropped(&self, name: &str) -> bool {
+        self.dropped_vars.iter().any(|v| v.name == name)
+    }
+
+    /// Check if a variable's state changed at this boundary.
+    pub fn has_transition(&self, name: &str) -> bool {
+        self.delta_vars.contains_key(name)
+    }
+
+    /// Get a variable's snapshot by name.
+    pub fn get_var(&self, name: &str) -> Option<&VarSnapshot> {
+        self.variables.iter().find(|v| v.name == name)
+    }
 }
 
 
@@ -655,5 +899,41 @@ mod tests {
         assert!(StateTimeline::is_function_boundary("pub fn foo() {"));
         assert!(StateTimeline::is_function_boundary("    pub async fn bar() {"));
         assert!(!StateTimeline::is_function_boundary("let x = 1;"));
+    }
+
+    #[test]
+    fn test_dropped_var_not_in_subsequent_boundary_state() {
+        let mut timeline = StateTimeline::new();
+
+        // Line 0: fn main() {
+        timeline.record(0, &vec![], "fn main() {");
+
+        // Line 1: let x = String::from("hello");
+        let x = make_entry("x", SetEntryState::Owned);
+        timeline.record(1, &vec![&x], "    let x = String::from(\"hello\");");
+
+        // Line 2: drop(x);  - x is no longer in entries
+        timeline.record(2, &vec![], "    drop(x);");
+
+        // Line 3: let y = 1;  - new variable, x should NOT appear
+        let y = make_entry("y", SetEntryState::Owned);
+        timeline.record(3, &vec![&y], "    let y = 1;");
+
+        // x should be dropped at line 2
+        let drops_at_2 = timeline.get_pending_drops(2);
+        assert_eq!(drops_at_2.len(), 1);
+        assert_eq!(drops_at_2[0].name, "x");
+        timeline.mark_drop_shown("x");
+
+        // boundary_state at line 3 should NOT include x
+        let boundary = timeline.boundary_state(3).unwrap();
+        assert!(
+            !boundary.variables.iter().any(|v| v.name == "x"),
+            "x should not appear in variables after being dropped"
+        );
+        assert!(
+            boundary.variables.iter().any(|v| v.name == "y"),
+            "y should appear in variables"
+        );
     }
 }
