@@ -22,7 +22,7 @@ pub struct ServerState {
     /// Document contents by URI
     pub documents: HashMap<Url, String>,
     /// Cached analysis results by URI
-    pub analysis_cache: HashMap<Url, AnalysisCache>,
+    analysis_cache: HashMap<Url, AnalysisCache>,
 }
 
 impl ServerState {
@@ -168,7 +168,7 @@ pub fn handle_inlay_hints(
 fn format_capabilities_hint(set: &OwnershipSet) -> String {
     set.entries
         .iter()
-        .map(|entry| format_entry_capabilities(entry))
+        .map(format_entry_capabilities)
         .collect::<Vec<_>>()
         .join(", ")
 }

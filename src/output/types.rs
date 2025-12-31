@@ -41,7 +41,7 @@ pub enum RenderStyle {
 }
 
 impl RenderStyle {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "inline" => Some(Self::Inline),
             "columnar" | "columns" => Some(Self::Columnar),

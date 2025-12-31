@@ -1,7 +1,7 @@
 //! Diagnostic renderer - rustc-style with line numbers and underlines.
 
 use crate::output::context::RenderContext;
-use crate::output::helpers::{find_var_position, format_change_label};
+use crate::output::helpers::get_line_annotations;
 use crate::output::traits::RichTextRenderer;
 
 /// Diagnostic renderer - rustc-style with line numbers and underline annotations.
@@ -33,32 +33,20 @@ impl RichTextRenderer for DiagnosticRenderer {
             // Get pending drops for the NEXT line (drops happen after this line)
             let pending_drops = ctx.timeline.get_pending_drops(line_num_u32 + 1);
 
-            // Collect annotations for this line: (var_name, position, label, has_drop)
-            let mut annotations: Vec<(String, usize, String, bool)> = Vec::new();
-
-            for change in &changes {
-                if let Some(pos) = find_var_position(line, &change.name) {
-                    let label = format_change_label(change);
-                    // Check if this variable has a pending drop
-                    let has_drop = pending_drops.iter().any(|d| d.name == change.name);
-                    annotations.push((change.name.clone(), pos, label, has_drop));
-                }
-            }
+            // Get unified annotations (state changes + drops, sorted right-to-left)
+            let annotations = get_line_annotations(line, &changes, &pending_drops, &ctx.timeline);
 
             // Render underline annotations
             if !annotations.is_empty() {
-                // Sort by position (rightmost first for rendering order)
-                annotations.sort_by_key(|(_, pos, _, _)| std::cmp::Reverse(*pos));
-
                 // Build underline line with ─ under each variable
                 let max_pos = line.chars().count();
                 let mut underline_chars: Vec<char> = vec![' '; max_pos];
 
-                for (name, pos, _, _) in &annotations {
-                    let var_len = name.chars().count();
+                for ann in &annotations {
+                    let var_len = ann.name.chars().count();
                     for i in 0..var_len {
-                        if pos + i < underline_chars.len() {
-                            underline_chars[pos + i] = '─';
+                        if ann.position + i < underline_chars.len() {
+                            underline_chars[ann.position + i] = '─';
                         }
                     }
                 }
@@ -72,79 +60,80 @@ impl RichTextRenderer for DiagnosticRenderer {
                 ));
 
                 // Print labels from right to left
-                // For each variable: show its state, then its drop note if applicable
-                for (idx, (name, pos, label, has_drop)) in annotations.iter().enumerate() {
+                for (idx, ann) in annotations.iter().enumerate() {
                     let is_last = idx == annotations.len() - 1;
 
-                    // Build the connector line for the state annotation
+                    // Build the connector line
                     let mut connector_chars: Vec<char> = vec![' '; max_pos];
 
                     // Add | for all annotations to the left of this one
                     if !is_last {
-                        for (_, other_pos, _, _) in annotations.iter().skip(idx + 1) {
-                            if *other_pos < connector_chars.len() {
-                                connector_chars[*other_pos] = '|';
+                        for other in annotations.iter().skip(idx + 1) {
+                            if other.position < connector_chars.len() {
+                                connector_chars[other.position] = '|';
                             }
                         }
                     }
 
                     // Add └─ at current position
-                    if *pos < connector_chars.len() {
-                        connector_chars[*pos] = '└';
+                    if ann.position < connector_chars.len() {
+                        connector_chars[ann.position] = '└';
                     }
 
                     let connector: String = connector_chars.iter().collect();
                     let connector_trimmed = connector.trim_end();
 
-                    // Print the state annotation
-                    output.push_str(&format!(
-                        "{:>width$} │ {}─ {}: {}\n",
-                        "",
-                        connector_trimmed,
-                        name,
-                        label,
-                        width = line_num_width
-                    ));
+                    // Print the state annotation (if not drop-only)
+                    if let Some(ref label) = ann.state_label {
+                        output.push_str(&format!(
+                            "{:>width$} │ {}─ {}: {}\n",
+                            "",
+                            connector_trimmed,
+                            ann.name,
+                            label,
+                            width = line_num_width
+                        ));
+                    }
 
-                    // If this variable has a drop, print it on the next line
-                    if *has_drop {
-                        // Build connector for drop note (same position, but use └─ for drop)
-                        let mut drop_connector_chars: Vec<char> = vec![' '; max_pos];
-
-                        // Add | for annotations to the left
-                        if !is_last {
-                            for (_, other_pos, _, _) in annotations.iter().skip(idx + 1) {
-                                if *other_pos < drop_connector_chars.len() {
-                                    drop_connector_chars[*other_pos] = '|';
+                    // Print drop note if applicable
+                    if ann.has_drop {
+                        // For drop-only annotations, reuse the same connector
+                        // For state+drop, build a new connector
+                        let drop_connector = if ann.state_label.is_some() {
+                            let mut drop_connector_chars: Vec<char> = vec![' '; max_pos];
+                            if !is_last {
+                                for other in annotations.iter().skip(idx + 1) {
+                                    if other.position < drop_connector_chars.len() {
+                                        drop_connector_chars[other.position] = '|';
+                                    }
                                 }
                             }
-                        }
-
-                        // Add └─ at current position for the drop
-                        if *pos < drop_connector_chars.len() {
-                            drop_connector_chars[*pos] = '└';
-                        }
-
-                        let drop_connector: String = drop_connector_chars.iter().collect();
+                            if ann.position < drop_connector_chars.len() {
+                                drop_connector_chars[ann.position] = '└';
+                            }
+                            drop_connector_chars.iter().collect::<String>()
+                        } else {
+                            connector.clone()
+                        };
                         let drop_connector_trimmed = drop_connector.trim_end();
 
                         output.push_str(&format!(
                             "{:>width$} │ {}─ note: `{}` dropped (last use)\n",
                             "",
                             drop_connector_trimmed,
-                            name,
+                            ann.name,
                             width = line_num_width
                         ));
 
-                        ctx.timeline.mark_drop_shown(name);
+                        ctx.timeline.mark_drop_shown(&ann.name);
                     }
 
                     // Add blank connector line between variables (except after the last one)
                     if !is_last {
                         let mut blank_connector_chars: Vec<char> = vec![' '; max_pos];
-                        for (_, other_pos, _, _) in annotations.iter().skip(idx + 1) {
-                            if *other_pos < blank_connector_chars.len() {
-                                blank_connector_chars[*other_pos] = '|';
+                        for other in annotations.iter().skip(idx + 1) {
+                            if other.position < blank_connector_chars.len() {
+                                blank_connector_chars[other.position] = '|';
                             }
                         }
                         let blank_connector: String = blank_connector_chars.iter().collect();
@@ -159,38 +148,8 @@ impl RichTextRenderer for DiagnosticRenderer {
                         }
                     }
                 }
-            }
 
-            // Handle drops for variables not annotated on this line
-            // (e.g., variables that appear but don't have state changes)
-            let mut had_standalone_drops = false;
-            for drop in &pending_drops {
-                if !ctx.timeline.is_drop_shown(&drop.name) {
-                    if let Some(pos) = find_var_position(line, &drop.name) {
-                        let max_pos = line.chars().count();
-                        let mut marker_chars: Vec<char> = vec![' '; max_pos];
-                        let var_len = drop.name.chars().count();
-                        for i in 0..var_len {
-                            if pos + i < marker_chars.len() {
-                                marker_chars[pos + i] = '^';
-                            }
-                        }
-                        let marker: String = marker_chars.iter().collect();
-                        output.push_str(&format!(
-                            "{:>width$} │ {} note: `{}` dropped (last use)\n",
-                            "",
-                            marker.trim_end(),
-                            drop.name,
-                            width = line_num_width
-                        ));
-                        ctx.timeline.mark_drop_shown(&drop.name);
-                        had_standalone_drops = true;
-                    }
-                }
-            }
-
-            // Add blank line after annotation block for readability
-            if !annotations.is_empty() || had_standalone_drops {
+                // Add blank line after annotation block for readability
                 output.push_str(&format!("{:>width$} │\n", "", width = line_num_width));
             }
         }

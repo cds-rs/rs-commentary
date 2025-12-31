@@ -176,19 +176,6 @@ fn is_likely_copy(name: &str, copy_types: &[&str]) -> bool {
     )
 }
 
-/// Format transfers for display.
-pub fn format_transfers(transfers: &[CallTransfer]) -> String {
-    if transfers.is_empty() {
-        return String::new();
-    }
-
-    transfers
-        .iter()
-        .map(|t| format!("{} {}", t.kind.symbol(), t.variable))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

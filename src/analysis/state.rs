@@ -346,7 +346,7 @@ impl BindingState {
                 Ok(BindingState::Dropped)
             }
 
-            (BindingState::MutBorrow { from }, OwnershipEvent::Reborrow { to }) => {
+            (BindingState::MutBorrow { from: _ }, OwnershipEvent::Reborrow { to }) => {
                 Ok(BindingState::Suspended {
                     reborrowed_to: *to,
                 })

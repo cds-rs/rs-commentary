@@ -90,8 +90,10 @@ impl SemanticAnalyzer {
         tracing::info!("Loading cargo workspace from: {}", manifest.display());
 
         // Configure to load sysroot for standard library (needed for Copy trait detection)
-        let mut cargo_config = CargoConfig::default();
-        cargo_config.sysroot = Some(RustLibSource::Discover);
+        let cargo_config = CargoConfig {
+            sysroot: Some(RustLibSource::Discover),
+            ..Default::default()
+        };
 
         let load_config = LoadCargoConfig {
             load_out_dirs_from_check: false,  // Faster startup

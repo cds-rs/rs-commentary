@@ -8,10 +8,12 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 /// Output style for annotations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 enum Style {
     Inline,
     Columnar,
     Grouped,
+    #[default]
     Diagnostic,
     SetNotation,
     VerticalSpans,
@@ -41,11 +43,6 @@ impl FromStr for Style {
     }
 }
 
-impl Default for Style {
-    fn default() -> Self {
-        Style::Diagnostic
-    }
-}
 
 impl From<Style> for RenderStyle {
     fn from(s: Style) -> Self {

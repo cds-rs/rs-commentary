@@ -650,11 +650,9 @@ impl OwnershipAnalyzer {
         let borrow_info = let_stmt.initializer().and_then(|init| {
             if let ast::Expr::RefExpr(ref_expr) = &init {
                 let is_mut = ref_expr.mut_token().is_some();
-                if let Some(inner) = ref_expr.expr() {
-                    if let ast::Expr::PathExpr(path_expr) = &inner {
-                        if let Some((_name, binding_id, _)) = self.resolve_path(path_expr) {
-                            return Some((binding_id, is_mut));
-                        }
+                if let Some(ast::Expr::PathExpr(path_expr)) = ref_expr.expr() {
+                    if let Some((_name, binding_id, _)) = self.resolve_path(&path_expr) {
+                        return Some((binding_id, is_mut));
                     }
                 }
             }
@@ -1001,12 +999,11 @@ impl OwnershipAnalyzer {
                     let _ = c; // Silence unused warning
                     if !format_ident.is_empty() {
                         let first = format_ident.chars().next().unwrap();
-                        if first.is_alphabetic() || first == '_' {
-                            if !recorded.contains(&format_ident) {
+                        if (first.is_alphabetic() || first == '_')
+                            && !recorded.contains(&format_ident) {
                                 self.record_macro_borrow(&format_ident, macro_expr, &macro_name);
                                 recorded.insert(format_ident.clone());
                             }
-                        }
                     }
                     format_ident.clear();
                 }
@@ -1154,16 +1151,14 @@ impl OwnershipAnalyzer {
         match arg {
             // &x - shared borrow in call context
             ast::Expr::RefExpr(ref_expr) if ref_expr.mut_token().is_none() => {
-                if let Some(inner) = ref_expr.expr() {
-                    if let ast::Expr::PathExpr(path_expr) = &inner {
-                        if let Some((name, binding_id, _)) = self.resolve_path(path_expr) {
-                            self.annotations.push(Annotation::new(
-                                arg.syntax().text_range(),
-                                name,
-                                BindingState::SharedBorrow { from: binding_id },
-                                "shared borrow passed to function".to_string(),
-                            ));
-                        }
+                if let Some(ast::Expr::PathExpr(path_expr)) = ref_expr.expr() {
+                    if let Some((name, binding_id, _)) = self.resolve_path(&path_expr) {
+                        self.annotations.push(Annotation::new(
+                            arg.syntax().text_range(),
+                            name,
+                            BindingState::SharedBorrow { from: binding_id },
+                            "shared borrow passed to function".to_string(),
+                        ));
                     }
                 }
                 self.visit_expr(arg);
@@ -1171,18 +1166,16 @@ impl OwnershipAnalyzer {
 
             // &mut x - reborrow, original is suspended
             ast::Expr::RefExpr(ref_expr) => {
-                if let Some(inner) = ref_expr.expr() {
-                    if let ast::Expr::PathExpr(path_expr) = &inner {
-                        if let Some((name, _binding_id, _)) = self.resolve_path(path_expr) {
-                            let reborrow_id = BindingId(self.next_binding_id);
-                            self.next_binding_id += 1;
-                            self.annotations.push(Annotation::new(
-                                arg.syntax().text_range(),
-                                name,
-                                BindingState::Suspended { reborrowed_to: reborrow_id },
-                                "reborrowed to function call, original suspended".to_string(),
-                            ));
-                        }
+                if let Some(ast::Expr::PathExpr(path_expr)) = ref_expr.expr() {
+                    if let Some((name, _binding_id, _)) = self.resolve_path(&path_expr) {
+                        let reborrow_id = BindingId(self.next_binding_id);
+                        self.next_binding_id += 1;
+                        self.annotations.push(Annotation::new(
+                            arg.syntax().text_range(),
+                            name,
+                            BindingState::Suspended { reborrowed_to: reborrow_id },
+                            "reborrowed to function call, original suspended".to_string(),
+                        ));
                     }
                 }
                 self.visit_expr(arg);

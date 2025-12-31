@@ -197,7 +197,7 @@ fn build_code_panel_for_function(ctx: &RenderContext, func: &FunctionView, curre
     let mut code_html = String::new();
 
     for line_num in func.lines() {
-        let line = ctx.lines.get(line_num as usize).map(|s| *s).unwrap_or("");
+        let line = ctx.lines.get(line_num as usize).copied().unwrap_or("");
         let escaped = html_escape(line);
         let class = if line_num == current_line { "line current" } else { "line" };
 

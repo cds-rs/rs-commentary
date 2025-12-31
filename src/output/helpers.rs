@@ -1,7 +1,78 @@
 //! Shared helper functions for renderers.
 
 use crate::analysis::{SetEntry, SetEntryState};
-use crate::util::{ChangeType, StateChange, StateTimeline};
+use crate::util::{ChangeType, StateChange, StateTimeline, VariableDrop};
+
+/// A unified annotation for rendering on a source line.
+#[derive(Debug, Clone)]
+pub struct LineAnnotation {
+    /// Variable name
+    pub name: String,
+    /// Column position in the source line
+    pub position: usize,
+    /// State label (empty for drop-only annotations)
+    pub state_label: Option<String>,
+    /// Whether this variable is dropped after this line
+    pub has_drop: bool,
+}
+
+impl LineAnnotation {
+    /// Create annotation from a state change.
+    pub fn from_change(change: &StateChange, position: usize, has_drop: bool) -> Self {
+        Self {
+            name: change.name.clone(),
+            position,
+            state_label: Some(format_change_label(change)),
+            has_drop,
+        }
+    }
+
+    /// Create drop-only annotation.
+    pub fn drop_only(name: String, position: usize) -> Self {
+        Self {
+            name,
+            position,
+            state_label: None,
+            has_drop: true,
+        }
+    }
+}
+
+/// Collect all annotations for a source line, combining state changes and drops.
+/// Returns annotations sorted by position (rightmost first).
+pub fn get_line_annotations(
+    line: &str,
+    changes: &[StateChange],
+    pending_drops: &[VariableDrop],
+    timeline: &StateTimeline,
+) -> Vec<LineAnnotation> {
+    let mut annotations = Vec::new();
+
+    // Add state change annotations
+    for change in changes {
+        if let Some(pos) = find_var_position(line, &change.name) {
+            let has_drop = pending_drops.iter().any(|d| d.name == change.name);
+            annotations.push(LineAnnotation::from_change(change, pos, has_drop));
+        }
+    }
+
+    // Add drop-only annotations for variables dropped on this line
+    // but without a state change annotation
+    for drop in pending_drops {
+        if !timeline.is_drop_shown(&drop.name) {
+            let already_annotated = annotations.iter().any(|a| a.name == drop.name);
+            if !already_annotated {
+                if let Some(pos) = find_var_position(line, &drop.name) {
+                    annotations.push(LineAnnotation::drop_only(drop.name.clone(), pos));
+                }
+            }
+        }
+    }
+
+    // Sort by position (rightmost first for rendering order)
+    annotations.sort_by_key(|a| std::cmp::Reverse(a.position));
+    annotations
+}
 
 /// Calculate padding needed to reach target column.
 pub fn pad_to_column(current: usize, target: usize) -> usize {

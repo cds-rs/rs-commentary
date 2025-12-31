@@ -119,7 +119,7 @@ impl StateTimeline {
             let after_fn = &trimmed[fn_pos + 3..];
             // Function name ends at '(' or '<' (generics)
             let end = after_fn
-                .find(|c: char| c == '(' || c == '<')
+                .find(['(', '<'])
                 .unwrap_or(after_fn.len());
             return after_fn[..end].trim().to_string();
         }
@@ -174,7 +174,7 @@ impl StateTimeline {
         let states: HashMap<String, (SetEntryState, bool)> = entries
             .iter()
             .filter(|e| new_scope_vars.contains(&e.name))
-            .map(|e| (e.name.clone(), (e.state.clone(), e.mutable)))
+            .map(|e| (e.name.clone(), (e.state, e.mutable)))
             .collect();
 
         // Extract borrow relationships
@@ -378,7 +378,7 @@ impl StateTimeline {
                 // Variable returns to owned state
                 result.insert(name.clone(), (SetEntryState::Owned, *mutable, true));
             } else {
-                result.insert(name.clone(), (entry_state.clone(), *mutable, false));
+                result.insert(name.clone(), (*entry_state, *mutable, false));
             }
         }
 
@@ -407,14 +407,14 @@ impl StateTimeline {
             let change_type = match prev_state {
                 None => ChangeType::New,
                 Some((old_state, _)) if old_state != state => ChangeType::StateChanged {
-                    from: old_state.clone(),
+                    from: *old_state,
                 },
                 _ => continue, // No change
             };
 
             changes.push(StateChange {
                 name: name.clone(),
-                state: state.clone(),
+                state: *state,
                 mutable: *mutable,
                 change_type,
             });
@@ -528,7 +528,7 @@ impl StateTimeline {
                 // Try to get state from previous line, or default to Owned
                 let state = prev
                     .and_then(|p| p.states.get(&d.name))
-                    .map(|(s, _)| s.clone())
+                    .map(|(s, _)| *s)
                     .unwrap_or(SetEntryState::Owned);
                 let mutable = prev
                     .and_then(|p| p.states.get(&d.name))
@@ -553,7 +553,7 @@ impl StateTimeline {
             })
             .map(|(name, (state, mutable))| VarSnapshot {
                 name: name.clone(),
-                state: state.clone(),
+                state: *state,
                 mutable: *mutable,
             })
             .collect();
@@ -570,7 +570,7 @@ impl StateTimeline {
             })
             .map(|(name, (state, mutable))| VarSnapshot {
                 name: name.clone(),
-                state: state.clone(),
+                state: *state,
                 mutable: *mutable,
             })
             .collect();
@@ -588,8 +588,8 @@ impl StateTimeline {
                         delta_vars.insert(
                             name.clone(),
                             StateTransition {
-                                from: prev_st.clone(),
-                                to: curr_st.clone(),
+                                from: *prev_st,
+                                to: *curr_st,
                                 reason,
                             },
                         );
