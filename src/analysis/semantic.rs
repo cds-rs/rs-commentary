@@ -73,6 +73,15 @@ pub struct LastUseInfo {
     pub is_copy: bool,
 }
 
+/// Context for semantic analysis operations.
+/// Bundles common parameters to reduce function signature complexity.
+struct SemanticContext<'a, 'db> {
+    sema: &'a Semantics<'db, RootDatabase>,
+    file_id: FileId,
+    source: &'a str,
+    loop_ranges: &'a [(u32, u32)],
+}
+
 /// Semantic analyzer backed by rust-analyzer.
 pub struct SemanticAnalyzer {
     host: AnalysisHost,
@@ -290,21 +299,26 @@ impl SemanticAnalyzer {
             collect_loop_ranges(&item, source, &mut loop_ranges);
         }
 
+        // Create context for semantic analysis
+        let ctx = SemanticContext {
+            sema: &sema,
+            file_id,
+            source,
+            loop_ranges: &loop_ranges,
+        };
+
         // Walk AST to find all let bindings and parameters
         for item in file.items() {
-            self.collect_bindings_last_uses_with_sema(&sema, &item, file_id, source, &loop_ranges, &mut result);
+            self.collect_bindings_last_uses(&ctx, &item, &mut result);
         }
 
         result
     }
 
-    fn collect_bindings_last_uses_with_sema<'db>(
+    fn collect_bindings_last_uses(
         &self,
-        sema: &Semantics<'db, ra_ap_ide::RootDatabase>,
+        ctx: &SemanticContext<'_, '_>,
         item: &ast::Item,
-        file_id: FileId,
-        source: &str,
-        loop_ranges: &[(u32, u32)],
         result: &mut HashMap<TextSize, LastUseInfo>,
     ) {
         match item {
@@ -313,27 +327,20 @@ impl SemanticAnalyzer {
                 if let Some(param_list) = f.param_list() {
                     for param in param_list.params() {
                         if let Some(pat) = param.pat() {
-                            self.collect_pat_last_uses_with_sema(sema, &pat, file_id, source, loop_ranges, result);
+                            self.collect_pat_last_uses(ctx, &pat, result);
                         }
                     }
                 }
                 // Collect bindings in body
                 if let Some(body) = f.body() {
-                    self.collect_block_last_uses_with_sema(sema, &body, file_id, source, loop_ranges, result);
+                    self.collect_block_last_uses(ctx, &body, result);
                 }
             }
             ast::Item::Impl(i) => {
                 if let Some(items) = i.assoc_item_list() {
                     for item in items.assoc_items() {
                         if let ast::AssocItem::Fn(f) = item {
-                            self.collect_bindings_last_uses_with_sema(
-                                sema,
-                                &ast::Item::Fn(f),
-                                file_id,
-                                source,
-                                loop_ranges,
-                                result,
-                            );
+                            self.collect_bindings_last_uses(ctx, &ast::Item::Fn(f), result);
                         }
                     }
                 }
@@ -342,96 +349,83 @@ impl SemanticAnalyzer {
         }
     }
 
-    fn collect_block_last_uses_with_sema<'db>(
+    fn collect_block_last_uses(
         &self,
-        sema: &Semantics<'db, ra_ap_ide::RootDatabase>,
+        ctx: &SemanticContext<'_, '_>,
         block: &ast::BlockExpr,
-        file_id: FileId,
-        source: &str,
-        loop_ranges: &[(u32, u32)],
         result: &mut HashMap<TextSize, LastUseInfo>,
     ) {
         for stmt in block.statements() {
             match &stmt {
                 ast::Stmt::LetStmt(let_stmt) => {
                     if let Some(pat) = let_stmt.pat() {
-                        self.collect_pat_last_uses_with_sema(sema, &pat, file_id, source, loop_ranges, result);
+                        self.collect_pat_last_uses(ctx, &pat, result);
                     }
                 }
                 ast::Stmt::ExprStmt(expr_stmt) => {
                     if let Some(expr) = expr_stmt.expr() {
-                        self.collect_expr_last_uses_with_sema(sema, &expr, file_id, source, loop_ranges, result);
+                        self.collect_expr_last_uses(ctx, &expr, result);
                     }
                 }
                 _ => {}
             }
         }
         if let Some(tail) = block.tail_expr() {
-            self.collect_expr_last_uses_with_sema(sema, &tail, file_id, source, loop_ranges, result);
+            self.collect_expr_last_uses(ctx, &tail, result);
         }
     }
 
-    fn collect_expr_last_uses_with_sema<'db>(
+    fn collect_expr_last_uses(
         &self,
-        sema: &Semantics<'db, ra_ap_ide::RootDatabase>,
+        ctx: &SemanticContext<'_, '_>,
         expr: &ast::Expr,
-        file_id: FileId,
-        source: &str,
-        loop_ranges: &[(u32, u32)],
         result: &mut HashMap<TextSize, LastUseInfo>,
     ) {
         match expr {
             ast::Expr::BlockExpr(block) => {
-                self.collect_block_last_uses_with_sema(sema, block, file_id, source, loop_ranges, result);
+                self.collect_block_last_uses(ctx, block, result);
             }
             ast::Expr::IfExpr(if_expr) => {
                 if let Some(then_branch) = if_expr.then_branch() {
-                    self.collect_block_last_uses_with_sema(sema, &then_branch, file_id, source, loop_ranges, result);
+                    self.collect_block_last_uses(ctx, &then_branch, result);
                 }
                 if let Some(else_branch) = if_expr.else_branch() {
                     match else_branch {
                         ast::ElseBranch::Block(block) => {
-                            self.collect_block_last_uses_with_sema(sema, &block, file_id, source, loop_ranges, result);
+                            self.collect_block_last_uses(ctx, &block, result);
                         }
                         ast::ElseBranch::IfExpr(nested) => {
-                            self.collect_expr_last_uses_with_sema(
-                                sema,
-                                &ast::Expr::IfExpr(nested),
-                                file_id,
-                                source,
-                                loop_ranges,
-                                result,
-                            );
+                            self.collect_expr_last_uses(ctx, &ast::Expr::IfExpr(nested), result);
                         }
                     }
                 }
             }
             ast::Expr::LoopExpr(loop_expr) => {
                 if let Some(body) = loop_expr.loop_body() {
-                    self.collect_block_last_uses_with_sema(sema, &body, file_id, source, loop_ranges, result);
+                    self.collect_block_last_uses(ctx, &body, result);
                 }
             }
             ast::Expr::WhileExpr(while_expr) => {
                 if let Some(body) = while_expr.loop_body() {
-                    self.collect_block_last_uses_with_sema(sema, &body, file_id, source, loop_ranges, result);
+                    self.collect_block_last_uses(ctx, &body, result);
                 }
             }
             ast::Expr::ForExpr(for_expr) => {
                 if let Some(pat) = for_expr.pat() {
-                    self.collect_pat_last_uses_with_sema(sema, &pat, file_id, source, loop_ranges, result);
+                    self.collect_pat_last_uses(ctx, &pat, result);
                 }
                 if let Some(body) = for_expr.loop_body() {
-                    self.collect_block_last_uses_with_sema(sema, &body, file_id, source, loop_ranges, result);
+                    self.collect_block_last_uses(ctx, &body, result);
                 }
             }
             ast::Expr::MatchExpr(match_expr) => {
                 if let Some(arm_list) = match_expr.match_arm_list() {
                     for arm in arm_list.arms() {
                         if let Some(pat) = arm.pat() {
-                            self.collect_pat_last_uses_with_sema(sema, &pat, file_id, source, loop_ranges, result);
+                            self.collect_pat_last_uses(ctx, &pat, result);
                         }
                         if let Some(expr) = arm.expr() {
-                            self.collect_expr_last_uses_with_sema(sema, &expr, file_id, source, loop_ranges, result);
+                            self.collect_expr_last_uses(ctx, &expr, result);
                         }
                     }
                 }
@@ -440,25 +434,22 @@ impl SemanticAnalyzer {
                 if let Some(param_list) = closure.param_list() {
                     for param in param_list.params() {
                         if let Some(pat) = param.pat() {
-                            self.collect_pat_last_uses_with_sema(sema, &pat, file_id, source, loop_ranges, result);
+                            self.collect_pat_last_uses(ctx, &pat, result);
                         }
                     }
                 }
                 if let Some(body) = closure.body() {
-                    self.collect_expr_last_uses_with_sema(sema, &body, file_id, source, loop_ranges, result);
+                    self.collect_expr_last_uses(ctx, &body, result);
                 }
             }
             _ => {}
         }
     }
 
-    fn collect_pat_last_uses_with_sema<'db>(
+    fn collect_pat_last_uses(
         &self,
-        sema: &Semantics<'db, ra_ap_ide::RootDatabase>,
+        ctx: &SemanticContext<'_, '_>,
         pat: &ast::Pat,
-        file_id: FileId,
-        source: &str,
-        loop_ranges: &[(u32, u32)],
         result: &mut HashMap<TextSize, LastUseInfo>,
     ) {
         match pat {
@@ -467,16 +458,16 @@ impl SemanticAnalyzer {
                     let offset = name.syntax().text_range().start();
                     let name_str = name.text().to_string();
 
-                    if let Some(last_use_offset) = self.find_last_use(file_id, offset) {
-                        let last_use_line = offset_to_line(source, last_use_offset);
-                        let decl_line = offset_to_line(source, offset);
+                    if let Some(last_use_offset) = self.find_last_use(ctx.file_id, offset) {
+                        let last_use_line = offset_to_line(ctx.source, last_use_offset);
+                        let decl_line = offset_to_line(ctx.source, offset);
 
                         // Compute drop_line: if last use is in a loop but decl is outside,
                         // the drop should be after the loop ends
-                        let drop_line = compute_drop_line(decl_line, last_use_line, loop_ranges);
+                        let drop_line = compute_drop_line(decl_line, last_use_line, ctx.loop_ranges);
 
                         // Check if this binding's type implements Copy using Semantics
-                        let is_copy = self.is_copy_binding_sema(sema, ident).unwrap_or(false);
+                        let is_copy = self.is_copy_binding_sema(ctx.sema, ident).unwrap_or(false);
 
                         result.insert(
                             offset,
@@ -494,7 +485,7 @@ impl SemanticAnalyzer {
             }
             ast::Pat::TuplePat(tuple) => {
                 for field in tuple.fields() {
-                    self.collect_pat_last_uses_with_sema(sema, &field, file_id, source, loop_ranges, result);
+                    self.collect_pat_last_uses(ctx, &field, result);
                 }
             }
             _ => {}
