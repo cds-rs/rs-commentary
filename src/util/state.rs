@@ -16,6 +16,8 @@ pub struct LineState {
     pub states: HashMap<String, (SetEntryState, bool)>,
     /// Variables that were dropped at this line.
     pub dropped_here: Vec<String>,
+    /// Borrow relationships: borrow_name -> source_name (e.g., "y" -> "x" for `let y = &x`).
+    pub borrows_from: HashMap<String, String>,
 }
 
 /// Information about a variable that was dropped.
@@ -25,12 +27,16 @@ pub struct VariableDrop {
     pub name: String,
     /// Line where it was last seen.
     pub last_seen_line: u32,
+    /// If this was a borrow, the source variable that is now freed.
+    /// When a borrow ends, its source returns to owned state.
+    pub frees_source: Option<String>,
 }
 
 /// A time-traveling state machine for ownership tracking.
 ///
 /// Records state at each line and allows querying any point in history.
-/// Supports rewinding to previous states for comparison or re-rendering.
+/// Supports function-scoped variable tracking - each function maintains
+/// its own set of live variables, isolated from other functions.
 #[derive(Debug, Default)]
 pub struct StateTimeline {
     /// State snapshot at each line number.
@@ -44,6 +50,12 @@ pub struct StateTimeline {
     /// Semantic last-use data: map from variable name to last-use line (0-indexed).
     /// When present, this overrides heuristic drop detection.
     semantic_last_uses: HashMap<String, u32>,
+    /// Current function scope name.
+    current_scope: String,
+    /// Map from line number to scope name.
+    line_to_scope: HashMap<u32, String>,
+    /// Accumulated live variables per scope (carried forward within scope).
+    scope_live_vars: HashMap<String, HashSet<String>>,
 }
 
 impl StateTimeline {
@@ -99,36 +111,88 @@ impl StateTimeline {
             || trimmed.starts_with("pub unsafe fn ")
     }
 
+    /// Extract function name from a function declaration line.
+    pub fn extract_function_name(line: &str) -> String {
+        let trimmed = line.trim();
+        // Find "fn " and extract the name after it
+        if let Some(fn_pos) = trimmed.find("fn ") {
+            let after_fn = &trimmed[fn_pos + 3..];
+            // Function name ends at '(' or '<' (generics)
+            let end = after_fn
+                .find(|c: char| c == '(' || c == '<')
+                .unwrap_or(after_fn.len());
+            return after_fn[..end].trim().to_string();
+        }
+        "unknown".to_string()
+    }
+
+    /// Get the scope name for a line.
+    pub fn get_scope(&self, line_num: u32) -> Option<&String> {
+        self.line_to_scope.get(&line_num)
+    }
+
     /// Record state for a line, computing transitions from previous line.
+    /// Maintains function-scoped variable tracking.
     pub fn record(&mut self, line_num: u32, entries: &[&SetEntry], line_text: &str) {
-        // Check for scope boundary
+        // Check for scope boundary - entering a new function
         if Self::is_function_boundary(line_text) {
+            let func_name = Self::extract_function_name(line_text);
+            self.current_scope = func_name.clone();
             self.scope_starts.push(line_num);
             self.shown_dropped.clear();
+            // Initialize fresh variable set for this scope
+            self.scope_live_vars.insert(func_name.clone(), HashSet::new());
         }
 
-        let prev_state = self.get(self.current_line);
+        // Record which scope this line belongs to
+        self.line_to_scope.insert(line_num, self.current_scope.clone());
 
-        // Compute current live set
+        // Get variables that should be live in this scope
+        let scope_vars = self.scope_live_vars
+            .get(&self.current_scope)
+            .cloned()
+            .unwrap_or_default();
+
+        // Filter entries to only include variables from current scope
+        // New variables are added to scope, existing ones are kept
+        let mut new_scope_vars = scope_vars.clone();
+        for entry in entries {
+            if !matches!(entry.state, SetEntryState::Dropped) {
+                new_scope_vars.insert(entry.name.clone());
+            }
+        }
+
+        // Compute current live set - only variables in this scope
         let live: HashSet<String> = entries
             .iter()
             .filter(|e| !matches!(e.state, SetEntryState::Dropped))
+            .filter(|e| new_scope_vars.contains(&e.name))
             .map(|e| e.name.clone())
             .collect();
 
-        // Compute states
+        // Compute states - only for variables in this scope
         let states: HashMap<String, (SetEntryState, bool)> = entries
             .iter()
+            .filter(|e| new_scope_vars.contains(&e.name))
             .map(|e| (e.name.clone(), (e.state.clone(), e.mutable)))
             .collect();
 
-        // Detect drops (variables in prev but not in current)
+        // Extract borrow relationships
+        let borrows_from: HashMap<String, String> = entries
+            .iter()
+            .filter(|e| new_scope_vars.contains(&e.name))
+            .filter_map(|e| e.borrows_from.as_ref().map(|from| (e.name.clone(), from.clone())))
+            .collect();
+
+        // Detect drops within this scope
+        let prev_state = self.get_in_scope(self.current_line, &self.current_scope);
         let dropped_here: Vec<String> = if let Some(prev) = prev_state {
             if !line_text.trim().starts_with('}') {
                 prev.live
                     .iter()
                     .filter(|v| !live.contains(*v))
-                    .filter(|v| prev.states.contains_key(*v)) // Only annotated vars
+                    .filter(|v| prev.states.contains_key(*v))
+                    .filter(|v| new_scope_vars.contains(*v))
                     .cloned()
                     .collect()
             } else {
@@ -138,15 +202,33 @@ impl StateTimeline {
             Vec::new()
         };
 
+        // Remove dropped variables from scope tracking
+        for dropped in &dropped_here {
+            new_scope_vars.remove(dropped);
+        }
+
+        // Update scope's live variables
+        self.scope_live_vars.insert(self.current_scope.clone(), new_scope_vars);
+
         self.history.insert(
             line_num,
             LineState {
                 live,
                 states,
                 dropped_here,
+                borrows_from,
             },
         );
         self.current_line = line_num;
+    }
+
+    /// Get state at a line, but only if it's in the specified scope.
+    fn get_in_scope(&self, line_num: u32, scope: &str) -> Option<&LineState> {
+        if self.line_to_scope.get(&line_num).map(|s| s.as_str()) == Some(scope) {
+            self.history.get(&line_num)
+        } else {
+            None
+        }
     }
 
     /// Get state at a specific line (time travel).
@@ -172,15 +254,41 @@ impl StateTimeline {
     ///
     /// When semantic data is available, uses accurate NLL drop points.
     /// Otherwise falls back to heuristic state-transition detection.
+    /// Only returns drops for variables in the current line's scope.
+    ///
+    /// Returns `VariableDrop` with `frees_source` populated when a borrow ends,
+    /// indicating that the source variable returns to owned state.
     pub fn get_pending_drops(&self, line_num: u32) -> Vec<VariableDrop> {
         let mut drops = Vec::new();
 
-        // Check semantic drops first
+        // Get current line's scope
+        let current_scope = self.line_to_scope.get(&line_num).cloned().unwrap_or_default();
+
+        // Get current line state to look up borrow relationships
+        let current_state = self.get(line_num);
+
+        // Get variables that are in this scope
+        let scope_vars = self.scope_live_vars
+            .get(&current_scope)
+            .cloned()
+            .unwrap_or_default();
+
+        // Check semantic drops first - only for variables in current scope
         for (name, &last_use_line) in &self.semantic_last_uses {
+            // Only process if variable is in current scope
+            if !scope_vars.contains(name) && !current_state.map(|s| s.states.contains_key(name)).unwrap_or(false) {
+                continue;
+            }
+
             if let Some(true) = self.should_show_drop_at(name, line_num) {
+                // Check if this was a borrow - look up in current state's borrow map
+                let frees_source = current_state
+                    .and_then(|s| s.borrows_from.get(name).cloned());
+
                 drops.push(VariableDrop {
                     name: name.clone(),
                     last_seen_line: last_use_line,
+                    frees_source,
                 });
             }
         }
@@ -191,15 +299,21 @@ impl StateTimeline {
         }
 
         // Fallback to heuristic detection
+        // Variables in dropped_here were detected as dropped during record()
+        // They may no longer be in scope_vars (removed after drop), so don't filter by scope
         self.get(line_num)
             .map(|state| {
                 state
                     .dropped_here
                     .iter()
                     .filter(|name| !self.shown_dropped.contains(*name))
-                    .map(|name| VariableDrop {
-                        name: name.clone(),
-                        last_seen_line: line_num.saturating_sub(1),
+                    .map(|name| {
+                        let frees_source = state.borrows_from.get(name).cloned();
+                        VariableDrop {
+                            name: name.clone(),
+                            last_seen_line: line_num.saturating_sub(1),
+                            frees_source,
+                        }
                     })
                     .collect()
             })
@@ -214,6 +328,61 @@ impl StateTimeline {
     /// Check if a drop has already been shown.
     pub fn is_drop_shown(&self, name: &str) -> bool {
         self.shown_dropped.contains(name)
+    }
+
+    /// Get the effective state for a line, accounting for NLL borrow endings.
+    ///
+    /// When a borrow ends (detected via semantic drop), the source variable
+    /// transitions back to owned state. This method returns the corrected states.
+    /// Only returns variables that are still live in the current scope.
+    ///
+    /// Returns a map of variable name to (effective_state, mutable, is_freed_from_borrow).
+    pub fn get_effective_state(&self, line_num: u32) -> HashMap<String, (SetEntryState, bool, bool)> {
+        let mut result = HashMap::new();
+
+        let Some(state) = self.get(line_num) else {
+            return result;
+        };
+
+        // Get current scope and its live variables
+        let current_scope = self.line_to_scope.get(&line_num).cloned().unwrap_or_default();
+        let scope_vars = self.scope_live_vars
+            .get(&current_scope)
+            .cloned()
+            .unwrap_or_default();
+
+        // Get drops for this line to find freed sources
+        let drops = self.get_pending_drops(line_num);
+        let freed_sources: HashSet<String> = drops
+            .iter()
+            .filter_map(|d| d.frees_source.clone())
+            .collect();
+        let drop_names: HashSet<&str> = drops.iter().map(|d| d.name.as_str()).collect();
+
+        for (name, (entry_state, mutable)) in &state.states {
+            // Only include variables that are still live in this scope
+            if !scope_vars.contains(name) {
+                continue;
+            }
+            // Skip dropped entries
+            if matches!(entry_state, SetEntryState::Dropped) {
+                continue;
+            }
+            // Skip borrows that are ending (they'll be in drops)
+            if drop_names.contains(name.as_str()) {
+                continue;
+            }
+
+            // Check if this variable is freed from a borrow
+            if freed_sources.contains(name) {
+                // Variable returns to owned state
+                result.insert(name.clone(), (SetEntryState::Owned, *mutable, true));
+            } else {
+                result.insert(name.clone(), (entry_state.clone(), *mutable, false));
+            }
+        }
+
+        result
     }
 
     /// Get entries that changed state from the previous line.

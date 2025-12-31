@@ -111,17 +111,17 @@ pub fn render_source_semantic(
     let diagnostics = analyzer.diagnostics(file_id);
 
     // Get semantic last-use data for accurate NLL drops
-    // Uses drop_line which accounts for loop boundaries
-    let last_uses = analyzer.find_all_last_uses(file_id, source);
+    let last_use_info = analyzer.find_all_last_uses(file_id, source);
 
-    // Extract drop lines for NLL tracking
-    let semantic_drops: std::collections::HashMap<String, u32> = last_uses
+    // Extract drop lines: line AFTER last use (already computed by semantic analysis)
+    // Key is (name, decl_line) to disambiguate variables with the same name in different scopes
+    let drop_lines: HashMap<(String, u32), u32> = last_use_info
         .values()
-        .map(|info| (info.name.clone(), info.drop_line))
+        .map(|info| ((info.name.clone(), info.decl_line), info.drop_line))
         .collect();
 
     // Extract Copy type info for accurate filtering
-    let copy_types: HashMap<String, bool> = last_uses
+    let copy_types: HashMap<String, bool> = last_use_info
         .values()
         .map(|info| (info.name.clone(), info.is_copy))
         .collect();
@@ -136,7 +136,7 @@ pub fn render_source_semantic(
 
     // Create context with semantic Copy info for accurate filtering
     let mut ctx = RenderContext::new_with_semantic(source, set_annotations, config.clone(), copy_types.clone());
-    ctx.set_semantic_last_uses(semantic_drops.clone());
+    ctx.set_semantic_drop_lines(drop_lines);
 
     // For Validated style, use the special renderer
     if matches!(style, RenderStyle::Validated) {

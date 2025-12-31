@@ -734,8 +734,10 @@ fn compute_drop_line(decl_line: u32, last_use_line: u32, loop_ranges: &[(u32, u3
         }
     }
 
-    // If we found a loop that contains the last use but not decl, drop after the loop
-    best_loop_end.unwrap_or(last_use_line)
+    // If we found a loop that contains the last use but not decl, drop after the loop.
+    // For loops: drop at loop_end (the closing brace line).
+    // For non-loops: drop on the line AFTER last use.
+    best_loop_end.unwrap_or(last_use_line + 1)
 }
 
 #[cfg(test)]

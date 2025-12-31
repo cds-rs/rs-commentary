@@ -109,7 +109,8 @@ fn main() -> Result<()> {
                 }
             };
 
-            let config = RenderConfig::new().with_filter_copy(!all);
+            let config = RenderConfig::new()
+                .with_filter_copy(!all);
 
             // Try semantic analysis first for accurate NLL drop detection
             let output = if let Some(ref path) = file_path {

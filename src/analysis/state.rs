@@ -540,7 +540,7 @@ pub struct SetEntry {
 }
 
 /// Simplified state for set notation display.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SetEntryState {
     /// Owned binding (shows as `x` or `mut x`)
     Owned,

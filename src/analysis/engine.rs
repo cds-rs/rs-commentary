@@ -501,13 +501,7 @@ impl OwnershipAnalyzer {
 
         let fn_scope = self.enter_scope();
 
-        // Snapshot at function entry (empty set)
-        if let Some(body) = func.body() {
-            let start = u32::from(body.syntax().text_range().start());
-            self.snapshot_set(start);
-        }
-
-        // Process parameters with type info
+        // Process parameters FIRST (before snapshot) so they appear at function entry
         if let Some(param_list) = func.param_list() {
             for param in param_list.params() {
                 let type_str = param.ty().map(|ty| ty.syntax().text().to_string());
@@ -517,6 +511,10 @@ impl OwnershipAnalyzer {
                 }
             }
         }
+
+        // THEN snapshot at function signature line (captures parameters)
+        let fn_start = u32::from(func.syntax().text_range().start());
+        self.snapshot_set(fn_start);
 
         // Process body inline (not via visit_block_expr to keep params in same scope)
         if let Some(body) = func.body() {
@@ -1364,7 +1362,7 @@ impl Default for OwnershipAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::Capabilities;
+    use crate::analysis::{Capabilities, SetEntryState};
 
     #[test]
     fn test_basic_let_binding() {
@@ -1818,5 +1816,107 @@ fn main() {
 
         let set_str = format!("{}", set_with_r.unwrap().set);
         assert!(set_str.contains("main{"), "Should have main scope prefix");
+    }
+
+    #[test]
+    fn test_parameter_at_function_entry() {
+        // Parameters should appear at the function signature line, not when first used
+        let source = r#"
+fn greet(name: &str) {
+    println!("{}", name);
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let _ = analyzer.analyze(source).unwrap();
+        let sets = analyzer.set_annotations();
+
+        // Function signature is line 1 (0-indexed), parameter should be there
+        let fn_entry_set = sets.iter().find(|s| s.line == 1);
+        assert!(fn_entry_set.is_some(), "Should have set at function entry (line 1)");
+
+        let entries = &fn_entry_set.unwrap().set.entries;
+        let name_entry = entries.iter().find(|e| e.name == "name");
+        assert!(name_entry.is_some(), "Parameter 'name' should be in function entry set");
+        assert!(
+            matches!(name_entry.unwrap().state, SetEntryState::SharedBorrow),
+            "Parameter 'name: &str' should be SharedBorrow"
+        );
+    }
+
+    #[test]
+    fn test_owned_parameter_at_function_entry() {
+        let source = r#"
+fn consume(s: String) {
+    drop(s);
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let _ = analyzer.analyze(source).unwrap();
+        let sets = analyzer.set_annotations();
+
+        let fn_entry_set = sets.iter().find(|s| s.line == 1);
+        assert!(fn_entry_set.is_some(), "Should have set at function entry");
+
+        let entries = &fn_entry_set.unwrap().set.entries;
+        let s_entry = entries.iter().find(|e| e.name == "s");
+        assert!(s_entry.is_some(), "Parameter 's' should be in function entry set");
+        assert!(
+            matches!(s_entry.unwrap().state, SetEntryState::Owned),
+            "Parameter 's: String' should be Owned"
+        );
+    }
+
+    #[test]
+    fn test_mut_borrow_parameter_at_function_entry() {
+        let source = r#"
+fn modify(data: &mut Vec<i32>) {
+    data.push(1);
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let _ = analyzer.analyze(source).unwrap();
+        let sets = analyzer.set_annotations();
+
+        let fn_entry_set = sets.iter().find(|s| s.line == 1);
+        assert!(fn_entry_set.is_some(), "Should have set at function entry");
+
+        let entries = &fn_entry_set.unwrap().set.entries;
+        let data_entry = entries.iter().find(|e| e.name == "data");
+        assert!(data_entry.is_some(), "Parameter 'data' should be in function entry set");
+        assert!(
+            matches!(data_entry.unwrap().state, SetEntryState::MutBorrow),
+            "Parameter 'data: &mut Vec<i32>' should be MutBorrow"
+        );
+    }
+
+    #[test]
+    fn test_multiple_parameters_at_function_entry() {
+        let source = r#"
+fn process(a: String, b: &str, c: &mut i32) {
+    *c = a.len() as i32;
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let _ = analyzer.analyze(source).unwrap();
+        let sets = analyzer.set_annotations();
+
+        let fn_entry_set = sets.iter().find(|s| s.line == 1);
+        assert!(fn_entry_set.is_some(), "Should have set at function entry");
+
+        let entries = &fn_entry_set.unwrap().set.entries;
+
+        // All three parameters should be present
+        assert!(entries.iter().any(|e| e.name == "a"), "Should have parameter 'a'");
+        assert!(entries.iter().any(|e| e.name == "b"), "Should have parameter 'b'");
+        assert!(entries.iter().any(|e| e.name == "c"), "Should have parameter 'c'");
+
+        // Check their types
+        let a = entries.iter().find(|e| e.name == "a").unwrap();
+        let b = entries.iter().find(|e| e.name == "b").unwrap();
+        let c = entries.iter().find(|e| e.name == "c").unwrap();
+
+        assert!(matches!(a.state, SetEntryState::Owned), "a: String should be Owned");
+        assert!(matches!(b.state, SetEntryState::SharedBorrow), "b: &str should be SharedBorrow");
+        assert!(matches!(c.state, SetEntryState::MutBorrow), "c: &mut i32 should be MutBorrow");
     }
 }
