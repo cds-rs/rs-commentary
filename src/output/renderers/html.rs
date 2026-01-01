@@ -11,7 +11,7 @@
 
 use crate::analysis::SetEntryState;
 use crate::execution::FunctionView;
-use crate::output::context::RenderContext;
+use crate::output::context::{AnnotationTracker, LineContent, RenderContext};
 use crate::output::traits::RichTextRenderer;
 use crate::util::{BoundaryState, TransitionReason};
 
@@ -43,6 +43,7 @@ impl RichTextRenderer for HtmlRenderer {
 {slides}
     </div>
   </div>
+  <div id="zoom-indicator" title="Zoom: +/- or 0 to reset">100%</div>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.6.1/reveal.min.js"></script>
   <script>
     Reveal.initialize({{
@@ -67,6 +68,66 @@ impl RichTextRenderer for HtmlRenderer {
           Reveal.slide(indices.h, indices.v);
         }}
       }});
+    }});
+
+    // Center the current line in the code panel when slide changes
+    function scrollToCurrentLine() {{
+      const currentSlide = Reveal.getCurrentSlide();
+      if (!currentSlide) return;
+      const currentLine = currentSlide.querySelector('.line.current');
+      if (currentLine) {{
+        currentLine.scrollIntoView({{ block: 'center', behavior: 'instant' }});
+      }}
+    }}
+
+    Reveal.on('slidechanged', scrollToCurrentLine);
+    Reveal.on('ready', scrollToCurrentLine);
+
+    // Zoom controls: +/= to zoom in, - to zoom out, 0 to reset
+    let zoomLevel = 1.0;
+    const zoomStep = 0.15;
+    const zoomMin = 0.5;
+    const zoomMax = 2.5;
+    const zoomIndicator = document.getElementById('zoom-indicator');
+    const baseFontSizes = {{ code: 0.65, state: 0.7, desc: 0.75 }};
+
+    function updateZoom() {{
+      // Scale font sizes within content areas
+      document.querySelectorAll('.code-block').forEach(el => {{
+        el.style.fontSize = `${{baseFontSizes.code * zoomLevel}}em`;
+      }});
+      document.querySelectorAll('.state-block').forEach(el => {{
+        el.style.fontSize = `${{baseFontSizes.state * zoomLevel}}em`;
+      }});
+      document.querySelectorAll('.description').forEach(el => {{
+        el.style.fontSize = `${{baseFontSizes.desc * zoomLevel}}em`;
+      }});
+      if (zoomIndicator) {{
+        zoomIndicator.textContent = `${{Math.round(zoomLevel * 100)}}%`;
+        zoomIndicator.style.opacity = '1';
+        setTimeout(() => zoomIndicator.style.opacity = '0.5', 1000);
+      }}
+      // Re-center after zoom
+      setTimeout(scrollToCurrentLine, 50);
+    }}
+
+    document.addEventListener('keydown', (e) => {{
+      // Ignore if typing in an input
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+
+      if (e.key === '=' || e.key === '+') {{
+        e.preventDefault();
+        zoomLevel = Math.min(zoomMax, zoomLevel + zoomStep);
+        updateZoom();
+      }} else if (e.key === '-') {{
+        e.preventDefault();
+        zoomLevel = Math.max(zoomMin, zoomLevel - zoomStep);
+        updateZoom();
+      }} else if (e.key === '0') {{
+        e.preventDefault();
+        zoomLevel = 1.0;
+        updateZoom();
+      }}
     }});
   </script>
 </body>
@@ -124,36 +185,53 @@ fn build_title_slide(functions: &[FunctionView]) -> String {
 
 /// Build slides for a single function.
 fn build_function_slides(ctx: &RenderContext, func: &FunctionView, slides: &mut String) {
-    let lines: Vec<u32> = func.lines().collect();
-    let total = lines.len();
+    // Use unified annotation tracker from context
+    let mut tracker = AnnotationTracker::new();
 
-    for (step_idx, &line_num) in lines.iter().enumerate() {
+    // Collect lines that have pedagogical value using unified LineContent
+    let interesting_lines: Vec<LineContent> = func
+        .lines()
+        .filter_map(|line_num| {
+            let content = ctx.get_line_content(line_num, &mut tracker);
+            if content.is_interesting() {
+                Some(content)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let total = interesting_lines.len();
+
+    for (step_idx, content) in interesting_lines.into_iter().enumerate() {
         let is_first = step_idx == 0;
-        let slide = build_function_slide(ctx, func, line_num, step_idx, total, is_first);
+        let slide = build_function_slide_from_content(ctx, func, &content, step_idx, total, is_first);
         slides.push_str(&slide);
     }
 }
 
-/// Build a single slide for a function line.
-fn build_function_slide(
+/// Build a slide from unified LineContent.
+fn build_function_slide_from_content(
     ctx: &RenderContext,
     func: &FunctionView,
-    current_line: u32,
+    content: &LineContent,
     step_idx: usize,
     total_steps: usize,
     is_first: bool,
 ) -> String {
+    let current_line = content.line_num;
+
     // Build code panel - show only this function's lines, with current highlighted
     let code_html = build_code_panel_for_function(ctx, func, current_line);
 
-    // Get boundary state for state panel and description (computed from timeline diff)
+    // Get boundary state for state panel
     let boundary_state = ctx.timeline.boundary_state(current_line);
 
     // Build state panel
     let state_html = build_state_panel(ctx, boundary_state.as_ref());
 
-    // Build description
-    let desc = build_description(boundary_state.as_ref(), ctx, current_line);
+    // Build description from unified LineContent
+    let desc = build_description_from_content(content);
 
     // Add data attribute for first slide to enable navigation
     let first_attr = if is_first {
@@ -175,7 +253,7 @@ fn build_function_slide(
           </div>
           <div class="state-panel">
             <div class="panel-title">Ownership State</div>
-            <pre class="state-block">{}</pre>
+            <div class="state-block">{}</div>
           </div>
         </div>
         <div class="description">{}</div>
@@ -192,12 +270,78 @@ fn build_function_slide(
     )
 }
 
+/// Build description from unified LineContent.
+fn build_description_from_content(content: &LineContent) -> String {
+    let mut parts = Vec::new();
+
+    // Describe new variables
+    for var in &content.new_vars {
+        let state_desc = state_short_desc(&var.state, var.mutable);
+        parts.push(format!(
+            "<span class=\"new\">NEW:</span> <code>{}</code> introduced as {}",
+            var.name, state_desc
+        ));
+    }
+
+    // Describe state transitions
+    for (name, transition) in &content.transitions {
+        let from_desc = state_short_desc(&transition.from, false);
+        let to_desc = state_short_desc(&transition.to, false);
+        let reason_desc = format_transition_reason(&transition.reason);
+        parts.push(format!(
+            "<span class=\"transition\">↔</span> <code>{}</code>: {} → {}{}",
+            name,
+            from_desc,
+            to_desc,
+            reason_desc
+        ));
+    }
+
+    // Describe copy events (using pre-computed "still valid" from LineContent)
+    for copy in &content.copy_events {
+        let still_valid = if copy.show_still_valid {
+            format!("; <code>{}</code> still valid", copy.from)
+        } else {
+            String::new()
+        };
+        parts.push(format!(
+            "<span class=\"call-transfer\">⟳</span> <code>{}</code> copied → {} (Copy){}",
+            copy.from, copy.to, still_valid
+        ));
+    }
+
+    // Describe drops
+    for var in &content.drops {
+        parts.push(format!(
+            "<span class=\"drop-msg\">†</span> <code>{}</code> dropped (NLL)",
+            var.name
+        ));
+    }
+
+    if parts.is_empty() {
+        // Show current line code as context
+        let trimmed = content.line_text.trim();
+        if !trimmed.is_empty() {
+            return format!("<code>{}</code>", html_escape(trimmed));
+        }
+        String::new()
+    } else {
+        parts.join(" &nbsp;│&nbsp; ")
+    }
+}
+
 /// Build the code panel showing only the current function's lines.
 fn build_code_panel_for_function(ctx: &RenderContext, func: &FunctionView, current_line: u32) -> String {
     let mut code_html = String::new();
 
     for line_num in func.lines() {
         let line = ctx.lines.get(line_num as usize).copied().unwrap_or("");
+
+        // Skip empty lines (e.g., from stripped comments)
+        if line.trim().is_empty() {
+            continue;
+        }
+
         let escaped = html_escape(line);
         let class = if line_num == current_line { "line current" } else { "line" };
 
@@ -205,7 +349,7 @@ fn build_code_panel_for_function(ctx: &RenderContext, func: &FunctionView, curre
             r#"<div class="{}"><span class="ln">{:3}</span> {}</div>"#,
             class,
             line_num + 1,
-            if escaped.is_empty() { "&nbsp;" } else { &escaped }
+            &escaped
         ));
         code_html.push('\n');
     }
@@ -213,19 +357,14 @@ fn build_code_panel_for_function(ctx: &RenderContext, func: &FunctionView, curre
     code_html
 }
 
-/// Build ASCII state panel showing all variables and their states.
+/// Build state panel as an HTML table.
 fn build_state_panel(ctx: &RenderContext, boundary: Option<&BoundaryState>) -> String {
-    let mut lines = Vec::new();
-
-    // Box top
-    lines.push("┌────────────────────────────────┐".to_string());
-    lines.push("│  <span class=\"state-header\">Variable         State</span>       │".to_string());
-    lines.push("├────────────────────────────────┤".to_string());
+    let mut html = String::from(r#"<table class="state-table"><thead><tr><th>Variable</th><th>State</th></tr></thead><tbody>"#);
 
     let Some(state) = boundary else {
-        lines.push("│  <span class=\"empty\">(no tracked variables)</span>       │".to_string());
-        lines.push("└────────────────────────────────┘".to_string());
-        return lines.join("\n");
+        html.push_str(r#"<tr><td colspan="2" class="empty">(no tracked variables)</td></tr>"#);
+        html.push_str("</tbody></table>");
+        return html;
     };
 
     // Display live variables
@@ -253,16 +392,12 @@ fn build_state_panel(ctx: &RenderContext, boundary: Option<&BoundaryState>) -> S
         // Highlight if newly introduced or state changed
         let is_new = state.is_new(&var.name);
         let has_transition = state.has_transition(&var.name);
-        let (open_tag, close_tag) = if is_new || has_transition {
-            ("<span class=\"changed\">", "</span>")
-        } else {
-            ("", "")
-        };
+        let row_class = if is_new || has_transition { " class=\"changed\"" } else { "" };
 
-        let var_display = format!("{}{:<12}{}", open_tag, var.name, close_tag);
-        let state_display = format!("{} {}", dots, state_desc);
-
-        lines.push(format!("│  {}  {:<16} │", var_display, state_display));
+        html.push_str(&format!(
+            "<tr{}><td>{}</td><td><span class=\"dots\">{}</span> {}</td></tr>",
+            row_class, var.name, dots, state_desc
+        ));
     }
 
     // Display dropped variables
@@ -273,77 +408,18 @@ fn build_state_panel(ctx: &RenderContext, boundary: Option<&BoundaryState>) -> S
         }
 
         has_vars = true;
-        lines.push(format!(
-            "│  <span class=\"dropped\">{:<12}  ───  dropped</span>       │",
-            format!("{}†", var.name)
+        html.push_str(&format!(
+            r#"<tr class="dropped"><td>{}†</td><td><span class="dots">───</span> dropped</td></tr>"#,
+            var.name
         ));
     }
 
     if !has_vars {
-        lines.push("│  <span class=\"empty\">(no tracked variables)</span>       │".to_string());
+        html.push_str(r#"<tr><td colspan="2" class="empty">(no tracked variables)</td></tr>"#);
     }
 
-    // Box bottom
-    lines.push("└────────────────────────────────┘".to_string());
-
-    lines.join("\n")
-}
-
-/// Build description text for changes at this line.
-fn build_description(
-    boundary: Option<&BoundaryState>,
-    ctx: &RenderContext,
-    line_num: u32,
-) -> String {
-    let mut parts = Vec::new();
-
-    if let Some(state) = boundary {
-        // Describe new variables
-        for var in &state.new_vars {
-            let state_desc = state_short_desc(&var.state, var.mutable);
-            parts.push(format!(
-                "<span class=\"new\">NEW:</span> <code>{}</code> introduced as {}",
-                var.name, state_desc
-            ));
-        }
-
-        // Describe state transitions
-        for (name, transition) in &state.delta_vars {
-            let from_desc = state_short_desc(&transition.from, false);
-            let to_desc = state_short_desc(&transition.to, false);
-            let reason_desc = format_transition_reason(&transition.reason);
-            parts.push(format!(
-                "<span class=\"transition\">{}</span> <code>{}</code>: {} → {}{}",
-                "↔",
-                name,
-                from_desc,
-                to_desc,
-                reason_desc
-            ));
-        }
-
-        // Describe drops
-        for var in &state.dropped_vars {
-            parts.push(format!(
-                "<span class=\"drop-msg\">†</span> <code>{}</code> dropped (NLL)",
-                var.name
-            ));
-        }
-    }
-
-    // Show current line of code if no other description
-    if let Some(line) = ctx.lines.get(line_num as usize) {
-        let trimmed = line.trim();
-        if !trimmed.is_empty() && parts.is_empty() {
-            parts.push(format!("<code>{}</code>", html_escape(trimmed)));
-        }
-    }
-
-    if parts.is_empty() {
-        String::new()
-    } else {
-        parts.join(" &nbsp;│&nbsp; ")
-    }
+    html.push_str("</tbody></table>");
+    html
 }
 
 fn state_short_desc(state: &SetEntryState, mutable: bool) -> &'static str {
@@ -530,7 +606,7 @@ const CSS_STYLES: &str = r#"
       margin-right: 16px;
     }
 
-    /* State block */
+    /* State block with table */
     .state-block {
       margin: 0;
       padding: 12px 16px;
@@ -538,21 +614,40 @@ const CSS_STYLES: &str = r#"
       line-height: 1.5;
     }
 
-    .state-header {
-      color: var(--line-num);
-      font-weight: bold;
+    .state-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: inherit;
     }
 
-    .state-block .changed {
+    .state-table th {
+      text-align: left;
+      color: var(--line-num);
+      font-weight: bold;
+      padding: 4px 8px;
+      border-bottom: 1px solid var(--highlight);
+    }
+
+    .state-table td {
+      padding: 4px 8px;
+      vertical-align: top;
+    }
+
+    .state-table tr.changed td {
       color: var(--changed);
       font-weight: bold;
     }
 
-    .state-block .dropped {
+    .state-table tr.dropped td {
       color: var(--dropped);
     }
 
-    .state-block .empty {
+    .state-table .dots {
+      font-family: inherit;
+      margin-right: 6px;
+    }
+
+    .state-table .empty {
       color: var(--line-num);
       font-style: italic;
     }
@@ -598,5 +693,26 @@ const CSS_STYLES: &str = r#"
 
     .reveal .controls {
       color: var(--owned-mut);
+    }
+
+    /* Zoom indicator */
+    #zoom-indicator {
+      position: fixed;
+      bottom: 60px;
+      right: 20px;
+      background: var(--highlight);
+      color: var(--fg);
+      padding: 6px 12px;
+      border-radius: 4px;
+      font-size: 0.75em;
+      font-weight: bold;
+      opacity: 0.5;
+      transition: opacity 0.3s;
+      cursor: help;
+      z-index: 100;
+    }
+
+    #zoom-indicator:hover {
+      opacity: 1;
     }
 "#;

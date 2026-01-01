@@ -1,9 +1,103 @@
 //! Render context - holds analyzed data for renderers.
 
 use crate::analysis::{BindingKind, CopyEvent, OwnershipSet, SetAnnotation, SetEntry, SetEntryState};
-use crate::util::StateTimeline;
+use crate::util::{StateTimeline, StateTransition, VarSnapshot};
 use super::types::RenderConfig;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+// ============================================================================
+// Unified Line Content - Single source of truth for all renderers
+// ============================================================================
+
+/// Processed copy event with computed "still valid" status.
+#[derive(Debug, Clone)]
+pub struct ProcessedCopy {
+    /// Variable being copied from.
+    pub from: String,
+    /// Target (function name or variable).
+    pub to: String,
+    /// Whether the source variable is still used after this line.
+    pub still_valid: bool,
+    /// Whether this is the first time we're showing "still valid" for this var.
+    pub show_still_valid: bool,
+}
+
+/// Unified line content - all pedagogically relevant info for a line.
+/// This is the single source of truth that all renderers consume.
+#[derive(Debug, Clone)]
+pub struct LineContent {
+    /// Line number (0-indexed).
+    pub line_num: u32,
+    /// Source text for this line.
+    pub line_text: String,
+    /// Variables newly introduced on this line.
+    pub new_vars: Vec<VarSnapshot>,
+    /// State transitions on this line.
+    pub transitions: Vec<(String, StateTransition)>,
+    /// Variables dropped on this line.
+    pub drops: Vec<VarSnapshot>,
+    /// Processed copy events with "still valid" info.
+    pub copy_events: Vec<ProcessedCopy>,
+}
+
+impl LineContent {
+    /// Returns true if this line has pedagogical value worth showing.
+    pub fn is_interesting(&self) -> bool {
+        // Skip empty lines
+        if self.line_text.trim().is_empty() {
+            return false;
+        }
+
+        // Skip lines that are just closing braces with no ownership events
+        let trimmed = self.line_text.trim();
+        if trimmed == "}" || trimmed == "};" {
+            return !self.drops.is_empty();
+        }
+
+        // Interesting if any ownership event happens
+        !self.new_vars.is_empty()
+            || !self.transitions.is_empty()
+            || !self.drops.is_empty()
+            || !self.copy_events.is_empty()
+    }
+}
+
+/// Tracks state across lines to avoid duplicate annotations.
+#[derive(Debug, Default)]
+pub struct AnnotationTracker {
+    /// Variables for which we've already shown "still valid".
+    shown_still_valid: HashSet<String>,
+    /// Variables for which we've already shown introduction.
+    shown_introductions: HashSet<String>,
+}
+
+impl AnnotationTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Check if we should show "still valid" for a variable, and mark it as shown.
+    /// Returns true if this is the first time we're showing "still valid" for this var.
+    pub fn should_show_still_valid(&mut self, name: &str) -> bool {
+        if self.shown_still_valid.contains(name) {
+            false
+        } else {
+            self.shown_still_valid.insert(name.to_string());
+            true
+        }
+    }
+
+    /// Check if we should show introduction for a variable, and mark it as shown.
+    /// Returns true if this is the first time we're showing this introduction.
+    pub fn should_show_introduction(&mut self, name: &str) -> bool {
+        if self.shown_introductions.contains(name) {
+            false
+        } else {
+            self.shown_introductions.insert(name.to_string());
+            true
+        }
+    }
+}
 
 /// Context passed to renderers with analyzed data.
 pub struct RenderContext<'a> {
@@ -231,7 +325,7 @@ impl<'a> RenderContext<'a> {
         }
 
         // Collect names of variables with copy events
-        let copy_var_names: std::collections::HashSet<&str> =
+        let copy_var_names: HashSet<&str> =
             copy_events.iter().map(|c| c.from.as_str()).collect();
 
         // Filter out state changes for those variables
@@ -239,5 +333,73 @@ impl<'a> RenderContext<'a> {
             .into_iter()
             .filter(|change| !copy_var_names.contains(change.name.as_str()))
             .collect()
+    }
+
+    /// Get unified line content for a line.
+    ///
+    /// This is the single source of truth for all renderers. It combines:
+    /// - New variable introductions (deduplicated via tracker)
+    /// - State transitions
+    /// - Drops
+    /// - Copy events with "still valid" info (deduplicated via tracker)
+    pub fn get_line_content(&self, line: u32, tracker: &mut AnnotationTracker) -> LineContent {
+        let line_text = self.lines.get(line as usize).copied().unwrap_or("").to_string();
+        let boundary = self.timeline.boundary_state(line);
+
+        // Process copy events with deduplication
+        let raw_copies = self.get_copy_events(line);
+        let copy_events: Vec<ProcessedCopy> = raw_copies
+            .iter()
+            .filter(|c| !c.is_scalar_in_call) // Skip low-value scalar copies
+            .map(|c| {
+                let still_valid = !self.is_dead_after(&c.from, line);
+                let show_still_valid = if still_valid && !tracker.shown_still_valid.contains(&c.from) {
+                    tracker.shown_still_valid.insert(c.from.clone());
+                    true
+                } else {
+                    false
+                };
+                ProcessedCopy {
+                    from: c.from.clone(),
+                    to: c.to.clone(),
+                    still_valid,
+                    show_still_valid,
+                }
+            })
+            .collect();
+
+        if let Some(state) = boundary {
+            // Filter new vars to avoid duplicate introductions
+            let new_vars: Vec<VarSnapshot> = state
+                .new_vars
+                .into_iter()
+                .filter(|v| {
+                    if tracker.shown_introductions.contains(&v.name) {
+                        false
+                    } else {
+                        tracker.shown_introductions.insert(v.name.clone());
+                        true
+                    }
+                })
+                .collect();
+
+            LineContent {
+                line_num: line,
+                line_text,
+                new_vars,
+                transitions: state.delta_vars.into_iter().collect(),
+                drops: state.dropped_vars,
+                copy_events,
+            }
+        } else {
+            LineContent {
+                line_num: line,
+                line_text,
+                new_vars: Vec::new(),
+                transitions: Vec::new(),
+                drops: Vec::new(),
+                copy_events,
+            }
+        }
     }
 }

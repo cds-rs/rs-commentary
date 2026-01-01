@@ -57,14 +57,13 @@ fn test_drop_removes_variable_from_subsequent_lines() {
     );
 
     // Verify NLL drop semantics:
-    // 1. Drop annotation shows on the line AFTER last use (line 6: println!("after drop"))
-    // 2. At the closing brace (line 7), x should NOT appear at all
+    // 1. x should be shown as dropped (x†) at its last use line
+    // 2. The closing brace is skipped (no pedagogical value) unless something drops there
 
-    // The closing brace section (Step 7/7) should show "(no tracked variables)"
-    // This means x has fully disappeared after the drop line
+    // x should be shown as dropped
     assert!(
-        html.contains("(no tracked variables)"),
-        "Closing brace should show no tracked variables after drop"
+        html.contains("x†") || html.contains("<code>x</code> dropped"),
+        "x should be shown as dropped"
     );
 
     // x should NOT appear as Owned (●●●) after being dropped

@@ -1,6 +1,6 @@
 //! Diagnostic renderer - rustc-style with line numbers and underlines.
 
-use crate::output::context::RenderContext;
+use crate::output::context::{AnnotationTracker, RenderContext};
 use crate::output::helpers::get_line_annotations;
 use crate::output::traits::RichTextRenderer;
 use crate::util::InvalidationReason;
@@ -32,8 +32,8 @@ impl RichTextRenderer for DiagnosticRenderer {
         let mut output = String::new();
         let line_num_width = ctx.lines.len().to_string().len().max(2);
 
-        // Track variables that have already shown "still valid" (only show once per variable)
-        let mut shown_still_valid: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Use unified tracker for deduplication (consistent with HTML renderer)
+        let mut tracker = AnnotationTracker::new();
 
         // Header
         output.push_str(&format!("{:>width$} ╭─\n", "", width = line_num_width));
@@ -71,15 +71,13 @@ impl RichTextRenderer for DiagnosticRenderer {
                 if let Some(pos) = crate::output::helpers::find_var_position(line, &copy.from) {
                     // Only show "still valid" if:
                     // 1. The variable is used afterward (not dead), AND
-                    // 2. We haven't already shown "still valid" for this variable
+                    // 2. We haven't already shown "still valid" for this variable (via tracker)
                     let is_dead = ctx.is_dead_after(&copy.from, line_num_u32);
-                    let already_shown = shown_still_valid.contains(&copy.from);
-                    let label = if is_dead || already_shown {
-                        format!("copied → {} (Copy)", copy.to)
-                    } else {
-                        // Mark as shown for future copies
-                        shown_still_valid.insert(copy.from.clone());
+                    let show_still_valid = !is_dead && tracker.should_show_still_valid(&copy.from);
+                    let label = if show_still_valid {
                         format!("copied → {} (Copy); {} still valid", copy.to, copy.from)
+                    } else {
+                        format!("copied → {} (Copy)", copy.to)
                     };
                     annotations.push(crate::output::helpers::LineAnnotation {
                         name: copy.from.clone(),
