@@ -462,6 +462,53 @@ impl StateTimeline {
         changes
     }
 
+    /// Get all variable transitions for a line: (prev, curr) pairs.
+    /// This is the unified view that treats ∅ as the initial/final state.
+    /// Returns transitions for: new vars, changed vars, unchanged vars, dropped vars.
+    pub fn get_var_transitions(&self, line_num: u32) -> Vec<VarTransition> {
+        let current = self.get(line_num);
+        let prev = self.find_prev_in_scope(line_num);
+        let drops = self.get_pending_drops(line_num);
+
+        let mut transitions = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        // Process current live variables
+        if let Some(curr) = current {
+            for (name, (state, mutable)) in &curr.states {
+                if matches!(state, SetEntryState::Dropped) {
+                    continue;
+                }
+                seen.insert(name.clone());
+
+                let prev_state = prev.and_then(|p| p.states.get(name)).cloned();
+                transitions.push(VarTransition {
+                    name: name.clone(),
+                    prev: prev_state, // None = ∅ (new var)
+                    curr: Some((state.clone(), *mutable)),
+                });
+            }
+        }
+
+        // Process dropped variables (state → ∅)
+        for drop in &drops {
+            if seen.contains(&drop.name) {
+                continue; // Already handled above
+            }
+            // Get previous state for dropped var
+            let prev_state = prev.and_then(|p| p.states.get(&drop.name)).cloned();
+            if prev_state.is_some() {
+                transitions.push(VarTransition {
+                    name: drop.name.clone(),
+                    prev: prev_state,
+                    curr: None, // ∅ = dropped
+                });
+            }
+        }
+
+        transitions
+    }
+
     /// Find the previous line that has state in the current scope.
     fn find_prev_in_scope(&self, line_num: u32) -> Option<&LineState> {
         if line_num == 0 {
@@ -780,6 +827,34 @@ pub struct BoundaryState {
 
     /// Complete variable state at this boundary (for rendering).
     pub variables: Vec<VarSnapshot>,
+}
+
+/// Variable state transition: (prev, curr) where None represents ∅ (not in scope).
+#[derive(Debug, Clone)]
+pub struct VarTransition {
+    pub name: String,
+    pub prev: Option<(SetEntryState, bool)>, // (state, mutable), None = ∅
+    pub curr: Option<(SetEntryState, bool)>, // (state, mutable), None = ∅ (dropped)
+}
+
+impl VarTransition {
+    /// Is this a new variable (∅ → state)?
+    pub fn is_new(&self) -> bool {
+        self.prev.is_none() && self.curr.is_some()
+    }
+
+    /// Is this a dropped variable (state → ∅)?
+    pub fn is_dropped(&self) -> bool {
+        self.prev.is_some() && self.curr.is_none()
+    }
+
+    /// Is this an unchanged variable (state → same state)?
+    pub fn is_unchanged(&self) -> bool {
+        match (&self.prev, &self.curr) {
+            (Some((p, _)), Some((c, _))) => p == c,
+            _ => false,
+        }
+    }
 }
 
 impl BoundaryState {

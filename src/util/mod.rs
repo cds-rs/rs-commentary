@@ -8,5 +8,5 @@ pub use ast_visitor::{AstEvent, AstIter};
 pub use position::{offset_to_position, position_to_offset};
 pub use state::{
     BoundaryState, ChangeType, InvalidationReason, LineState, StateChange, StateTimeline,
-    StateTransition, TransitionReason, VariableDrop, VarSnapshot,
+    StateTransition, TransitionReason, VarTransition, VariableDrop, VarSnapshot,
 };

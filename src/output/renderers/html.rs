@@ -13,7 +13,7 @@ use crate::analysis::SetEntryState;
 use crate::execution::FunctionView;
 use crate::output::context::{AnnotationTracker, LineContent, RenderContext};
 use crate::output::traits::RichTextRenderer;
-use crate::util::{BoundaryState, TransitionReason};
+use crate::util::{TransitionReason, VarTransition};
 
 /// HTML renderer - produces reveal.js step-through presentation.
 pub struct HtmlRenderer;
@@ -224,11 +224,8 @@ fn build_function_slide_from_content(
     // Build code panel - show only this function's lines, with current highlighted
     let code_html = build_code_panel_for_function(ctx, func, current_line);
 
-    // Get boundary state for state panel
-    let boundary_state = ctx.timeline.boundary_state(current_line);
-
-    // Build state panel
-    let state_html = build_state_panel(ctx, boundary_state.as_ref());
+    // Build state panel using unified transitions
+    let state_html = build_state_panel(ctx, current_line);
 
     // Build description from unified LineContent
     let desc = build_description_from_content(content);
@@ -357,60 +354,37 @@ fn build_code_panel_for_function(ctx: &RenderContext, func: &FunctionView, curre
     code_html
 }
 
-/// Build state panel as an HTML table.
-fn build_state_panel(ctx: &RenderContext, boundary: Option<&BoundaryState>) -> String {
+/// Build state panel as an HTML table using unified transitions.
+fn build_state_panel(ctx: &RenderContext, line_num: u32) -> String {
     let mut html = String::from(r#"<table class="state-table"><thead><tr><th>Variable</th><th>State</th></tr></thead><tbody>"#);
 
-    let Some(state) = boundary else {
+    let transitions = ctx.timeline.get_var_transitions(line_num);
+
+    if transitions.is_empty() {
         html.push_str(r#"<tr><td colspan="2" class="empty">(no tracked variables)</td></tr>"#);
         html.push_str("</tbody></table>");
         return html;
-    };
-
-    // Display live variables
-    let mut has_vars = false;
-    for var in &state.variables {
-        // Skip Copy types if configured (unless they're borrows)
-        let is_borrow = matches!(var.state, SetEntryState::SharedBorrow | SetEntryState::MutBorrow);
-        if ctx.config.filter_copy_types && ctx.is_copy_type(&var.name) && !is_borrow {
-            continue;
-        }
-
-        has_vars = true;
-
-        let dots = match var.state {
-            SetEntryState::Owned => if var.mutable { "●●●" } else { "●●○" },
-            SetEntryState::Shared { .. } => "●●○",
-            SetEntryState::Frozen { .. } => "●○○",
-            SetEntryState::SharedBorrow => "○●○",
-            SetEntryState::MutBorrow => "○●●",
-            SetEntryState::Moved { .. } => "───",
-            SetEntryState::Dropped => "───",
-        };
-        let state_desc = state_short_desc(&var.state, var.mutable);
-
-        // Highlight if newly introduced or state changed
-        let is_new = state.is_new(&var.name);
-        let has_transition = state.has_transition(&var.name);
-        let row_class = if is_new || has_transition { " class=\"changed\"" } else { "" };
-
-        html.push_str(&format!(
-            "<tr{}><td>{}</td><td><span class=\"dots\">{}</span> {}</td></tr>",
-            row_class, var.name, dots, state_desc
-        ));
     }
 
-    // Display dropped variables
-    for var in &state.dropped_vars {
-        // Skip Copy types if configured
-        if ctx.config.filter_copy_types && ctx.is_copy_type(&var.name) {
+    let mut has_vars = false;
+
+    for trans in &transitions {
+        // Skip Copy types if configured (unless they're borrows)
+        let is_borrow = trans.curr.as_ref().map_or(false, |(s, _)| {
+            matches!(s, SetEntryState::SharedBorrow | SetEntryState::MutBorrow)
+        });
+        if ctx.config.filter_copy_types && ctx.is_copy_type(&trans.name) && !is_borrow {
             continue;
         }
 
         has_vars = true;
+
+        // Determine row class and build state cell using (prev, curr) window
+        let (row_class, state_cell) = render_transition(trans);
+
         html.push_str(&format!(
-            r#"<tr class="dropped"><td>{}†</td><td><span class="dots">───</span> dropped</td></tr>"#,
-            var.name
+            "<tr{}><td>{}</td><td>{}</td></tr>",
+            row_class, trans.name, state_cell
         ));
     }
 
@@ -422,6 +396,50 @@ fn build_state_panel(ctx: &RenderContext, boundary: Option<&BoundaryState>) -> S
     html
 }
 
+/// Render a single variable transition as (row_class, state_cell).
+fn render_transition(trans: &VarTransition) -> (&'static str, String) {
+    match (&trans.prev, &trans.curr) {
+        // New: ∅ → state
+        (None, Some((state, mutable))) => {
+            let dots = state_to_dots(state, *mutable);
+            let desc = state_short_desc(state, *mutable);
+            (
+                " class=\"new\"",
+                format!("<span class=\"prev-state\">∅</span> → <span class=\"dots\">{}</span> {}", dots, desc)
+            )
+        }
+        // Dropped: state → ∅
+        (Some((state, mutable)), None) => {
+            let prev_dots = state_to_dots(state, *mutable);
+            (
+                " class=\"dropped\"",
+                format!("<span class=\"prev-state\">{}</span> → <span class=\"dots\">†</span> dropped", prev_dots)
+            )
+        }
+        // Transition: prev → curr (different states)
+        (Some((prev_state, _)), Some((curr_state, mutable))) if prev_state != curr_state => {
+            let prev_dots = state_to_dots(prev_state, false);
+            let curr_dots = state_to_dots(curr_state, *mutable);
+            let desc = state_short_desc(curr_state, *mutable);
+            (
+                " class=\"transition\"",
+                format!("<span class=\"prev-state\">{}</span> → <span class=\"dots\">{}</span> {}", prev_dots, curr_dots, desc)
+            )
+        }
+        // Unchanged: just show current state
+        (Some(_), Some((state, mutable))) => {
+            let dots = state_to_dots(state, *mutable);
+            let desc = state_short_desc(state, *mutable);
+            (
+                "",
+                format!("<span class=\"dots\">{}</span> {}", dots, desc)
+            )
+        }
+        // Shouldn't happen: both None
+        (None, None) => ("", String::new()),
+    }
+}
+
 fn state_short_desc(state: &SetEntryState, mutable: bool) -> &'static str {
     match state {
         SetEntryState::Owned => if mutable { "owned mut" } else { "owned" },
@@ -431,6 +449,18 @@ fn state_short_desc(state: &SetEntryState, mutable: bool) -> &'static str {
         SetEntryState::MutBorrow => "&mut T",
         SetEntryState::Moved { .. } => "moved",
         SetEntryState::Dropped => "dropped",
+    }
+}
+
+fn state_to_dots(state: &SetEntryState, mutable: bool) -> &'static str {
+    match state {
+        SetEntryState::Owned => if mutable { "●●●" } else { "●●○" },
+        SetEntryState::Shared { .. } => "●●○",
+        SetEntryState::Frozen { .. } => "●○○",
+        SetEntryState::SharedBorrow => "○●○",
+        SetEntryState::MutBorrow => "○●●",
+        SetEntryState::Moved { .. } => "───",
+        SetEntryState::Dropped => "───",
     }
 }
 
@@ -633,9 +663,28 @@ const CSS_STYLES: &str = r#"
       vertical-align: top;
     }
 
-    .state-table tr.changed td {
+    .state-table tr.new td {
+      border-left: 3px solid var(--new);
+    }
+
+    .state-table tr.new td:first-child {
+      color: var(--new);
+      font-weight: bold;
+    }
+
+    .state-table tr.transition td {
+      border-left: 3px solid var(--changed);
+    }
+
+    .state-table tr.transition td:first-child {
       color: var(--changed);
       font-weight: bold;
+    }
+
+    .state-table .prev-state {
+      font-size: 0.85em;
+      opacity: 0.5;
+      margin-right: 0.25em;
     }
 
     .state-table tr.dropped td {
