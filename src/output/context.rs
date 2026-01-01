@@ -194,4 +194,50 @@ impl<'a> RenderContext<'a> {
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
+
+    /// Check if a variable is dead (no more uses) after a given line.
+    ///
+    /// Returns true if the variable's drop_line is at or before `after_line + 1`,
+    /// meaning there are no uses of the variable after `after_line`.
+    pub fn is_dead_after(&self, name: &str, after_line: u32) -> bool {
+        // Find the best matching declaration for this name
+        // (the one with decl_line <= after_line and closest to after_line)
+        let mut best_drop_line: Option<u32> = None;
+        let mut best_decl_line: u32 = 0;
+
+        for ((n, decl_line), drop_line) in &self.semantic_drop_lines {
+            if n == name && *decl_line <= after_line {
+                if best_drop_line.is_none() || *decl_line > best_decl_line {
+                    best_drop_line = Some(*drop_line);
+                    best_decl_line = *decl_line;
+                }
+            }
+        }
+
+        // If drop_line <= after_line + 1, the variable is dead after after_line
+        best_drop_line.map_or(false, |drop_line| drop_line <= after_line + 1)
+    }
+
+    /// Get state changes for a line, filtering out variables that have copy events.
+    ///
+    /// At call sites, the copy annotation ("copied → fn") is more informative than
+    /// the state annotation ("●●● owned mut"), so we suppress the state when both exist.
+    pub fn get_filtered_changes(&self, line: u32) -> Vec<crate::util::StateChange> {
+        let changes = self.timeline.get_changes(line);
+        let copy_events = self.get_copy_events(line);
+
+        if copy_events.is_empty() {
+            return changes;
+        }
+
+        // Collect names of variables with copy events
+        let copy_var_names: std::collections::HashSet<&str> =
+            copy_events.iter().map(|c| c.from.as_str()).collect();
+
+        // Filter out state changes for those variables
+        changes
+            .into_iter()
+            .filter(|change| !copy_var_names.contains(change.name.as_str()))
+            .collect()
+    }
 }

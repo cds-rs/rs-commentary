@@ -7,7 +7,7 @@
 
 use crate::analysis::state::{Annotation, BindingKind, BindingState};
 use anyhow::{Context, Result};
-use ra_ap_hir::Semantics;
+use ra_ap_hir::{HirDisplay, Semantics};
 use ra_ap_ide::{
     AnalysisHost, AssistResolveStrategy, DiagnosticsConfig, FileId, FilePosition, FileRange,
     HoverConfig, HoverDocFormat, RootDatabase, SubstTyLen,
@@ -71,6 +71,8 @@ pub struct LastUseInfo {
     pub drop_line: u32,
     /// Classification of the binding's type (owned/copy/reference).
     pub kind: BindingKind,
+    /// True if this is a scalar primitive (u32, bool, etc.) for noise filtering.
+    pub is_scalar: bool,
 }
 
 impl LastUseInfo {
@@ -176,6 +178,34 @@ impl SemanticAnalyzer {
         } else {
             Some(BindingKind::OwnedMove)
         }
+    }
+
+    /// Check if a type is a scalar primitive (u32, i32, bool, char, etc.).
+    /// These types are Copy but don't benefit from "copied" annotations
+    /// when passed to functions - they're just noise.
+    fn is_scalar_type<'db>(
+        &self,
+        sema: &Semantics<'db, RootDatabase>,
+        pat: &ast::IdentPat,
+    ) -> bool {
+        let db = self.host.raw_database();
+        let Some(ty) = sema.type_of_binding_in_pat(pat) else {
+            return false;
+        };
+
+        // Get the type display string
+        let ty_str = ty.display(db, ra_ap_syntax::Edition::Edition2021).to_string();
+
+        // Check for known scalar primitives
+        matches!(
+            ty_str.as_str(),
+            "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
+                | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
+                | "f32" | "f64"
+                | "bool"
+                | "char"
+                | "()" // unit type
+        )
     }
 
     /// Check if a type at a position implements Copy (fallback using hover).
@@ -489,6 +519,9 @@ impl SemanticAnalyzer {
                             .get_binding_kind_sema(ctx.sema, ident)
                             .unwrap_or(BindingKind::OwnedMove);
 
+                        // Check if this is a scalar primitive (for noise filtering)
+                        let is_scalar = self.is_scalar_type(ctx.sema, ident);
+
                         result.insert(
                             offset,
                             LastUseInfo {
@@ -498,6 +531,7 @@ impl SemanticAnalyzer {
                                 last_use_offset,
                                 drop_line,
                                 kind,
+                                is_scalar,
                             },
                         );
                     }

@@ -25,6 +25,9 @@ pub struct BindingInfo {
     pub scope: ScopeId,
     pub is_mutable: bool,
     pub is_copy: bool,
+    /// True if this is a scalar primitive (i32, usize, bool, etc.)
+    /// Used for noise suppression in function call annotations.
+    pub is_scalar: bool,
     pub current_state: BindingState,
 }
 
@@ -34,10 +37,13 @@ pub struct BindingInfo {
 pub struct CopyEvent {
     /// Name of the source binding
     pub from: String,
-    /// Name of the target binding
+    /// Name of the target binding ("call" for function arguments)
     pub to: String,
     /// Line number where the copy occurred
     pub line: u32,
+    /// If true, this is a low-value annotation (scalar primitive in function call).
+    /// Renderers can choose to suppress these for noise reduction.
+    pub is_scalar_in_call: bool,
 }
 
 /// The ownership analyzer tracks variable state through code.
@@ -73,6 +79,8 @@ pub struct OwnershipAnalyzer {
     block_scope_stack: Vec<ScopeId>,
     /// Semantic copy types: declaration offset -> is_copy (from rust-analyzer)
     semantic_copy_types: HashMap<u32, bool>,
+    /// Semantic scalar types: declaration offset -> is_scalar (from rust-analyzer)
+    semantic_scalar_types: HashMap<u32, bool>,
 }
 
 impl OwnershipAnalyzer {
@@ -109,6 +117,7 @@ impl OwnershipAnalyzer {
             fn_scope: None,
             block_scope_stack: Vec::new(),
             semantic_copy_types: HashMap::new(),
+            semantic_scalar_types: HashMap::new(),
         }
     }
 
@@ -117,6 +126,14 @@ impl OwnershipAnalyzer {
     /// This provides authoritative type info for Copy/Move determination.
     pub fn set_semantic_copy_types(&mut self, copy_types: HashMap<u32, bool>) {
         self.semantic_copy_types = copy_types;
+    }
+
+    /// Set semantic scalar type information from rust-analyzer.
+    ///
+    /// Scalar primitives (i32, usize, bool, etc.) create low-value copy
+    /// annotations when passed to functions. Renderers can suppress these.
+    pub fn set_semantic_scalar_types(&mut self, scalar_types: HashMap<u32, bool>) {
+        self.semantic_scalar_types = scalar_types;
     }
 
     // ========================================================================
@@ -278,6 +295,7 @@ impl OwnershipAnalyzer {
         name: String,
         is_mutable: bool,
         is_copy: bool,
+        is_scalar: bool,
         range: TextRange,
     ) -> BindingId {
         let id = BindingId(self.next_binding_id);
@@ -288,6 +306,7 @@ impl OwnershipAnalyzer {
             scope: self.current_scope,
             is_mutable,
             is_copy,
+            is_scalar,
             current_state: BindingState::Owned { mutable: is_mutable },
         };
 
@@ -340,6 +359,7 @@ impl OwnershipAnalyzer {
             scope: self.current_scope,
             is_mutable,
             is_copy: true, // References are Copy
+            is_scalar: false, // References are not scalars
             current_state: state.clone(),
         };
 
@@ -435,6 +455,7 @@ impl OwnershipAnalyzer {
             from: from_name,
             to: to_name,
             line,
+            is_scalar_in_call: false, // Let bindings always show
         });
     }
 
@@ -619,8 +640,8 @@ impl OwnershipAnalyzer {
                 self.process_expr(expr);
             }
 
-            AstEvent::CallArg(arg) => {
-                self.process_call_arg(arg);
+            AstEvent::CallArg { arg, call_target } => {
+                self.process_call_arg(arg, &call_target);
             }
 
             AstEvent::MethodReceiver { receiver, method_call } => {
@@ -832,6 +853,9 @@ impl OwnershipAnalyzer {
             false
         };
 
+        // Look up scalar info from semantic analysis
+        let is_scalar = self.semantic_scalar_types.get(&decl_offset).copied().unwrap_or(false);
+
         // If this is a reference binding (let r = &x), create a borrow binding
         if let Some((borrowed_from, is_mut_borrow)) = borrow_info {
             if let ast::Pat::IdentPat(ident_pat) = pat {
@@ -860,7 +884,7 @@ impl OwnershipAnalyzer {
         };
 
         // Create a normal owned binding
-        self.visit_pat_with_type(pat, false, is_copy);
+        self.visit_pat_with_type(pat, false, is_copy, is_scalar);
 
         // Record transfer (move or copy) from source to target
         if let Some((source_name, source_id, source_is_copy, range)) = transfer_source {
@@ -903,7 +927,7 @@ impl OwnershipAnalyzer {
     }
 
     /// Process a call argument (potential move or borrow).
-    fn process_call_arg(&mut self, arg: &ast::Expr) {
+    fn process_call_arg(&mut self, arg: &ast::Expr, call_target: &str) {
         match arg {
             // &x - shared borrow in call context
             ast::Expr::RefExpr(ref_expr) if ref_expr.mut_token().is_none() => {
@@ -939,13 +963,22 @@ impl OwnershipAnalyzer {
             ast::Expr::PathExpr(path_expr) => {
                 if let Some((name, binding_id, binding)) = self.resolve_path(path_expr) {
                     let range = arg.syntax().text_range();
-                    if binding.is_copy {
+                    // Skip copy events for reference types - they're reborrows, not copies.
+                    // The state timeline already shows them as borrows.
+                    let is_borrow = matches!(
+                        binding.current_state,
+                        BindingState::SharedBorrow { .. } | BindingState::MutBorrow { .. }
+                    );
+                    if is_borrow {
+                        // Reference types: no annotation needed, state shows the borrow
+                    } else if binding.is_copy {
                         // Create copy event for function call (Copy types remain valid)
                         let line = self.offset_to_line(u32::from(range.start()));
                         self.copy_events.push(CopyEvent {
                             from: name.clone(),
-                            to: "call".to_string(),
+                            to: call_target.to_string(),
                             line,
+                            is_scalar_in_call: binding.is_scalar,
                         });
                     } else {
                         self.record_move(binding_id, None, range);
@@ -1003,6 +1036,7 @@ impl OwnershipAnalyzer {
             scope: self.current_scope,
             is_mutable: ident_pat.mut_token().is_some(),
             is_copy,
+            is_scalar: false, // Function params default to non-scalar (conservative)
             current_state: state.clone(),
         };
 
@@ -1059,7 +1093,7 @@ impl OwnershipAnalyzer {
         false
     }
 
-    fn visit_pat_with_type(&mut self, pat: &ast::Pat, is_mutable: bool, is_copy: bool) {
+    fn visit_pat_with_type(&mut self, pat: &ast::Pat, is_mutable: bool, is_copy: bool, is_scalar: bool) {
         match pat {
             ast::Pat::IdentPat(ident_pat) => {
                 if let Some(name) = ident_pat.name() {
@@ -1068,19 +1102,21 @@ impl OwnershipAnalyzer {
                         name.text().to_string(),
                         is_mut,
                         is_copy,
+                        is_scalar,
                         pat.syntax().text_range(),
                     );
                 }
             }
             ast::Pat::TuplePat(tuple_pat) => {
+                // Tuple elements may have different scalar status; conservatively use false
                 for field in tuple_pat.fields() {
-                    self.visit_pat_with_type(&field, is_mutable, is_copy);
+                    self.visit_pat_with_type(&field, is_mutable, is_copy, false);
                 }
             }
             ast::Pat::RefPat(ref_pat) => {
-                // Reference patterns bind by reference, the binding itself is Copy
+                // Reference patterns bind by reference, the binding itself is Copy but not scalar
                 if let Some(inner) = ref_pat.pat() {
-                    self.visit_pat_with_type(&inner, is_mutable, true);
+                    self.visit_pat_with_type(&inner, is_mutable, true, false);
                 }
             }
             _ => {}
@@ -1088,7 +1124,7 @@ impl OwnershipAnalyzer {
     }
 
     fn visit_pat(&mut self, pat: &ast::Pat, is_mutable: bool) {
-        self.visit_pat_with_type(pat, is_mutable, false);
+        self.visit_pat_with_type(pat, is_mutable, false, false);
     }
 
     // ========================================================================
@@ -1425,7 +1461,7 @@ fn main() {
         // Check for copy event (created when Copy type passed to function)
         let copies = analyzer.copy_events();
         assert!(
-            copies.iter().any(|c| c.from == "x" && c.to == "call"),
+            copies.iter().any(|c| c.from == "x" && c.to == "take_int"),
             "Primitive i32 should create copy event when passed to function"
         );
     }

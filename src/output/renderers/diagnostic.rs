@@ -32,6 +32,9 @@ impl RichTextRenderer for DiagnosticRenderer {
         let mut output = String::new();
         let line_num_width = ctx.lines.len().to_string().len().max(2);
 
+        // Track variables that have already shown "still valid" (only show once per variable)
+        let mut shown_still_valid: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         // Header
         output.push_str(&format!("{:>width$} ╭─\n", "", width = line_num_width));
 
@@ -47,8 +50,8 @@ impl RichTextRenderer for DiagnosticRenderer {
                 width = line_num_width
             ));
 
-            // Get state changes from timeline
-            let changes = ctx.timeline.get_changes(line_num_u32);
+            // Get state changes from timeline (filtered to exclude vars with copy events)
+            let changes = ctx.get_filtered_changes(line_num_u32);
 
             // Get pending drops for the NEXT line (drops happen after this line)
             let pending_drops = ctx.timeline.get_pending_drops(line_num_u32 + 1);
@@ -59,13 +62,29 @@ impl RichTextRenderer for DiagnosticRenderer {
             // Get unified annotations (state changes + drops, sorted right-to-left)
             let mut annotations = get_line_annotations(line, &changes, &pending_drops, &ctx.timeline);
 
-            // Add copy event annotations
+            // Add copy event annotations (skip scalar primitives in function calls)
             for copy in copy_events {
+                // Skip low-value annotations: scalar primitives (i32, usize, etc.) passed to functions
+                if copy.is_scalar_in_call {
+                    continue;
+                }
                 if let Some(pos) = crate::output::helpers::find_var_position(line, &copy.from) {
+                    // Only show "still valid" if:
+                    // 1. The variable is used afterward (not dead), AND
+                    // 2. We haven't already shown "still valid" for this variable
+                    let is_dead = ctx.is_dead_after(&copy.from, line_num_u32);
+                    let already_shown = shown_still_valid.contains(&copy.from);
+                    let label = if is_dead || already_shown {
+                        format!("copied → {} (Copy)", copy.to)
+                    } else {
+                        // Mark as shown for future copies
+                        shown_still_valid.insert(copy.from.clone());
+                        format!("copied → {} (Copy); {} still valid", copy.to, copy.from)
+                    };
                     annotations.push(crate::output::helpers::LineAnnotation {
                         name: copy.from.clone(),
                         position: pos,
-                        state_label: Some(format!("copied → {} (Copy); {} still valid", copy.to, copy.from)),
+                        state_label: Some(label),
                         has_drop: false,
                         drop_reason: None,
                         is_borrow: false, // Copy types are owned, not borrows

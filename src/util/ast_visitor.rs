@@ -24,6 +24,7 @@
 //! ```
 
 use ra_ap_syntax::ast::{self, HasArgList, HasLoopBody, HasModuleItem, RangeItem};
+use ra_ap_syntax::AstNode;
 
 /// Events yielded during AST traversal.
 ///
@@ -51,7 +52,11 @@ pub enum AstEvent {
 
     // === Special contexts ===
     /// Argument in a function/method call (for borrow detection)
-    CallArg(ast::Expr),
+    CallArg {
+        arg: ast::Expr,
+        /// The call target name (function or method name)
+        call_target: String,
+    },
     /// Method receiver (for NLL borrow ending)
     MethodReceiver {
         receiver: ast::Expr,
@@ -91,7 +96,7 @@ enum YieldEvent {
     EnterFor(ast::ForExpr),
     EnterMatchArm(ast::MatchArm),
     EnterClosure(ast::ClosureExpr),
-    CallArg(ast::Expr),
+    CallArg { arg: ast::Expr, call_target: String },
     MethodReceiver {
         receiver: ast::Expr,
         method_call: ast::MethodCallExpr,
@@ -144,13 +149,27 @@ impl AstIter {
             }
 
             ast::Expr::CallExpr(call_expr) => {
+                // Extract function name from callee
+                let call_target = call_expr
+                    .expr()
+                    .and_then(|e| {
+                        if let ast::Expr::PathExpr(path) = e {
+                            path.path().map(|p| p.syntax().text().to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| "call".to_string());
+
                 // Push in reverse: args (reversed), then callee
                 if let Some(args) = call_expr.arg_list() {
                     let args_vec: Vec<_> = args.args().collect();
                     for arg in args_vec.into_iter().rev() {
                         self.stack.push(WorkItem::Expr(arg.clone()));
-                        self.stack
-                            .push(WorkItem::Yield(YieldEvent::CallArg(arg)));
+                        self.stack.push(WorkItem::Yield(YieldEvent::CallArg {
+                            arg,
+                            call_target: call_target.clone(),
+                        }));
                     }
                 }
                 if let Some(callee) = call_expr.expr() {
@@ -159,13 +178,21 @@ impl AstIter {
             }
 
             ast::Expr::MethodCallExpr(method_call) => {
+                // Extract method name
+                let call_target = method_call
+                    .name_ref()
+                    .map(|n| n.text().to_string())
+                    .unwrap_or_else(|| "call".to_string());
+
                 // Push in reverse: args, then receiver
                 if let Some(args) = method_call.arg_list() {
                     let args_vec: Vec<_> = args.args().collect();
                     for arg in args_vec.into_iter().rev() {
                         self.stack.push(WorkItem::Expr(arg.clone()));
-                        self.stack
-                            .push(WorkItem::Yield(YieldEvent::CallArg(arg)));
+                        self.stack.push(WorkItem::Yield(YieldEvent::CallArg {
+                            arg,
+                            call_target: call_target.clone(),
+                        }));
                     }
                 }
                 if let Some(receiver) = method_call.receiver() {
@@ -618,7 +645,9 @@ impl Iterator for AstIter {
                         YieldEvent::EnterFor(f) => AstEvent::EnterFor(f),
                         YieldEvent::EnterMatchArm(a) => AstEvent::EnterMatchArm(a),
                         YieldEvent::EnterClosure(c) => AstEvent::EnterClosure(c),
-                        YieldEvent::CallArg(a) => AstEvent::CallArg(a),
+                        YieldEvent::CallArg { arg, call_target } => {
+                            AstEvent::CallArg { arg, call_target }
+                        }
                         YieldEvent::MethodReceiver {
                             receiver,
                             method_call,
@@ -674,7 +703,7 @@ fn main() {
         assert!(events
             .iter()
             .any(|e| matches!(e, AstEvent::MethodReceiver { .. })));
-        assert!(events.iter().any(|e| matches!(e, AstEvent::CallArg(_))));
+        assert!(events.iter().any(|e| matches!(e, AstEvent::CallArg { .. })));
     }
 
     #[test]

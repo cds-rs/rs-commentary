@@ -229,9 +229,16 @@ pub fn render_source_semantic(
         .map(|(decl_offset, info)| (u32::from(*decl_offset), info.is_copy()))
         .collect();
 
+    // Extract scalar info keyed by declaration offset for noise filtering
+    let scalar_types_by_offset: HashMap<u32, bool> = last_use_info
+        .iter()
+        .map(|(decl_offset, info)| (u32::from(*decl_offset), info.is_scalar))
+        .collect();
+
     // Run ownership analysis (with original source for accurate positions)
     let mut ownership_analyzer = OwnershipAnalyzer::new();
     ownership_analyzer.set_semantic_copy_types(copy_types_by_offset);
+    ownership_analyzer.set_semantic_scalar_types(scalar_types_by_offset);
     let Ok(_) = ownership_analyzer.analyze(source) else {
         return None;
     };
