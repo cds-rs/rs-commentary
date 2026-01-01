@@ -10,9 +10,10 @@ use super::state::{
     Annotation, BindingId, BindingState, OwnershipEvent, OwnershipSet, Scope, ScopeId,
     SetAnnotation,
 };
+use crate::util::{AstEvent, AstIter};
 use anyhow::Result;
 use ra_ap_syntax::{
-    ast::{self, HasArgList, HasLoopBody, HasModuleItem, HasName},
+    ast::{self, HasArgList, HasName},
     AstNode, SourceFile, TextRange,
 };
 use std::collections::HashMap;
@@ -38,6 +39,24 @@ pub struct OwnershipAnalyzer {
     current_scope: ScopeId,
     current_fn_name: String,
     source: String,
+
+    // Event processing context (for AstIter-based traversal)
+    /// Current let statement being processed (set on Stmt(LetStmt), cleared on Pat)
+    current_let_stmt: Option<ast::LetStmt>,
+    /// True when processing function parameters (set on EnterFn, cleared on EnterBlock)
+    in_fn_params: bool,
+    /// Current function being processed (for parameter type lookup)
+    current_fn: Option<ast::Fn>,
+    /// Current closure being processed (for parameter type lookup)
+    current_closure: Option<ast::ClosureExpr>,
+    /// Parameter index counter (for matching patterns with parameter types)
+    param_index: usize,
+    /// True when processing closure parameters
+    in_closure_params: bool,
+    /// Scope ID of the current function (for dropped bindings at closing brace)
+    fn_scope: Option<ScopeId>,
+    /// Scope ID of the current block (for dropped bindings at closing brace)
+    block_scope_stack: Vec<ScopeId>,
 }
 
 impl OwnershipAnalyzer {
@@ -63,6 +82,15 @@ impl OwnershipAnalyzer {
             current_scope: root_scope_id,
             current_fn_name: String::new(),
             source: String::new(),
+            // Context fields
+            current_let_stmt: None,
+            in_fn_params: false,
+            current_fn: None,
+            current_closure: None,
+            param_index: 0,
+            in_closure_params: false,
+            fn_scope: None,
+            block_scope_stack: Vec::new(),
         }
     }
 
@@ -125,8 +153,10 @@ impl OwnershipAnalyzer {
             tracing::warn!("Parse error: {:?}", error);
         }
 
-        // Walk the AST and track ownership state
-        self.visit_source_file(&file);
+        // Walk the AST using iterator-based traversal
+        for event in AstIter::new(&file) {
+            self.process(&event);
+        }
 
         tracing::debug!("Analysis complete: {} annotations", self.annotations.len());
         Ok(self.annotations.clone())
@@ -194,28 +224,6 @@ impl OwnershipAnalyzer {
         }
 
         self.set_annotations.push(SetAnnotation { line, set });
-    }
-
-    /// Generate an ownership set snapshot at scope exit, showing dropped bindings.
-    /// Takes the scope_id of the scope that was just exited.
-    fn snapshot_set_with_dropped(&mut self, offset: u32, exited_scope: ScopeId) {
-        let line = self.offset_to_line(offset);
-        let mut set = OwnershipSet::new(self.current_fn_name.clone(), line);
-
-        // Get the bindings from the scope that just exited
-        if let Some(scope) = self.scopes.get(&exited_scope) {
-            for &binding_id in &scope.bindings {
-                if let Some(binding) = self.bindings.get(&binding_id) {
-                    // Show as dropped if the binding was in the exited scope
-                    set.add_dropped(binding.name.clone());
-                }
-            }
-        }
-
-        // If we have any dropped entries, add the annotation
-        if !set.entries.is_empty() {
-            self.set_annotations.push(SetAnnotation { line, set });
-        }
     }
 
     /// Convert byte offset to line number (0-indexed).
@@ -466,86 +474,375 @@ impl OwnershipAnalyzer {
         &self.annotations
     }
 
-    // AST visitor methods
+    // ========================================================================
+    // Event-Based Processing (AstIter integration)
+    // ========================================================================
 
-    fn visit_source_file(&mut self, file: &SourceFile) {
-        let items: Vec<_> = file.items().collect();
-        tracing::debug!("Found {} top-level items", items.len());
-        for item in items {
-            self.visit_item(&item);
-        }
-    }
+    /// Process an AST event from the iterator.
+    ///
+    /// This is the main entry point for event-based traversal. Each event
+    /// triggers appropriate state machine updates and annotation generation.
+    pub fn process(&mut self, event: &AstEvent) {
+        match event {
+            AstEvent::EnterFn(func) => {
+                self.handle_enter_fn(func);
+            }
 
-    fn visit_item(&mut self, item: &ast::Item) {
-        tracing::debug!("Visiting item: {:?}", std::mem::discriminant(item));
-        match item {
-            ast::Item::Fn(func) => self.visit_fn(func),
-            ast::Item::Impl(impl_block) => {
-                // Visit methods in impl blocks
-                if let Some(assoc_items) = impl_block.assoc_item_list() {
-                    for assoc_item in assoc_items.assoc_items() {
-                        if let ast::AssocItem::Fn(func) = assoc_item {
-                            self.visit_fn(&func);
-                        }
-                    }
+            AstEvent::ExitFn => {
+                self.handle_exit_fn();
+            }
+
+            AstEvent::EnterBlock(block) => {
+                self.handle_enter_block(block);
+            }
+
+            AstEvent::ExitBlock => {
+                self.handle_exit_block();
+            }
+
+            AstEvent::EnterFor(for_expr) => {
+                // For loops create their own scope
+                self.enter_scope();
+                // Process the iterable before the loop scope
+                if let Some(iterable) = for_expr.iterable() {
+                    self.process_expr(&iterable);
                 }
             }
-            _ => {}
+
+            AstEvent::ExitFor => {
+                self.exit_scope();
+            }
+
+            AstEvent::EnterMatchArm(_arm) => {
+                self.enter_scope();
+            }
+
+            AstEvent::ExitMatchArm => {
+                self.exit_scope();
+            }
+
+            AstEvent::EnterClosure(closure) => {
+                self.handle_enter_closure(closure);
+            }
+
+            AstEvent::ExitClosure => {
+                self.exit_scope();
+                self.current_closure = None;
+            }
+
+            AstEvent::Stmt(stmt) => {
+                self.handle_stmt(stmt);
+            }
+
+            AstEvent::Pat { pat, is_mut } => {
+                self.handle_pat(pat, *is_mut);
+            }
+
+            AstEvent::Expr(expr) => {
+                // If we're in closure params mode and see an Expr, we've moved to the body
+                if self.in_closure_params {
+                    self.in_closure_params = false;
+                }
+                self.process_expr(expr);
+            }
+
+            AstEvent::CallArg(arg) => {
+                self.process_call_arg(arg);
+            }
+
+            AstEvent::MethodReceiver { receiver, method_call } => {
+                self.handle_method_receiver(receiver, method_call);
+            }
+
+            AstEvent::Macro(macro_expr) => {
+                self.visit_macro_expr(macro_expr);
+            }
+
+            // Item and Impl events don't need special handling here;
+            // the iterator will yield EnterFn for functions within them
+            AstEvent::Item(_) | AstEvent::Impl(_) => {}
         }
     }
 
-    fn visit_fn(&mut self, func: &ast::Fn) {
+    /// Handle entering a function.
+    fn handle_enter_fn(&mut self, func: &ast::Fn) {
         // Track function name for set notation
-        let prev_fn_name = self.current_fn_name.clone();
         if let Some(name) = func.name() {
             self.current_fn_name = name.text().to_string();
         }
 
+        // Store function for parameter type lookup
+        self.current_fn = Some(func.clone());
+        self.param_index = 0;
+
+        // Enter function scope
         let fn_scope = self.enter_scope();
-
-        // Process parameters FIRST (before snapshot) so they appear at function entry
-        if let Some(param_list) = func.param_list() {
-            for param in param_list.params() {
-                let type_str = param.ty().map(|ty| ty.syntax().text().to_string());
-
-                if let Some(pat) = param.pat() {
-                    self.visit_param(&pat, type_str.as_deref());
-                }
-            }
-        }
-
-        // THEN snapshot at function signature line (captures parameters)
-        let fn_start = u32::from(func.syntax().text_range().start());
-        self.snapshot_set(fn_start);
-
-        // Process body inline (not via visit_block_expr to keep params in same scope)
-        if let Some(body) = func.body() {
-            for stmt in body.statements() {
-                self.visit_stmt(&stmt);
-            }
-
-            // Handle tail expression
-            if let Some(expr) = body.tail_expr() {
-                self.visit_expr(&expr);
-                let expr_end = u32::from(expr.syntax().text_range().end());
-                self.snapshot_set(expr_end);
-            }
-
-            // Exit scope and show dropped at closing brace
-            self.exit_scope();
-
-            if let Some(stmt_list) = body.stmt_list() {
-                if let Some(r_curly) = stmt_list.r_curly_token() {
-                    let brace_pos = u32::from(r_curly.text_range().start());
-                    self.snapshot_set_with_dropped(brace_pos, fn_scope);
-                }
-            }
-        } else {
-            self.exit_scope();
-        }
-
-        self.current_fn_name = prev_fn_name;
+        self.fn_scope = Some(fn_scope);
+        self.in_fn_params = true;
     }
+
+    /// Handle exiting a function.
+    fn handle_exit_fn(&mut self) {
+        self.fn_scope = None;
+        self.current_fn = None;
+        self.current_fn_name = String::new();
+    }
+
+    /// Handle entering a block.
+    fn handle_enter_block(&mut self, block: &ast::BlockExpr) {
+        // First block after function entry: process parameter snapshot
+        if self.in_fn_params {
+            self.in_fn_params = false;
+            // Snapshot at function entry (captures parameters)
+            if let Some(stmt_list) = block.stmt_list() {
+                if let Some(l_curly) = stmt_list.l_curly_token() {
+                    let fn_start = u32::from(l_curly.text_range().start());
+                    self.snapshot_set(fn_start);
+                }
+            }
+            // Don't enter a new scope - we're in the function scope already
+            return;
+        }
+
+        // Non-function blocks: enter a new scope
+        let scope_id = self.enter_scope();
+        self.block_scope_stack.push(scope_id);
+    }
+
+    /// Handle exiting a block.
+    fn handle_exit_block(&mut self) {
+        // Get the block scope we're exiting
+        if self.block_scope_stack.pop().is_some() {
+            self.exit_scope();
+            // Note: We'd need the closing brace position for snapshot_set_with_dropped
+            // but we don't have it here. The semantic layer handles drops more accurately.
+        } else if self.fn_scope.is_some() {
+            // Exiting the function body block
+            self.exit_scope();
+            // snapshot_set_with_dropped would need the closing brace position
+        }
+    }
+
+    /// Handle entering a closure.
+    fn handle_enter_closure(&mut self, closure: &ast::ClosureExpr) {
+        let is_move = closure.move_token().is_some();
+        let range = closure.syntax().text_range();
+
+        // Store closure for parameter type lookup
+        self.current_closure = Some(closure.clone());
+        self.param_index = 0;
+        self.in_closure_params = true;
+
+        // Enter scope first so capture analysis can detect outer variables
+        self.enter_scope();
+
+        // For move closures, capture analysis (now that we're in the closure's scope)
+        if is_move {
+            if let Some(body) = closure.body() {
+                let captures = self.collect_captures(&body);
+                for (name, binding_id, binding) in captures {
+                    if !binding.is_copy {
+                        self.apply_event_with_annotation(
+                            binding_id,
+                            OwnershipEvent::Move { to: None },
+                            range,
+                            format!("{}: moved into closure", name),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle a statement event.
+    fn handle_stmt(&mut self, stmt: &ast::Stmt) {
+        match stmt {
+            ast::Stmt::LetStmt(let_stmt) => {
+                // Store context for when we see the Pat event
+                // Snapshot will be taken after the Pat event processes the binding
+                self.current_let_stmt = Some(let_stmt.clone());
+            }
+            ast::Stmt::ExprStmt(_) => {
+                // Expression will be handled by Expr event
+                // Snapshot after the statement
+                let end = u32::from(stmt.syntax().text_range().end());
+                self.snapshot_set(end);
+            }
+            ast::Stmt::Item(_) => {
+                // Nested items handled by Item event
+            }
+        }
+    }
+
+    /// Handle a pattern event.
+    fn handle_pat(&mut self, pat: &ast::Pat, is_mut: bool) {
+        if self.in_fn_params {
+            // This is a function parameter - look up the type
+            let type_str = self.current_fn.as_ref().and_then(|func| {
+                func.param_list()
+                    .and_then(|pl| pl.params().nth(self.param_index))
+                    .and_then(|param| param.ty())
+                    .map(|ty| ty.syntax().text().to_string())
+            });
+            self.param_index += 1;
+
+            // Use visit_param which handles the type
+            self.visit_param(pat, type_str.as_deref());
+        } else if self.in_closure_params {
+            // This is a closure parameter - look up the type
+            let type_str = self.current_closure.as_ref().and_then(|closure| {
+                closure.param_list()
+                    .and_then(|pl| pl.params().nth(self.param_index))
+                    .and_then(|param| param.ty())
+                    .map(|ty| ty.syntax().text().to_string())
+            });
+            self.param_index += 1;
+
+            // Use visit_param which handles the type
+            self.visit_param(pat, type_str.as_deref());
+        } else if let Some(let_stmt) = self.current_let_stmt.take() {
+            // This is a let binding - use the full let statement context
+            self.handle_let_binding(pat, &let_stmt);
+        } else {
+            // For/match pattern or other context
+            self.visit_pat(pat, is_mut);
+        }
+    }
+
+    /// Handle a let binding (pattern from a let statement).
+    fn handle_let_binding(&mut self, pat: &ast::Pat, let_stmt: &ast::LetStmt) {
+        // Extract type info if available
+        let type_hint = let_stmt.ty().map(|ty| ty.syntax().text().to_string());
+
+        // Check if the initializer is a reference expression
+        let borrow_info = let_stmt.initializer().and_then(|init| {
+            if let ast::Expr::RefExpr(ref_expr) = &init {
+                let is_mut = ref_expr.mut_token().is_some();
+                if let Some(ast::Expr::PathExpr(path_expr)) = ref_expr.expr() {
+                    if let Some((_name, binding_id, _)) = self.resolve_path(&path_expr) {
+                        return Some((binding_id, is_mut));
+                    }
+                }
+            }
+            None
+        });
+
+        // Determine if Copy: check type hint first, then initializer expression
+        let is_copy = if let Some(ref t) = type_hint {
+            self.is_copy_type(t)
+        } else if let Some(ref init) = let_stmt.initializer() {
+            !self.is_non_copy_expr(init)
+        } else {
+            false
+        };
+
+        // If this is a reference binding (let r = &x), create a borrow binding
+        if let Some((borrowed_from, is_mut_borrow)) = borrow_info {
+            if let ast::Pat::IdentPat(ident_pat) = pat {
+                if let Some(name) = ident_pat.name() {
+                    let is_mut = ident_pat.mut_token().is_some();
+                    self.new_borrow_binding(
+                        name.text().to_string(),
+                        is_mut,
+                        is_mut_borrow,
+                        borrowed_from,
+                        pat.syntax().text_range(),
+                    );
+                    // Snapshot after binding creation
+                    let end = u32::from(let_stmt.syntax().text_range().end());
+                    self.snapshot_set(end);
+                    return;
+                }
+            }
+        }
+
+        // Otherwise create a normal owned binding
+        self.visit_pat_with_type(pat, false, is_copy);
+
+        // Snapshot after binding creation
+        let end = u32::from(let_stmt.syntax().text_range().end());
+        self.snapshot_set(end);
+    }
+
+    /// Process an expression (for state tracking).
+    fn process_expr(&mut self, expr: &ast::Expr) {
+        match expr {
+            ast::Expr::RefExpr(ref_expr) => {
+                let is_mut = ref_expr.mut_token().is_some();
+                if let Some(ast::Expr::PathExpr(path_expr)) = ref_expr.expr() {
+                    if let Some((_name, binding_id, _)) = self.resolve_path(&path_expr) {
+                        let range = expr.syntax().text_range();
+                        if is_mut {
+                            self.record_mut_borrow(binding_id, range);
+                        } else {
+                            self.record_shared_borrow(binding_id, range);
+                        }
+                    }
+                }
+            }
+            // Other expression types don't need special handling in process_expr;
+            // they're handled by the iterator's traversal or by CallArg/MethodReceiver events
+            _ => {}
+        }
+    }
+
+    /// Process a call argument (potential move or borrow).
+    fn process_call_arg(&mut self, arg: &ast::Expr) {
+        match arg {
+            // &x - shared borrow in call context
+            ast::Expr::RefExpr(ref_expr) if ref_expr.mut_token().is_none() => {
+                if let Some(ast::Expr::PathExpr(path_expr)) = ref_expr.expr() {
+                    if let Some((name, binding_id, _)) = self.resolve_path(&path_expr) {
+                        self.annotations.push(Annotation::new(
+                            arg.syntax().text_range(),
+                            name,
+                            BindingState::SharedBorrow { from: binding_id },
+                            "shared borrow passed to function".to_string(),
+                        ));
+                    }
+                }
+            }
+
+            // &mut x - reborrow, original is suspended
+            ast::Expr::RefExpr(ref_expr) => {
+                if let Some(ast::Expr::PathExpr(path_expr)) = ref_expr.expr() {
+                    if let Some((name, _binding_id, _)) = self.resolve_path(&path_expr) {
+                        let reborrow_id = BindingId(self.next_binding_id);
+                        self.next_binding_id += 1;
+                        self.annotations.push(Annotation::new(
+                            arg.syntax().text_range(),
+                            name,
+                            BindingState::Suspended { reborrowed_to: reborrow_id },
+                            "reborrowed to function call, original suspended".to_string(),
+                        ));
+                    }
+                }
+            }
+
+            // Plain variable - potential move
+            ast::Expr::PathExpr(path_expr) => {
+                if let Some((name, binding_id, binding)) = self.resolve_path(path_expr) {
+                    let range = arg.syntax().text_range();
+                    if binding.is_copy {
+                        self.annotations.push(Annotation::new(
+                            range,
+                            name.clone(),
+                            BindingState::Copied,
+                            format!("{}: copied (Copy type)", name),
+                        ));
+                    } else {
+                        self.record_move(binding_id, None, range);
+                    }
+                }
+            }
+
+            _ => {}
+        }
+    }
+
+    // ========================================================================
+    // Helper methods for binding creation
+    // ========================================================================
 
     /// Visit a function parameter with its type annotation.
     fn visit_param(&mut self, pat: &ast::Pat, type_str: Option<&str>) {
@@ -600,105 +897,6 @@ impl OwnershipAnalyzer {
         self.annotations.push(Annotation::new(range, name_str, state, explanation));
     }
 
-    fn visit_block_expr(&mut self, block: &ast::BlockExpr) {
-        let block_scope = self.enter_scope();
-
-        for stmt in block.statements() {
-            self.visit_stmt(&stmt);
-        }
-
-        // Handle tail expression
-        if let Some(expr) = block.tail_expr() {
-            self.visit_expr(&expr);
-            // Snapshot after tail expression (on the line containing the expression end)
-            let expr_end = u32::from(expr.syntax().text_range().end());
-            self.snapshot_set(expr_end);
-        }
-
-        // Exit scope BEFORE snapshot at closing brace to show dropped state
-        self.exit_scope();
-
-        // Snapshot at closing brace using the actual `}` token position
-        // This will show bindings as dropped
-        if let Some(stmt_list) = block.stmt_list() {
-            if let Some(r_curly) = stmt_list.r_curly_token() {
-                let brace_pos = u32::from(r_curly.text_range().start());
-                self.snapshot_set_with_dropped(brace_pos, block_scope);
-            }
-        }
-    }
-
-    fn visit_stmt(&mut self, stmt: &ast::Stmt) {
-        match stmt {
-            ast::Stmt::LetStmt(let_stmt) => self.visit_let_stmt(let_stmt),
-            ast::Stmt::ExprStmt(expr_stmt) => {
-                if let Some(expr) = expr_stmt.expr() {
-                    self.visit_expr(&expr);
-                }
-            }
-            ast::Stmt::Item(item) => self.visit_item(item),
-        }
-
-        // Snapshot ownership set after each statement
-        let end = u32::from(stmt.syntax().text_range().end());
-        self.snapshot_set(end);
-    }
-
-    fn visit_let_stmt(&mut self, let_stmt: &ast::LetStmt) {
-        // Extract type info if available
-        let type_hint = let_stmt.ty().map(|ty| ty.syntax().text().to_string());
-
-        // Check if the initializer is a reference expression
-        let borrow_info = let_stmt.initializer().and_then(|init| {
-            if let ast::Expr::RefExpr(ref_expr) = &init {
-                let is_mut = ref_expr.mut_token().is_some();
-                if let Some(ast::Expr::PathExpr(path_expr)) = ref_expr.expr() {
-                    if let Some((_name, binding_id, _)) = self.resolve_path(&path_expr) {
-                        return Some((binding_id, is_mut));
-                    }
-                }
-            }
-            None
-        });
-
-        // Determine if Copy: check type hint first, then initializer expression
-        let is_copy = if let Some(ref t) = type_hint {
-            self.is_copy_type(t)
-        } else if let Some(ref init) = let_stmt.initializer() {
-            // Infer from initializer expression
-            !self.is_non_copy_expr(init)
-        } else {
-            false // Unknown, assume non-Copy to be safe
-        };
-
-        // First visit the initializer to track any moves/borrows
-        if let Some(init) = let_stmt.initializer() {
-            self.visit_expr(&init);
-        }
-
-        // Then create the new binding
-        if let Some(pat) = let_stmt.pat() {
-            // If this is a reference binding (let r = &x), create a borrow binding
-            if let Some((borrowed_from, is_mut_borrow)) = borrow_info {
-                if let ast::Pat::IdentPat(ident_pat) = &pat {
-                    if let Some(name) = ident_pat.name() {
-                        let is_mut = ident_pat.mut_token().is_some();
-                        self.new_borrow_binding(
-                            name.text().to_string(),
-                            is_mut,
-                            is_mut_borrow,
-                            borrowed_from,
-                            pat.syntax().text_range(),
-                        );
-                        return;
-                    }
-                }
-            }
-            // Otherwise create a normal owned binding
-            self.visit_pat_with_type(&pat, false, is_copy);
-        }
-    }
-
     /// Check if an expression produces a non-Copy type.
     ///
     /// Assumes non-Copy by default. The semantic layer (rust-analyzer)
@@ -744,170 +942,13 @@ impl OwnershipAnalyzer {
         }
     }
 
-    // Keep the old method for compatibility (parameters, etc.)
     fn visit_pat(&mut self, pat: &ast::Pat, is_mutable: bool) {
         self.visit_pat_with_type(pat, is_mutable, false);
     }
 
-    fn visit_expr(&mut self, expr: &ast::Expr) {
-        match expr {
-            ast::Expr::PathExpr(path_expr) => {
-                // Variable use - tracked elsewhere (in call args, assignments, etc.)
-                let _ = self.resolve_path(path_expr);
-            }
-
-            ast::Expr::RefExpr(ref_expr) => {
-                let is_mut = ref_expr.mut_token().is_some();
-                if let Some(inner) = ref_expr.expr() {
-                    // Check if we're borrowing a simple variable
-                    if let ast::Expr::PathExpr(path_expr) = &inner {
-                        if let Some((_name, binding_id, _)) = self.resolve_path(path_expr) {
-                            let range = expr.syntax().text_range();
-                            if is_mut {
-                                self.record_mut_borrow(binding_id, range);
-                            } else {
-                                self.record_shared_borrow(binding_id, range);
-                            }
-                        }
-                    }
-                    self.visit_expr(&inner);
-                }
-            }
-            ast::Expr::CallExpr(call_expr) => {
-                if let Some(expr) = call_expr.expr() {
-                    self.visit_expr(&expr);
-                }
-                if let Some(args) = call_expr.arg_list() {
-                    for arg in args.args() {
-                        self.visit_call_arg(&arg);
-                    }
-                }
-            }
-            ast::Expr::MethodCallExpr(method_call) => {
-                // Check if receiver is moved (self) or borrowed (&self, &mut self)
-                if let Some(receiver) = method_call.receiver() {
-                    // For method calls that require &mut self on a shared binding,
-                    // NLL means any outstanding borrows have ended
-                    self.handle_method_receiver(&receiver, method_call);
-                }
-                if let Some(args) = method_call.arg_list() {
-                    for arg in args.args() {
-                        self.visit_call_arg(&arg);
-                    }
-                }
-            }
-            ast::Expr::BlockExpr(block) => {
-                self.visit_block_expr(block);
-            }
-            ast::Expr::IfExpr(if_expr) => {
-                if let Some(cond) = if_expr.condition() {
-                    self.visit_expr(&cond);
-                }
-                if let Some(then_branch) = if_expr.then_branch() {
-                    self.visit_block_expr(&then_branch);
-                }
-                if let Some(else_branch) = if_expr.else_branch() {
-                    match else_branch {
-                        ast::ElseBranch::Block(block) => self.visit_block_expr(&block),
-                        ast::ElseBranch::IfExpr(if_expr) => {
-                            self.visit_expr(&ast::Expr::IfExpr(if_expr))
-                        }
-                    }
-                }
-            }
-            ast::Expr::LoopExpr(loop_expr) => {
-                if let Some(body) = loop_expr.loop_body() {
-                    self.visit_block_expr(&body);
-                }
-            }
-            ast::Expr::ForExpr(for_expr) => {
-                if let Some(iterable) = for_expr.iterable() {
-                    self.visit_expr(&iterable);
-                }
-                self.enter_scope();
-                if let Some(pat) = for_expr.pat() {
-                    self.visit_pat(&pat, false);
-                }
-                if let Some(body) = for_expr.loop_body() {
-                    self.visit_block_expr(&body);
-                }
-                self.exit_scope();
-            }
-            ast::Expr::MatchExpr(match_expr) => {
-                if let Some(scrutinee) = match_expr.expr() {
-                    self.visit_expr(&scrutinee);
-                }
-                if let Some(arm_list) = match_expr.match_arm_list() {
-                    for arm in arm_list.arms() {
-                        self.enter_scope();
-                        if let Some(pat) = arm.pat() {
-                            self.visit_pat(&pat, false);
-                        }
-                        if let Some(expr) = arm.expr() {
-                            self.visit_expr(&expr);
-                        }
-                        self.exit_scope();
-                    }
-                }
-            }
-            ast::Expr::ClosureExpr(closure) => {
-                self.visit_closure(closure);
-            }
-            ast::Expr::WhileExpr(while_expr) => {
-                if let Some(cond) = while_expr.condition() {
-                    self.visit_expr(&cond);
-                }
-                if let Some(body) = while_expr.loop_body() {
-                    self.visit_block_expr(&body);
-                }
-            }
-            ast::Expr::ReturnExpr(return_expr) => {
-                if let Some(expr) = return_expr.expr() {
-                    self.visit_expr(&expr);
-                }
-            }
-            ast::Expr::BreakExpr(break_expr) => {
-                if let Some(expr) = break_expr.expr() {
-                    self.visit_expr(&expr);
-                }
-            }
-            ast::Expr::BinExpr(bin_expr) => {
-                if let Some(lhs) = bin_expr.lhs() {
-                    self.visit_expr(&lhs);
-                }
-                if let Some(rhs) = bin_expr.rhs() {
-                    self.visit_expr(&rhs);
-                }
-            }
-            ast::Expr::TupleExpr(tuple) => {
-                for field in tuple.fields() {
-                    self.visit_expr(&field);
-                }
-            }
-            ast::Expr::ArrayExpr(array) => {
-                if let ast::ArrayExprKind::ElementList(elements) = array.kind() {
-                    for elem in elements {
-                        self.visit_expr(&elem);
-                    }
-                }
-            }
-            ast::Expr::AwaitExpr(await_expr) => {
-                if let Some(expr) = await_expr.expr() {
-                    self.visit_expr(&expr);
-                }
-            }
-            ast::Expr::TryExpr(try_expr) => {
-                if let Some(expr) = try_expr.expr() {
-                    self.visit_expr(&expr);
-                }
-            }
-            ast::Expr::MacroExpr(macro_expr) => {
-                self.visit_macro_expr(macro_expr);
-            }
-            // Other expression types - visit inner expressions if any
-            _ => {}
-        }
-    }
+    // ========================================================================
+    // NLL and Call Handling
+    // ========================================================================
 
     /// Handle a method call receiver, implementing NLL borrow ending.
     /// When we see x.method() and x is currently Shared/Frozen (due to a borrow),
@@ -961,130 +1002,15 @@ impl OwnershipAnalyzer {
             }
         }
 
-        // For method receivers, we don't call visit_call_arg because:
+        // For method receivers, we don't need to recursively visit because:
         // 1. If NLL just restored the binding, we don't want to re-borrow/move it
         // 2. Method receivers are auto-referenced by Rust, not explicitly moved
-        // Instead, just visit any nested expressions in the receiver
-        if !matches!(receiver, ast::Expr::PathExpr(_)) {
-            self.visit_expr(receiver);
-        }
+        // 3. AstIter handles traversal of nested expressions
     }
 
-    /// Visit an argument in a function/method call.
-    /// Determines if the argument is moved, borrowed, or reborrowed.
-    fn visit_call_arg(&mut self, arg: &ast::Expr) {
-        match arg {
-            // &x - shared borrow in call context
-            ast::Expr::RefExpr(ref_expr) if ref_expr.mut_token().is_none() => {
-                if let Some(ast::Expr::PathExpr(path_expr)) = ref_expr.expr() {
-                    if let Some((name, binding_id, _)) = self.resolve_path(&path_expr) {
-                        self.annotations.push(Annotation::new(
-                            arg.syntax().text_range(),
-                            name,
-                            BindingState::SharedBorrow { from: binding_id },
-                            "shared borrow passed to function".to_string(),
-                        ));
-                    }
-                }
-                self.visit_expr(arg);
-            }
-
-            // &mut x - reborrow, original is suspended
-            ast::Expr::RefExpr(ref_expr) => {
-                if let Some(ast::Expr::PathExpr(path_expr)) = ref_expr.expr() {
-                    if let Some((name, _binding_id, _)) = self.resolve_path(&path_expr) {
-                        let reborrow_id = BindingId(self.next_binding_id);
-                        self.next_binding_id += 1;
-                        self.annotations.push(Annotation::new(
-                            arg.syntax().text_range(),
-                            name,
-                            BindingState::Suspended { reborrowed_to: reborrow_id },
-                            "reborrowed to function call, original suspended".to_string(),
-                        ));
-                    }
-                }
-                self.visit_expr(arg);
-            }
-
-            // Plain variable - potential move
-            ast::Expr::PathExpr(path_expr) => {
-                if let Some((name, binding_id, binding)) = self.resolve_path(path_expr) {
-                    let range = arg.syntax().text_range();
-                    if binding.is_copy {
-                        self.annotations.push(Annotation::new(
-                            range,
-                            name.clone(),
-                            BindingState::Copied,
-                            format!("{}: copied (Copy type)", name),
-                        ));
-                    } else {
-                        self.record_move(binding_id, None, range);
-                    }
-                }
-            }
-
-            // Other expressions - just visit them
-            _ => self.visit_expr(arg),
-        }
-    }
-
-    /// Visit a closure expression.
-    /// Closures capture variables from their environment and have their own parameters.
-    fn visit_closure(&mut self, closure: &ast::ClosureExpr) {
-        let is_move = closure.move_token().is_some();
-        let range = closure.syntax().text_range();
-
-        // Analyze the body to find captured variables
-        // For move closures, captured variables are moved into the closure
-        // For non-move closures, they're borrowed
-
-        self.enter_scope();
-
-        // Process closure parameters
-        if let Some(param_list) = closure.param_list() {
-            for param in param_list.params() {
-                let type_str = param.ty().map(|ty| ty.syntax().text().to_string());
-                if let Some(pat) = param.pat() {
-                    self.visit_param(&pat, type_str.as_deref());
-                }
-            }
-        }
-
-        // Track captures - visit body and record variable usage
-        if let Some(body) = closure.body() {
-            // For move closures, we need to track what gets moved
-            if is_move {
-                self.visit_closure_body_move(&body, range);
-            } else {
-                self.visit_expr(&body);
-            }
-        }
-
-        self.exit_scope();
-    }
-
-    /// Visit a closure body that uses `move` semantics.
-    /// Variables captured by a move closure are moved into it.
-    fn visit_closure_body_move(&mut self, body: &ast::Expr, closure_range: TextRange) {
-        // First, collect all variable references in the closure body
-        let captures = self.collect_captures(body);
-
-        // Record moves for captured non-Copy variables
-        for (name, binding_id, binding) in captures {
-            if !binding.is_copy {
-                // Apply Move event for closure capture
-                self.apply_event_with_annotation(
-                    binding_id,
-                    OwnershipEvent::Move { to: None },
-                    closure_range,
-                    format!("{}: moved into closure", name),
-                );
-            }
-        }
-
-        // Then visit the body normally
-        self.visit_expr(body);
-    }
+    // ========================================================================
+    // Closure Capture Analysis
+    // ========================================================================
 
     /// Collect all variable captures in an expression (for closure analysis).
     fn collect_captures(&self, expr: &ast::Expr) -> Vec<(String, BindingId, BindingInfo)> {

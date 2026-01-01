@@ -50,6 +50,7 @@ When borrowed, the original binding's capabilities are temporarily reduced:
 │    RenderContext builds from analysis                       │
 ├─────────────────────────────────────────────────────────────┤
 │  Utilities (src/util/)                                      │
+│    AstIter - lazy iterator over AST events                  │
 │    StateTimeline - time-traveling state machine             │
 │    Position utilities - offset/line conversion              │
 ├─────────────────────────────────────────────────────────────┤
@@ -77,6 +78,47 @@ When borrowed, the original binding's capabilities are temporarily reduced:
 The engine assumes all types are non-Copy; the semantic layer corrects this
 using `Type::is_copy()` from rust-analyzer's HIR. The semantic module uses
 `SemanticContext` to bundle common parameters (sema, file_id, source, loop_ranges).
+
+## AstIter (src/util/ast_visitor.rs)
+
+Stack-based lazy iterator that yields AST events during traversal:
+
+```rust
+pub enum AstEvent {
+    // Scope boundaries (paired enter/exit)
+    EnterFn(ast::Fn), ExitFn,
+    EnterBlock(ast::BlockExpr), ExitBlock,
+    EnterFor(ast::ForExpr), ExitFor,
+    EnterMatchArm(ast::MatchArm), ExitMatchArm,
+    EnterClosure(ast::ClosureExpr), ExitClosure,
+
+    // Nodes
+    Item(ast::Item), Impl(ast::Impl), Stmt(ast::Stmt),
+    Expr(ast::Expr), Pat { pat: ast::Pat, is_mut: bool },
+
+    // Special contexts
+    CallArg(ast::Expr),
+    MethodReceiver { receiver: ast::Expr, method_call: ast::MethodCallExpr },
+    Macro(ast::MacroExpr),
+}
+
+// Usage: consumers fold over events with their own state machine
+for event in AstIter::new(&source_file) {
+    ownership.process(&event);
+    call_detector.process(&event);
+}
+```
+
+Entry points:
+- `AstIter::new(&SourceFile)` - traverse entire file
+- `AstIter::from_fn(&ast::Fn)` - traverse single function
+- `AstIter::from_expr(&ast::Expr)` - traverse expression tree
+
+Benefits:
+- Single traversal implementation shared across modules
+- Composable: multiple consumers can process same event stream
+- Lazy: only traverses as far as needed
+- Extensible: add new event types without changing consumers
 
 ## State Machine
 
