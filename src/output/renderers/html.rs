@@ -241,10 +241,11 @@ fn build_state_panel(ctx: &RenderContext, boundary: Option<&BoundaryState>) -> S
 
         let dots = match var.state {
             SetEntryState::Owned => if var.mutable { "●●●" } else { "●●○" },
-            SetEntryState::Shared => "●●○",
-            SetEntryState::Frozen => "●○○",
+            SetEntryState::Shared { .. } => "●●○",
+            SetEntryState::Frozen { .. } => "●○○",
             SetEntryState::SharedBorrow => "○●○",
             SetEntryState::MutBorrow => "○●●",
+            SetEntryState::Moved { .. } => "───",
             SetEntryState::Dropped => "───",
         };
         let state_desc = state_short_desc(&var.state, var.mutable);
@@ -348,10 +349,11 @@ fn build_description(
 fn state_short_desc(state: &SetEntryState, mutable: bool) -> &'static str {
     match state {
         SetEntryState::Owned => if mutable { "owned mut" } else { "owned" },
-        SetEntryState::Shared => "shared",
-        SetEntryState::Frozen => "frozen",
+        SetEntryState::Shared { .. } => "shared",
+        SetEntryState::Frozen { .. } => "frozen",
         SetEntryState::SharedBorrow => "&T",
         SetEntryState::MutBorrow => "&mut T",
+        SetEntryState::Moved { .. } => "moved",
         SetEntryState::Dropped => "dropped",
     }
 }
@@ -371,7 +373,13 @@ fn format_transition_reason(reason: &TransitionReason) -> String {
                 format!(" ({} dropped)", borrow_name)
             }
         }
-        TransitionReason::Moved => " (moved)".to_string(),
+        TransitionReason::MovedTo { target } => {
+            if let Some(t) = target {
+                format!(" (moved to {})", t)
+            } else {
+                " (moved)".to_string()
+            }
+        }
         TransitionReason::ExplicitDrop => " (explicit drop)".to_string(),
         TransitionReason::ScopeExit => " (scope exit)".to_string(),
         TransitionReason::Other => String::new(),

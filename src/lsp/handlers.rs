@@ -185,11 +185,15 @@ fn format_entry_capabilities(entry: &SetEntry) -> String {
                 format!("{} ●●○", entry.name)  // OR
             }
         }
-        SetEntryState::Shared => {
-            format!("{} ●●○", entry.name)  // OR (shared)
+        SetEntryState::Shared { borrowed_by } => {
+            if borrowed_by.is_empty() {
+                format!("{} ●●○ (shared)", entry.name)
+            } else {
+                format!("{} ●●○ (shared by {})", entry.name, borrowed_by.join(", "))
+            }
         }
-        SetEntryState::Frozen => {
-            format!("{} ●○○", entry.name)  // O only
+        SetEntryState::Frozen { borrowed_by } => {
+            format!("{} ●○○ (frozen by {})", entry.name, borrowed_by)
         }
         SetEntryState::SharedBorrow => {
             if let Some(from) = &entry.borrows_from {
@@ -203,6 +207,13 @@ fn format_entry_capabilities(entry: &SetEntry) -> String {
                 format!("{} ○●● &mut {}", entry.name, from)  // RW
             } else {
                 format!("{} ○●●", entry.name)
+            }
+        }
+        SetEntryState::Moved { to } => {
+            if let Some(target) = to {
+                format!("{} ─→ {} (moved)", entry.name, target)
+            } else {
+                format!("{} ─→ _ (moved)", entry.name)
             }
         }
         SetEntryState::Dropped => {
@@ -227,11 +238,15 @@ fn format_set_explanation(set: &OwnershipSet) -> String {
                     format!("**{}**: owned (OR)", entry.name)
                 }
             }
-            SetEntryState::Shared => {
-                format!("**{}**: shared (shr) - read-only while borrowed", entry.name)
+            SetEntryState::Shared { borrowed_by } => {
+                if borrowed_by.is_empty() {
+                    format!("**{}**: shared (shr) - read-only while borrowed", entry.name)
+                } else {
+                    format!("**{}**: shared (shr) by {} - read-only while borrowed", entry.name, borrowed_by.join(", "))
+                }
             }
-            SetEntryState::Frozen => {
-                format!("**{}**: frozen (frz) - no access while &mut active", entry.name)
+            SetEntryState::Frozen { borrowed_by } => {
+                format!("**{}**: frozen (frz) by {} - no access while &mut active", entry.name, borrowed_by)
             }
             SetEntryState::SharedBorrow => {
                 let from = entry.borrows_from.as_deref().unwrap_or("?");
@@ -240,6 +255,13 @@ fn format_set_explanation(set: &OwnershipSet) -> String {
             SetEntryState::MutBorrow => {
                 let from = entry.borrows_from.as_deref().unwrap_or("?");
                 format!("**{}**: mutable borrow of {} (RW)", entry.name, from)
+            }
+            SetEntryState::Moved { to } => {
+                if let Some(target) = to {
+                    format!("**{}**: moved to {} - binding invalid", entry.name, target)
+                } else {
+                    format!("**{}**: moved - binding invalid", entry.name)
+                }
             }
             SetEntryState::Dropped => {
                 format!("**{}**: dropped (†) - out of scope", entry.name)
@@ -392,28 +414,41 @@ fn extract_identifier_at(text: &str, offset: usize) -> Option<String> {
 
 /// Format hover content for a variable from the ownership set.
 fn format_entry_hover(entry: &SetEntry, set: &OwnershipSet) -> String {
-    let (caps, state_desc, explanation) = match &entry.state {
+    let (caps, state_desc, explanation): (&str, String, &str) = match &entry.state {
         SetEntryState::Owned => {
             if entry.mutable {
-                ("ORW", "owned (mut)", "Full ownership with mutation rights. Can read, write, move, or drop.")
+                ("ORW", "owned (mut)".to_string(), "Full ownership with mutation rights. Can read, write, move, or drop.")
             } else {
-                ("OR", "owned", "Immutable ownership. Can read, move, or drop, but cannot mutate.")
+                ("OR", "owned".to_string(), "Immutable ownership. Can read, move, or drop, but cannot mutate.")
             }
         }
-        SetEntryState::Shared => {
-            ("OR", "shared (shr)", "Temporarily shared: read-only while borrowed. Mutation blocked until borrows end.")
+        SetEntryState::Shared { borrowed_by } => {
+            let by = if borrowed_by.is_empty() {
+                "shared (shr)".to_string()
+            } else {
+                format!("shared (shr) by {}", borrowed_by.join(", "))
+            };
+            ("OR", by, "Temporarily shared: read-only while borrowed. Mutation blocked until borrows end.")
         }
-        SetEntryState::Frozen => {
-            ("O", "frozen (frz)", "Temporarily frozen: active &mut borrow exists. No read or write access until the borrow ends.")
+        SetEntryState::Frozen { borrowed_by } => {
+            ("O", format!("frozen (frz) by {}", borrowed_by), "Temporarily frozen: active &mut borrow exists. No read or write access until the borrow ends.")
         }
         SetEntryState::SharedBorrow => {
-            ("R", "&borrow", "Shared reference (&T). Read-only access to borrowed value.")
+            ("R", "&borrow".to_string(), "Shared reference (&T). Read-only access to borrowed value.")
         }
         SetEntryState::MutBorrow => {
-            ("RW", "&mut borrow", "Mutable reference (&mut T). Exclusive read-write access to borrowed value.")
+            ("RW", "&mut borrow".to_string(), "Mutable reference (&mut T). Exclusive read-write access to borrowed value.")
+        }
+        SetEntryState::Moved { to } => {
+            let desc = if let Some(target) = to {
+                format!("moved to {}", target)
+            } else {
+                "moved".to_string()
+            };
+            ("∅", desc, "Value has been moved out. This binding is now invalid and cannot be used.")
         }
         SetEntryState::Dropped => {
-            ("†", "dropped", "Value has been dropped (freed). Scope has ended, memory is released.")
+            ("†", "dropped".to_string(), "Value has been dropped (freed). Scope has ended, memory is released.")
         }
     };
 

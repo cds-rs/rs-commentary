@@ -99,8 +99,16 @@ fn format_set_entry(entry: &SetEntry) -> String {
                 entry.name.clone()
             }
         }
-        SetEntryState::Shared => format!("shr {}", entry.name),
-        SetEntryState::Frozen => format!("frz {}", entry.name),
+        SetEntryState::Shared { borrowed_by } => {
+            if borrowed_by.is_empty() {
+                format!("shr {}", entry.name)
+            } else {
+                format!("shr {}({})", entry.name, borrowed_by.join(","))
+            }
+        }
+        SetEntryState::Frozen { borrowed_by } => {
+            format!("frz {}({})", entry.name, borrowed_by)
+        }
         SetEntryState::SharedBorrow => {
             if let Some(from) = &entry.borrows_from {
                 format!("{}(&{})", entry.name, from)
@@ -113,6 +121,13 @@ fn format_set_entry(entry: &SetEntry) -> String {
                 format!("{}(&mut {})", entry.name, from)
             } else {
                 format!("{}(&mut ?)", entry.name)
+            }
+        }
+        SetEntryState::Moved { to } => {
+            if let Some(target) = to {
+                format!("{}→{}", entry.name, target)
+            } else {
+                format!("{}→_", entry.name)
             }
         }
         SetEntryState::Dropped => format!("{}†", entry.name),

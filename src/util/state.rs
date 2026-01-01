@@ -20,16 +20,29 @@ pub struct LineState {
     pub borrows_from: HashMap<String, String>,
 }
 
-/// Information about a variable that was dropped.
+/// Why a binding became invalid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvalidationReason {
+    /// Value was moved to another binding (value lives on, source is invalid).
+    Moved { to: Option<String> },
+    /// Borrow ended at last use (NLL). The borrowed value is freed.
+    BorrowEnd,
+    /// Value dropped at scope exit (actual deallocation).
+    ScopeExit,
+}
+
+/// Information about a binding that became invalid.
 #[derive(Debug, Clone)]
 pub struct VariableDrop {
-    /// Name of the dropped variable.
+    /// Name of the binding.
     pub name: String,
     /// Line where it was last seen.
     pub last_seen_line: u32,
     /// If this was a borrow, the source variable that is now freed.
     /// When a borrow ends, its source returns to owned state.
     pub frees_source: Option<String>,
+    /// Why the binding became invalid.
+    pub reason: InvalidationReason,
 }
 
 /// A time-traveling state machine for ownership tracking.
@@ -174,7 +187,7 @@ impl StateTimeline {
         let states: HashMap<String, (SetEntryState, bool)> = entries
             .iter()
             .filter(|e| new_scope_vars.contains(&e.name))
-            .map(|e| (e.name.clone(), (e.state, e.mutable)))
+            .map(|e| (e.name.clone(), (e.state.clone(), e.mutable)))
             .collect();
 
         // Extract borrow relationships
@@ -285,10 +298,14 @@ impl StateTimeline {
                 let frees_source = current_state
                     .and_then(|s| s.borrows_from.get(name).cloned());
 
+                // Determine reason from the binding's state
+                let reason = self.determine_invalidation_reason(name, last_use_line, frees_source.is_some());
+
                 drops.push(VariableDrop {
                     name: name.clone(),
                     last_seen_line: last_use_line,
                     frees_source,
+                    reason,
                 });
             }
         }
@@ -309,15 +326,37 @@ impl StateTimeline {
                     .filter(|name| !self.shown_dropped.contains(*name))
                     .map(|name| {
                         let frees_source = state.borrows_from.get(name).cloned();
+                        let reason = self.determine_invalidation_reason(name, line_num.saturating_sub(1), frees_source.is_some());
                         VariableDrop {
                             name: name.clone(),
                             last_seen_line: line_num.saturating_sub(1),
                             frees_source,
+                            reason,
                         }
                     })
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Determine why a binding became invalid based on its state.
+    fn determine_invalidation_reason(&self, name: &str, last_use_line: u32, is_borrow: bool) -> InvalidationReason {
+        // If it's a borrow (has frees_source), it's a borrow ending
+        if is_borrow {
+            return InvalidationReason::BorrowEnd;
+        }
+
+        // Check the state at the last use line to see if it was moved
+        if let Some(state) = self.get(last_use_line) {
+            if let Some((entry_state, _)) = state.states.get(name) {
+                if let SetEntryState::Moved { to } = entry_state {
+                    return InvalidationReason::Moved { to: to.clone() };
+                }
+            }
+        }
+
+        // Default to scope exit (actual drop)
+        InvalidationReason::ScopeExit
     }
 
     /// Mark a variable as shown dropped (to avoid duplicate annotations).
@@ -378,7 +417,7 @@ impl StateTimeline {
                 // Variable returns to owned state
                 result.insert(name.clone(), (SetEntryState::Owned, *mutable, true));
             } else {
-                result.insert(name.clone(), (*entry_state, *mutable, false));
+                result.insert(name.clone(), (entry_state.clone(), *mutable, false));
             }
         }
 
@@ -407,14 +446,14 @@ impl StateTimeline {
             let change_type = match prev_state {
                 None => ChangeType::New,
                 Some((old_state, _)) if old_state != state => ChangeType::StateChanged {
-                    from: *old_state,
+                    from: old_state.clone(),
                 },
                 _ => continue, // No change
             };
 
             changes.push(StateChange {
                 name: name.clone(),
-                state: *state,
+                state: state.clone(),
                 mutable: *mutable,
                 change_type,
             });
@@ -528,7 +567,7 @@ impl StateTimeline {
                 // Try to get state from previous line, or default to Owned
                 let state = prev
                     .and_then(|p| p.states.get(&d.name))
-                    .map(|(s, _)| *s)
+                    .map(|(s, _)| s.clone())
                     .unwrap_or(SetEntryState::Owned);
                 let mutable = prev
                     .and_then(|p| p.states.get(&d.name))
@@ -553,7 +592,7 @@ impl StateTimeline {
             })
             .map(|(name, (state, mutable))| VarSnapshot {
                 name: name.clone(),
-                state: *state,
+                state: state.clone(),
                 mutable: *mutable,
             })
             .collect();
@@ -570,7 +609,7 @@ impl StateTimeline {
             })
             .map(|(name, (state, mutable))| VarSnapshot {
                 name: name.clone(),
-                state: *state,
+                state: state.clone(),
                 mutable: *mutable,
             })
             .collect();
@@ -588,8 +627,8 @@ impl StateTimeline {
                         delta_vars.insert(
                             name.clone(),
                             StateTransition {
-                                from: *prev_st,
-                                to: *curr_st,
+                                from: prev_st.clone(),
+                                to: curr_st.clone(),
                                 reason,
                             },
                         );
@@ -618,7 +657,7 @@ impl StateTimeline {
     ) -> TransitionReason {
         match (from, to) {
             // Owned -> Shared: shared borrow taken
-            (SetEntryState::Owned, SetEntryState::Shared) => {
+            (SetEntryState::Owned, SetEntryState::Shared { .. }) => {
                 // Find the borrow that references this variable
                 if let Some(borrow_name) = self.find_borrow_of(name, curr_state) {
                     TransitionReason::SharedBorrowTaken { borrow_name }
@@ -627,7 +666,7 @@ impl StateTimeline {
                 }
             }
             // Owned -> Frozen: mutable borrow taken
-            (SetEntryState::Owned, SetEntryState::Frozen) => {
+            (SetEntryState::Owned, SetEntryState::Frozen { .. }) => {
                 if let Some(borrow_name) = self.find_borrow_of(name, curr_state) {
                     TransitionReason::MutBorrowTaken { borrow_name }
                 } else {
@@ -635,11 +674,15 @@ impl StateTimeline {
                 }
             }
             // Shared/Frozen -> Owned: borrow ended
-            (SetEntryState::Shared, SetEntryState::Owned)
-            | (SetEntryState::Frozen, SetEntryState::Owned) => {
+            (SetEntryState::Shared { .. }, SetEntryState::Owned)
+            | (SetEntryState::Frozen { .. }, SetEntryState::Owned) => {
                 TransitionReason::BorrowEnded {
                     borrow_name: String::new(),
                 }
+            }
+            // Owned -> Moved
+            (SetEntryState::Owned, SetEntryState::Moved { to }) => {
+                TransitionReason::MovedTo { target: to.clone() }
             }
             // Anything -> Dropped
             (_, SetEntryState::Dropped) => TransitionReason::ExplicitDrop,
@@ -692,8 +735,8 @@ pub enum TransitionReason {
     MutBorrowTaken { borrow_name: String },
     /// A borrow ended (NLL): Shared/Frozen -> Owned
     BorrowEnded { borrow_name: String },
-    /// Value was moved
-    Moved,
+    /// Value was moved to another binding
+    MovedTo { target: Option<String> },
     /// Explicit drop() call
     ExplicitDrop,
     /// Scope exit (automatic drop)
@@ -824,8 +867,8 @@ mod tests {
         let x1 = make_entry("x", SetEntryState::Owned);
         timeline.record(1, &vec![&x1], "    let x = String::new();");
 
-        // Line 2: x is shared
-        let x2 = make_entry("x", SetEntryState::Shared);
+        // Line 2: x is shared (borrowed by r)
+        let x2 = make_entry("x", SetEntryState::Shared { borrowed_by: vec!["r".to_string()] });
         timeline.record(2, &vec![&x2], "    let r = &x;");
 
         let changes = timeline.get_changes(2);
@@ -861,7 +904,7 @@ mod tests {
         let x1 = make_entry("x", SetEntryState::Owned);
         timeline.record(1, &vec![&x1], "    let x = String::new();");
 
-        let x2 = make_entry("x", SetEntryState::Shared);
+        let x2 = make_entry("x", SetEntryState::Shared { borrowed_by: vec!["r".to_string()] });
         let r = make_entry("r", SetEntryState::SharedBorrow);
         timeline.record(2, &vec![&x2, &r], "    let r = &x;");
 

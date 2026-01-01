@@ -3,9 +3,29 @@
 use crate::output::context::RenderContext;
 use crate::output::helpers::get_line_annotations;
 use crate::output::traits::RichTextRenderer;
+use crate::util::InvalidationReason;
 
 /// Diagnostic renderer - rustc-style with line numbers and underline annotations.
 pub struct DiagnosticRenderer;
+
+/// Format a message based on the invalidation reason.
+fn format_invalidation_message(name: &str, reason: &InvalidationReason) -> String {
+    match reason {
+        InvalidationReason::Moved { to } => {
+            if let Some(target) = to {
+                format!("note: `{}` moved to `{}`", name, target)
+            } else {
+                format!("note: `{}` moved", name)
+            }
+        }
+        InvalidationReason::BorrowEnd => {
+            format!("note: `{}` borrow ends here", name)
+        }
+        InvalidationReason::ScopeExit => {
+            format!("note: `{}` last used here (dropped at scope exit)", name)
+        }
+    }
+}
 
 impl RichTextRenderer for DiagnosticRenderer {
     fn render(&self, ctx: &mut RenderContext) -> String {
@@ -96,7 +116,11 @@ impl RichTextRenderer for DiagnosticRenderer {
                     }
 
                     // Print drop note if applicable
-                    if ann.has_drop {
+                    // Skip drop note if state_label already describes a move (avoid redundancy)
+                    let is_move_already_shown = ann.state_label.as_ref()
+                        .map(|l| l.starts_with("move") || l.contains("→"))
+                        .unwrap_or(false);
+                    if ann.has_drop && !is_move_already_shown {
                         // For drop-only annotations, reuse the same connector
                         // For state+drop, build a new connector
                         let drop_connector = if ann.state_label.is_some() {
@@ -117,11 +141,16 @@ impl RichTextRenderer for DiagnosticRenderer {
                         };
                         let drop_connector_trimmed = drop_connector.trim_end();
 
+                        let message = if let Some(ref reason) = ann.drop_reason {
+                            format_invalidation_message(&ann.name, reason)
+                        } else {
+                            format!("note: `{}` dropped (last use)", ann.name)
+                        };
                         output.push_str(&format!(
-                            "{:>width$} │ {}─ note: `{}` dropped (last use)\n",
+                            "{:>width$} │ {}─ {}\n",
                             "",
                             drop_connector_trimmed,
-                            ann.name,
+                            message,
                             width = line_num_width
                         ));
 

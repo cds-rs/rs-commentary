@@ -1,7 +1,7 @@
 //! Shared helper functions for renderers.
 
 use crate::analysis::{SetEntry, SetEntryState};
-use crate::util::{ChangeType, StateChange, StateTimeline, VariableDrop};
+use crate::util::{ChangeType, InvalidationReason, StateChange, StateTimeline, VariableDrop};
 
 /// A unified annotation for rendering on a source line.
 #[derive(Debug, Clone)]
@@ -14,26 +14,30 @@ pub struct LineAnnotation {
     pub state_label: Option<String>,
     /// Whether this variable is dropped after this line
     pub has_drop: bool,
+    /// Why the binding became invalid (if has_drop is true)
+    pub drop_reason: Option<InvalidationReason>,
 }
 
 impl LineAnnotation {
     /// Create annotation from a state change.
-    pub fn from_change(change: &StateChange, position: usize, has_drop: bool) -> Self {
+    pub fn from_change(change: &StateChange, position: usize, drop_reason: Option<InvalidationReason>) -> Self {
         Self {
             name: change.name.clone(),
             position,
             state_label: Some(format_change_label(change)),
-            has_drop,
+            has_drop: drop_reason.is_some(),
+            drop_reason,
         }
     }
 
     /// Create drop-only annotation.
-    pub fn drop_only(name: String, position: usize) -> Self {
+    pub fn drop_only(name: String, position: usize, reason: InvalidationReason) -> Self {
         Self {
             name,
             position,
             state_label: None,
             has_drop: true,
+            drop_reason: Some(reason),
         }
     }
 }
@@ -51,8 +55,11 @@ pub fn get_line_annotations(
     // Add state change annotations
     for change in changes {
         if let Some(pos) = find_var_position(line, &change.name) {
-            let has_drop = pending_drops.iter().any(|d| d.name == change.name);
-            annotations.push(LineAnnotation::from_change(change, pos, has_drop));
+            let drop_reason = pending_drops
+                .iter()
+                .find(|d| d.name == change.name)
+                .map(|d| d.reason.clone());
+            annotations.push(LineAnnotation::from_change(change, pos, drop_reason));
         }
     }
 
@@ -63,7 +70,7 @@ pub fn get_line_annotations(
             let already_annotated = annotations.iter().any(|a| a.name == drop.name);
             if !already_annotated {
                 if let Some(pos) = find_var_position(line, &drop.name) {
-                    annotations.push(LineAnnotation::drop_only(drop.name.clone(), pos));
+                    annotations.push(LineAnnotation::drop_only(drop.name.clone(), pos, drop.reason.clone()));
                 }
             }
         }
@@ -93,10 +100,11 @@ pub fn format_capability_dots(entry: &SetEntry) -> &'static str {
                 "●●○"
             }
         }
-        SetEntryState::Shared => "●●○",
-        SetEntryState::Frozen => "●○○",
+        SetEntryState::Shared { .. } => "●●○",
+        SetEntryState::Frozen { .. } => "●○○",
         SetEntryState::SharedBorrow => "○●○",
         SetEntryState::MutBorrow => "○●●",
+        SetEntryState::Moved { .. } => "───",
         SetEntryState::Dropped => "───",
     }
 }
@@ -111,8 +119,16 @@ pub fn format_entry_short(entry: &SetEntry) -> String {
                 format!("{} ●●○", entry.name)
             }
         }
-        SetEntryState::Shared => format!("{} ●●○", entry.name),
-        SetEntryState::Frozen => format!("{} ●○○", entry.name),
+        SetEntryState::Shared { borrowed_by } => {
+            if borrowed_by.is_empty() {
+                format!("{} ●●○ shr", entry.name)
+            } else {
+                format!("{} ●●○ shr({})", entry.name, borrowed_by.join(","))
+            }
+        }
+        SetEntryState::Frozen { borrowed_by } => {
+            format!("{} ●○○ frz({})", entry.name, borrowed_by)
+        }
         SetEntryState::SharedBorrow => {
             if let Some(from) = &entry.borrows_from {
                 format!("{} ○●○ &{}", entry.name, from)
@@ -125,6 +141,13 @@ pub fn format_entry_short(entry: &SetEntry) -> String {
                 format!("{} ○●● &mut {}", entry.name, from)
             } else {
                 format!("{} ○●●", entry.name)
+            }
+        }
+        SetEntryState::Moved { to } => {
+            if let Some(target) = to {
+                format!("{} → {}", entry.name, target)
+            } else {
+                format!("{} → _", entry.name)
             }
         }
         SetEntryState::Dropped => format!("{}†", entry.name),
@@ -241,26 +264,42 @@ pub fn find_var_position(line: &str, var_name: &str) -> Option<usize> {
 
 /// Format a label for a state change from the timeline.
 pub fn format_change_label(change: &StateChange) -> String {
-    let state_str = match &change.state {
+    let state_str: String = match &change.state {
         SetEntryState::Owned => {
-            if change.mutable { "●●● owned mut" } else { "●●○ owned" }
+            if change.mutable { "●●● owned mut".to_string() } else { "●●○ owned".to_string() }
         }
-        SetEntryState::Shared => "●●○ shared (borrowed)",
-        SetEntryState::Frozen => "●○○ frozen (&mut active)",
-        SetEntryState::SharedBorrow => "○●○ shared borrow",
-        SetEntryState::MutBorrow => "○●● mutable borrow",
-        SetEntryState::Dropped => "dropped",
+        SetEntryState::Shared { borrowed_by } => {
+            if borrowed_by.is_empty() {
+                "●●○ shared".to_string()
+            } else {
+                format!("●●○ shared (by {})", borrowed_by.join(", "))
+            }
+        }
+        SetEntryState::Frozen { borrowed_by } => {
+            format!("●○○ frozen (by {})", borrowed_by)
+        }
+        SetEntryState::SharedBorrow => "○●○ shared borrow".to_string(),
+        SetEntryState::MutBorrow => "○●● mutable borrow".to_string(),
+        SetEntryState::Moved { to } => {
+            if let Some(target) = to {
+                format!("move → {}; now invalid", target)
+            } else {
+                "moved; now invalid".to_string()
+            }
+        }
+        SetEntryState::Dropped => "dropped".to_string(),
     };
 
     match &change.change_type {
-        ChangeType::New => state_str.to_string(),
+        ChangeType::New => state_str,
         ChangeType::StateChanged { from } => {
             let prev_str = match from {
                 SetEntryState::Owned => "owned",
-                SetEntryState::Shared => "shared",
-                SetEntryState::Frozen => "frozen",
+                SetEntryState::Shared { .. } => "shared",
+                SetEntryState::Frozen { .. } => "frozen",
                 SetEntryState::SharedBorrow => "borrow",
                 SetEntryState::MutBorrow => "&mut",
+                SetEntryState::Moved { .. } => "moved",
                 SetEntryState::Dropped => "dropped",
             };
             format!("{} (was {})", state_str, prev_str)

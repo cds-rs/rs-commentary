@@ -195,11 +195,18 @@ impl OwnershipAnalyzer {
                     BindingState::Owned { mutable } => {
                         set.add_owned(binding.name.clone(), *mutable);
                     }
-                    BindingState::Shared { original_mutable, .. } => {
-                        set.add_shared(binding.name.clone(), *original_mutable);
+                    BindingState::Shared { original_mutable, borrowed_by } => {
+                        let borrow_names: Vec<String> = borrowed_by
+                            .iter()
+                            .filter_map(|id| self.bindings.get(id).map(|b| b.name.clone()))
+                            .collect();
+                        set.add_shared(binding.name.clone(), *original_mutable, borrow_names);
                     }
-                    BindingState::Frozen { original_mutable, .. } => {
-                        set.add_frozen(binding.name.clone(), *original_mutable);
+                    BindingState::Frozen { original_mutable, borrowed_by } => {
+                        let borrow_name = self.bindings.get(borrowed_by)
+                            .map(|b| b.name.clone())
+                            .unwrap_or_else(|| "?".to_string());
+                        set.add_frozen(binding.name.clone(), *original_mutable, borrow_name);
                     }
                     BindingState::SharedBorrow { from } => {
                         let from_name = self.bindings.get(from)
@@ -213,8 +220,13 @@ impl OwnershipAnalyzer {
                             .unwrap_or_else(|| "?".to_string());
                         set.add_mut_borrow(binding.name.clone(), from_name);
                     }
-                    // Moved, Dropped, etc. - not in set
-                    BindingState::Moved { .. } | BindingState::Dropped => {}
+                    BindingState::Moved { to } => {
+                        let to_name = to.and_then(|id| self.bindings.get(&id).map(|b| b.name.clone()));
+                        set.add_moved(binding.name.clone(), to_name);
+                    }
+                    BindingState::Dropped => {
+                        set.add_dropped(binding.name.clone());
+                    }
                     // Other states
                     _ => {
                         set.add_owned(binding.name.clone(), binding.is_mutable);
@@ -727,6 +739,19 @@ impl OwnershipAnalyzer {
             None
         });
 
+        // Check if the initializer is a plain path expression (move source)
+        let move_source = let_stmt.initializer().and_then(|init| {
+            if let ast::Expr::PathExpr(path_expr) = &init {
+                if let Some((_name, binding_id, binding)) = self.resolve_path(path_expr) {
+                    // Only track as move source if it's not a Copy type
+                    if !binding.is_copy {
+                        return Some((binding_id, init.syntax().text_range()));
+                    }
+                }
+            }
+            None
+        });
+
         // Determine if Copy: check type hint first, then initializer expression
         let is_copy = if let Some(ref t) = type_hint {
             self.is_copy_type(t)
@@ -756,8 +781,20 @@ impl OwnershipAnalyzer {
             }
         }
 
-        // Otherwise create a normal owned binding
+        // Track the binding ID that will be created (for simple IdentPat)
+        let target_binding_id = if let ast::Pat::IdentPat(_) = pat {
+            Some(BindingId(self.next_binding_id))
+        } else {
+            None
+        };
+
+        // Create a normal owned binding
         self.visit_pat_with_type(pat, false, is_copy);
+
+        // If this is a move (let y = x where x is non-Copy), record the move
+        if let Some((source_id, range)) = move_source {
+            self.record_move(source_id, target_binding_id, range);
+        }
 
         // Snapshot after binding creation
         let end = u32::from(let_stmt.syntax().text_range().end());
