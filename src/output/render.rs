@@ -1,6 +1,6 @@
 //! Top-level render functions.
 
-use crate::analysis::{OwnershipAnalyzer, SemanticAnalyzer, SemanticResult};
+use crate::analysis::{BindingKind, OwnershipAnalyzer, SemanticAnalyzer, SemanticResult};
 use ra_ap_syntax::{SourceFile, SyntaxKind, SyntaxToken};
 use std::collections::HashMap;
 use std::path::Path;
@@ -215,7 +215,14 @@ pub fn render_source_semantic(
     // Extract Copy type info for accurate filtering
     let copy_types: HashMap<String, bool> = last_use_info
         .values()
-        .map(|info| (info.name.clone(), info.is_copy))
+        .map(|info| (info.name.clone(), info.is_copy()))
+        .collect();
+
+    // Extract binding kinds for accurate messaging (borrow vs drop)
+    // Key by (name, decl_line) to disambiguate variables with the same name in different scopes
+    let binding_kinds: HashMap<(String, u32), BindingKind> = last_use_info
+        .values()
+        .map(|info| ((info.name.clone(), info.decl_line), info.kind))
         .collect();
 
     // Run ownership analysis (with original source for accurate positions)
@@ -239,6 +246,7 @@ pub fn render_source_semantic(
     let mut ctx =
         RenderContext::new_with_semantic(source_for_render, set_annotations, config.clone(), copy_types);
     ctx.set_semantic_drop_lines(drop_lines);
+    ctx.set_binding_kinds(binding_kinds);
     ctx.set_copy_events(ownership_analyzer.copy_events());
 
     // For Validated style, use the special renderer

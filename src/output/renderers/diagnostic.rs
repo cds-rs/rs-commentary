@@ -125,12 +125,22 @@ impl RichTextRenderer for DiagnosticRenderer {
 
                     // Print the state annotation (if not drop-only)
                     if let Some(ref label) = ann.state_label {
+                        // Override label with semantic info when available.
+                        // This fixes for loop variables like `for x in vec.iter_mut()`
+                        // where AST analysis shows "owned" but the type is actually &mut T.
+                        // We pass line_num_u32 to disambiguate same-named variables in different scopes.
+                        use crate::analysis::BindingKind;
+                        let display_label = match ctx.get_binding_kind(&ann.name, line_num_u32) {
+                            Some(BindingKind::MutRef) => "○●● mutable borrow".to_string(),
+                            Some(BindingKind::SharedRef) => "○●○ shared borrow".to_string(),
+                            _ => label.clone(),
+                        };
                         output.push_str(&format!(
                             "{:>width$} │ {}─ {}: {}\n",
                             "",
                             connector_trimmed,
                             ann.name,
-                            label,
+                            display_label,
                             width = line_num_width
                         ));
                     }
@@ -171,7 +181,17 @@ impl RichTextRenderer for DiagnosticRenderer {
                         };
                         let drop_connector_trimmed = drop_connector.trim_end();
 
-                        let message = if ann.is_borrow {
+                        // Determine if this is a borrow/reference type.
+                        // Prefer semantic info (from rust-analyzer type inference) over AST-based detection.
+                        // This correctly handles for loop variables like `for x in vec.iter_mut()` where
+                        // `x` is `&mut T` but AST analysis doesn't know this.
+                        // We pass line_num_u32 to disambiguate same-named variables in different scopes.
+                        let is_borrow = match ctx.get_binding_kind(&ann.name, line_num_u32) {
+                            Some(kind) => kind.is_borrow(),
+                            None => ann.is_borrow,
+                        };
+
+                        let message = if is_borrow {
                             // References don't "drop" - their borrows end
                             format!("note: `{}` borrow ends here", ann.name)
                         } else if let Some(ref reason) = ann.drop_reason {

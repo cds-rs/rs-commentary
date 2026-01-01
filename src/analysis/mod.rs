@@ -9,7 +9,7 @@ mod engine;
 mod semantic;
 
 pub use state::{
-    Annotation, BindingId, BindingState, Capabilities, OwnershipEvent, OwnershipSet,
+    Annotation, BindingId, BindingKind, BindingState, Capabilities, OwnershipEvent, OwnershipSet,
     Scope, SetAnnotation, SetEntry, SetEntryState, TransitionError,
 };
 pub use engine::{CopyEvent, OwnershipAnalyzer};

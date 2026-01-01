@@ -13,6 +13,67 @@ use thiserror::Error;
 pub struct BindingId(pub u32);
 
 // ============================================================================
+// Binding Kind: Type Classification for Ownership
+// ============================================================================
+
+/// Classification of a binding's type for ownership tracking.
+///
+/// This enum captures the essential ownership semantics of a binding,
+/// derived from rust-analyzer type inference. It enables proper messaging
+/// (e.g., "borrow ends" vs "dropped") and accurate capability display.
+///
+/// # Variants
+///
+/// - `OwnedCopy`: Value types that implement `Copy` (e.g., `i32`, `[u32; 5]`)
+/// - `OwnedMove`: Value types with move semantics (e.g., `String`, `Vec<T>`)
+/// - `SharedRef`: Shared references (`&T`) - semantically a borrow
+/// - `MutRef`: Mutable references (`&mut T`) - exclusive borrow
+///
+/// # Note on `&T`
+///
+/// While `&T` technically implements `Copy`, we classify it as `SharedRef`
+/// because semantically it represents a borrow. This allows us to emit
+/// "borrow ends here" instead of the misleading "dropped at scope exit".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BindingKind {
+    /// Owned value that implements Copy (i32, bool, [u32; 5], etc.)
+    OwnedCopy,
+    /// Owned value with move semantics (String, Vec<T>, Box<T>, etc.)
+    OwnedMove,
+    /// Shared reference (&T) - borrows the referent
+    SharedRef,
+    /// Mutable reference (&mut T) - exclusively borrows the referent
+    MutRef,
+}
+
+impl BindingKind {
+    /// Returns true if this binding is a reference type.
+    pub fn is_reference(&self) -> bool {
+        matches!(self, BindingKind::SharedRef | BindingKind::MutRef)
+    }
+
+    /// Returns true if this binding is a mutable reference.
+    pub fn is_mut_ref(&self) -> bool {
+        matches!(self, BindingKind::MutRef)
+    }
+
+    /// Returns true if this binding has Copy semantics.
+    ///
+    /// Note: `&T` is technically Copy but returns `false` here because
+    /// we want to track it as a borrow, not as a copyable value.
+    pub fn is_copy(&self) -> bool {
+        matches!(self, BindingKind::OwnedCopy)
+    }
+
+    /// Returns true if this binding represents a borrow (reference).
+    ///
+    /// Alias for `is_reference()` with clearer intent.
+    pub fn is_borrow(&self) -> bool {
+        self.is_reference()
+    }
+}
+
+// ============================================================================
 // State Machine: Events and Transitions
 // ============================================================================
 

@@ -5,7 +5,7 @@
 //! - Macro expansion
 //! - Copy/Drop trait detection via `Type::is_copy()`
 
-use crate::analysis::state::{Annotation, BindingState};
+use crate::analysis::state::{Annotation, BindingKind, BindingState};
 use anyhow::{Context, Result};
 use ra_ap_hir::Semantics;
 use ra_ap_ide::{
@@ -69,8 +69,17 @@ pub struct LastUseInfo {
     /// This may differ from last_use_line when the last use is inside a loop
     /// but the variable is declared outside the loop.
     pub drop_line: u32,
-    /// Whether this binding's type implements Copy.
-    pub is_copy: bool,
+    /// Classification of the binding's type (owned/copy/reference).
+    pub kind: BindingKind,
+}
+
+impl LastUseInfo {
+    /// Returns true if this binding's type implements Copy.
+    ///
+    /// Convenience method for backwards compatibility.
+    pub fn is_copy(&self) -> bool {
+        self.kind.is_copy()
+    }
 }
 
 /// Context for semantic analysis operations.
@@ -140,24 +149,33 @@ impl SemanticAnalyzer {
         None
     }
 
-    /// Check if a binding implements Copy using HIR.
+    /// Get the binding kind (owned/copy/reference) using HIR type inference.
     ///
-    /// Uses `Type::is_copy()` for accurate trait checking.
-    /// The AST node must come from the same Semantics instance (parsed through it).
-    fn is_copy_binding_sema<'db>(
+    /// Uses `Type::is_reference()`, `Type::is_mutable_reference()`, and `Type::is_copy()`
+    /// to classify the binding. This enables accurate messaging like "borrow ends"
+    /// for reference types vs "dropped" for owned types.
+    fn get_binding_kind_sema<'db>(
         &self,
         sema: &Semantics<'db, RootDatabase>,
         pat: &ast::IdentPat,
-    ) -> Option<bool> {
+    ) -> Option<BindingKind> {
         let db = self.host.raw_database();
-        // Get the type of this binding - pat must be from sema's parsed file
-        let ty = match sema.type_of_binding_in_pat(pat) {
-            Some(t) => t,
-            None => {
-                return None;
-            }
-        };
-        Some(ty.is_copy(db))
+        let ty = sema.type_of_binding_in_pat(pat)?;
+
+        // Check reference types first (they take precedence over Copy)
+        if ty.is_mutable_reference() {
+            return Some(BindingKind::MutRef);
+        }
+        if ty.is_reference() {
+            return Some(BindingKind::SharedRef);
+        }
+
+        // For non-reference types, check Copy
+        if ty.is_copy(db) {
+            Some(BindingKind::OwnedCopy)
+        } else {
+            Some(BindingKind::OwnedMove)
+        }
     }
 
     /// Check if a type at a position implements Copy (fallback using hover).
@@ -466,8 +484,10 @@ impl SemanticAnalyzer {
                         // the drop should be after the loop ends
                         let drop_line = compute_drop_line(decl_line, last_use_line, ctx.loop_ranges);
 
-                        // Check if this binding's type implements Copy using Semantics
-                        let is_copy = self.is_copy_binding_sema(ctx.sema, ident).unwrap_or(false);
+                        // Get binding kind (owned/copy/reference) using type inference
+                        let kind = self
+                            .get_binding_kind_sema(ctx.sema, ident)
+                            .unwrap_or(BindingKind::OwnedMove);
 
                         result.insert(
                             offset,
@@ -477,7 +497,7 @@ impl SemanticAnalyzer {
                                 last_use_line,
                                 last_use_offset,
                                 drop_line,
-                                is_copy,
+                                kind,
                             },
                         );
                     }
