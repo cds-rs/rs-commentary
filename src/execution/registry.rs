@@ -5,9 +5,10 @@
 //! - `impl` blocks and their methods
 //! - Closure expressions bound to variables
 
+use crate::util::{AstEvent, AstIter};
+use ra_ap_syntax::ast::{self, HasName};
+use ra_ap_syntax::{AstNode, SourceFile, SyntaxNode, TextRange};
 use std::collections::HashMap;
-use ra_ap_syntax::{ast, AstNode, SourceFile, SyntaxNode, TextRange};
-use ra_ap_syntax::ast::{HasModuleItem, HasName};
 
 /// Information about a callable function/method/closure.
 #[derive(Debug, Clone)]
@@ -48,22 +49,19 @@ pub struct FunctionRegistry {
     pub methods: HashMap<(String, String), FunctionInfo>,
     /// Closures: variable_name → info (in current scope)
     pub closures: HashMap<String, FunctionInfo>,
-    /// Source text for line number calculation.
-    line_starts: Vec<u32>,
 }
 
 impl FunctionRegistry {
     /// Build a registry from a source file.
     pub fn build(source: &str, file: &SourceFile) -> Self {
-        let mut registry = Self {
-            functions: HashMap::new(),
-            methods: HashMap::new(),
-            closures: HashMap::new(),
-            line_starts: compute_line_starts(source),
-        };
+        let line_starts = compute_line_starts(source);
+        let mut builder = RegistryBuilder::new(line_starts);
 
-        registry.visit_source_file(file);
-        registry
+        for event in AstIter::new(file) {
+            builder.process(&event);
+        }
+
+        builder.into_registry()
     }
 
     /// Check if a function name exists in the registry.
@@ -78,7 +76,8 @@ impl FunctionRegistry {
 
     /// Get a method by type and name.
     pub fn get_method(&self, type_name: &str, method_name: &str) -> Option<&FunctionInfo> {
-        self.methods.get(&(type_name.to_string(), method_name.to_string()))
+        self.methods
+            .get(&(type_name.to_string(), method_name.to_string()))
     }
 
     /// Get a closure by variable name.
@@ -98,49 +97,66 @@ impl FunctionRegistry {
             .chain(self.methods.values())
             .chain(self.closures.values())
     }
+}
 
-    /// Convert a byte offset to a line number (0-indexed).
-    fn offset_to_line(&self, offset: u32) -> u32 {
-        match self.line_starts.binary_search(&offset) {
-            Ok(line) => line as u32,
-            Err(line) => line.saturating_sub(1) as u32,
+/// Builder that processes AST events to construct a FunctionRegistry.
+struct RegistryBuilder {
+    functions: HashMap<String, FunctionInfo>,
+    methods: HashMap<(String, String), FunctionInfo>,
+    closures: HashMap<String, FunctionInfo>,
+    line_starts: Vec<u32>,
+    /// Current impl type context (set when inside an impl block).
+    current_impl_type: Option<String>,
+}
+
+impl RegistryBuilder {
+    fn new(line_starts: Vec<u32>) -> Self {
+        Self {
+            functions: HashMap::new(),
+            methods: HashMap::new(),
+            closures: HashMap::new(),
+            line_starts,
+            current_impl_type: None,
         }
     }
 
-    /// Get line range for a syntax node.
-    fn node_line_range(&self, node: &SyntaxNode) -> (u32, u32) {
-        let range = node.text_range();
-        let start = self.offset_to_line(range.start().into());
-        let end = self.offset_to_line(range.end().into());
-        (start, end)
-    }
-
-    /// Visit the source file to collect all callables.
-    fn visit_source_file(&mut self, file: &SourceFile) {
-        for item in file.items() {
-            self.visit_item(&item);
-        }
-    }
-
-    /// Visit a top-level item.
-    fn visit_item(&mut self, item: &ast::Item) {
-        match item {
-            ast::Item::Fn(f) => self.visit_fn(f, None),
-            ast::Item::Impl(impl_block) => self.visit_impl(impl_block),
+    fn process(&mut self, event: &AstEvent) {
+        match event {
+            AstEvent::Impl(impl_block) => {
+                // Set context for methods that follow
+                self.current_impl_type = impl_block
+                    .self_ty()
+                    .map(|ty| ty.syntax().text().to_string());
+            }
+            AstEvent::EnterFn(func) => {
+                self.record_function(func);
+            }
+            AstEvent::ExitFn => {
+                // Clear impl context when exiting a function
+                // (the iterator will re-enter impl context for next method)
+            }
+            AstEvent::Stmt(ast::Stmt::LetStmt(let_stmt)) => {
+                self.check_for_closure(let_stmt);
+            }
+            // After processing all functions in an impl, we need to know when the impl ends.
+            // The iterator doesn't have an ExitImpl event, so we check if Item follows
+            AstEvent::Item(ast::Item::Fn(_)) => {
+                // Free function - clear any impl context
+                self.current_impl_type = None;
+            }
             _ => {}
         }
     }
 
-    /// Visit a function definition.
-    fn visit_fn(&mut self, f: &ast::Fn, impl_type: Option<&str>) {
-        let Some(name) = f.name() else { return };
+    fn record_function(&mut self, func: &ast::Fn) {
+        let Some(name) = func.name() else { return };
         let name_str = name.text().to_string();
-        let line_range = self.node_line_range(f.syntax());
-        let body_range = f.body().map(|b| b.syntax().text_range());
+        let line_range = self.node_line_range(func.syntax());
+        let body_range = func.body().map(|b| b.syntax().text_range());
 
-        let kind = match impl_type {
+        let kind = match &self.current_impl_type {
             Some(ty) => FunctionKind::Method {
-                impl_type: ty.to_string(),
+                impl_type: ty.clone(),
             },
             None => FunctionKind::Free,
         };
@@ -161,56 +177,22 @@ impl FunctionRegistry {
             }
             FunctionKind::Closure { .. } => unreachable!(),
         }
-
-        // Also visit the function body for closures
-        if let Some(body) = f.body() {
-            self.visit_block_for_closures(&body);
-        }
     }
 
-    /// Visit an impl block.
-    fn visit_impl(&mut self, impl_block: &ast::Impl) {
-        // Get the type name
-        let type_name = impl_block
-            .self_ty()
-            .map(|ty| ty.syntax().text().to_string())
-            .unwrap_or_else(|| "Unknown".to_string());
-
-        // Visit all methods in the impl
-        if let Some(assoc_items) = impl_block.assoc_item_list() {
-            for item in assoc_items.assoc_items() {
-                if let ast::AssocItem::Fn(f) = item {
-                    self.visit_fn(&f, Some(&type_name));
-                }
-            }
-        }
-    }
-
-    /// Visit a block expression looking for closure definitions.
-    fn visit_block_for_closures(&mut self, block: &ast::BlockExpr) {
-        for stmt in block.statements() {
-            if let ast::Stmt::LetStmt(let_stmt) = stmt {
-                self.visit_let_for_closure(&let_stmt);
-            }
-        }
-    }
-
-    /// Visit a let statement looking for closure assignment.
-    fn visit_let_for_closure(&mut self, let_stmt: &ast::LetStmt) {
-        // Check if the initializer is a closure
-        let Some(init) = let_stmt.initializer() else {
-            return;
-        };
-
+    fn check_for_closure(&mut self, let_stmt: &ast::LetStmt) {
         // Get the variable name from the pattern
         let Some(pat) = let_stmt.pat() else { return };
-        let var_name = match pat {
+        let var_name = match &pat {
             ast::Pat::IdentPat(ident) => ident.name().map(|n| n.text().to_string()),
             _ => None,
         };
         let Some(var_name) = var_name else { return };
 
-        // Check if it's a closure
+        // Check if the initializer is a closure
+        let Some(init) = let_stmt.initializer() else {
+            return;
+        };
+
         if let ast::Expr::ClosureExpr(closure) = init {
             let line_range = self.node_line_range(closure.syntax());
             let body_range = closure.body().map(|b| b.syntax().text_range());
@@ -225,6 +207,28 @@ impl FunctionRegistry {
             };
 
             self.closures.insert(var_name, info);
+        }
+    }
+
+    fn offset_to_line(&self, offset: u32) -> u32 {
+        match self.line_starts.binary_search(&offset) {
+            Ok(line) => line as u32,
+            Err(line) => line.saturating_sub(1) as u32,
+        }
+    }
+
+    fn node_line_range(&self, node: &SyntaxNode) -> (u32, u32) {
+        let range = node.text_range();
+        let start = self.offset_to_line(range.start().into());
+        let end = self.offset_to_line(range.end().into());
+        (start, end)
+    }
+
+    fn into_registry(self) -> FunctionRegistry {
+        FunctionRegistry {
+            functions: self.functions,
+            methods: self.methods,
+            closures: self.closures,
         }
     }
 }
