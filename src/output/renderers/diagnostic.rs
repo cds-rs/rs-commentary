@@ -53,8 +53,28 @@ impl RichTextRenderer for DiagnosticRenderer {
             // Get pending drops for the NEXT line (drops happen after this line)
             let pending_drops = ctx.timeline.get_pending_drops(line_num_u32 + 1);
 
+            // Get copy events for this line
+            let copy_events = ctx.get_copy_events(line_num_u32);
+
             // Get unified annotations (state changes + drops, sorted right-to-left)
-            let annotations = get_line_annotations(line, &changes, &pending_drops, &ctx.timeline);
+            let mut annotations = get_line_annotations(line, &changes, &pending_drops, &ctx.timeline);
+
+            // Add copy event annotations
+            for copy in copy_events {
+                if let Some(pos) = crate::output::helpers::find_var_position(line, &copy.from) {
+                    annotations.push(crate::output::helpers::LineAnnotation {
+                        name: copy.from.clone(),
+                        position: pos,
+                        state_label: Some(format!("copied → {} (Copy); {} still valid", copy.to, copy.from)),
+                        has_drop: false,
+                        drop_reason: None,
+                        is_borrow: false, // Copy types are owned, not borrows
+                    });
+                }
+            }
+
+            // Re-sort by position (rightmost first)
+            annotations.sort_by_key(|a| std::cmp::Reverse(a.position));
 
             // Render underline annotations
             if !annotations.is_empty() {
@@ -116,11 +136,21 @@ impl RichTextRenderer for DiagnosticRenderer {
                     }
 
                     // Print drop note if applicable
-                    // Skip drop note if state_label already describes a move (avoid redundancy)
+                    // Skip drop note if:
+                    // 1. State label already describes a move (avoid redundancy)
+                    // 2. State label shows a copy (Copy types don't have meaningful drops)
+                    // 3. Variable is a Copy type with ScopeExit reason (no interesting destructor)
                     let is_move_already_shown = ann.state_label.as_ref()
                         .map(|l| l.starts_with("move") || l.contains("→"))
                         .unwrap_or(false);
-                    if ann.has_drop && !is_move_already_shown {
+                    let is_copy_type = ann.state_label.as_ref()
+                        .map(|l| l.contains("(Copy)") || l.contains("copied"))
+                        .unwrap_or(false)
+                        || ctx.is_copy_type(&ann.name);
+                    let is_copy_scope_exit = is_copy_type
+                        && matches!(ann.drop_reason, Some(crate::util::InvalidationReason::ScopeExit));
+
+                    if ann.has_drop && !is_move_already_shown && !is_copy_scope_exit {
                         // For drop-only annotations, reuse the same connector
                         // For state+drop, build a new connector
                         let drop_connector = if ann.state_label.is_some() {
@@ -141,7 +171,10 @@ impl RichTextRenderer for DiagnosticRenderer {
                         };
                         let drop_connector_trimmed = drop_connector.trim_end();
 
-                        let message = if let Some(ref reason) = ann.drop_reason {
+                        let message = if ann.is_borrow {
+                            // References don't "drop" - their borrows end
+                            format!("note: `{}` borrow ends here", ann.name)
+                        } else if let Some(ref reason) = ann.drop_reason {
                             format_invalidation_message(&ann.name, reason)
                         } else {
                             format!("note: `{}` dropped (last use)", ann.name)

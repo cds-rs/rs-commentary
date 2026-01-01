@@ -16,28 +16,36 @@ pub struct LineAnnotation {
     pub has_drop: bool,
     /// Why the binding became invalid (if has_drop is true)
     pub drop_reason: Option<InvalidationReason>,
+    /// Whether this is a borrow (references don't "drop", their borrows "end")
+    pub is_borrow: bool,
 }
 
 impl LineAnnotation {
     /// Create annotation from a state change.
     pub fn from_change(change: &StateChange, position: usize, drop_reason: Option<InvalidationReason>) -> Self {
+        let is_borrow = matches!(
+            change.state,
+            SetEntryState::SharedBorrow | SetEntryState::MutBorrow
+        );
         Self {
             name: change.name.clone(),
             position,
             state_label: Some(format_change_label(change)),
             has_drop: drop_reason.is_some(),
             drop_reason,
+            is_borrow,
         }
     }
 
     /// Create drop-only annotation.
-    pub fn drop_only(name: String, position: usize, reason: InvalidationReason) -> Self {
+    pub fn drop_only(name: String, position: usize, reason: InvalidationReason, is_borrow: bool) -> Self {
         Self {
             name,
             position,
             state_label: None,
             has_drop: true,
             drop_reason: Some(reason),
+            is_borrow,
         }
     }
 }
@@ -70,7 +78,14 @@ pub fn get_line_annotations(
             let already_annotated = annotations.iter().any(|a| a.name == drop.name);
             if !already_annotated {
                 if let Some(pos) = find_var_position(line, &drop.name) {
-                    annotations.push(LineAnnotation::drop_only(drop.name.clone(), pos, drop.reason.clone()));
+                    // frees_source being Some indicates this was a borrow
+                    let is_borrow = drop.frees_source.is_some();
+                    annotations.push(LineAnnotation::drop_only(
+                        drop.name.clone(),
+                        pos,
+                        drop.reason.clone(),
+                        is_borrow,
+                    ));
                 }
             }
         }

@@ -264,7 +264,8 @@ impl BindingState {
             }
 
             (BindingState::Owned { .. }, OwnershipEvent::Copy) => {
-                // Copy doesn't change the source binding's state
+                // Copy doesn't change the source binding's state - it remains Owned
+                // The copy annotation is tracked separately as a synthetic event
                 Ok(self.clone())
             }
 

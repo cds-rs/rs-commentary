@@ -28,12 +28,26 @@ pub struct BindingInfo {
     pub current_state: BindingState,
 }
 
+/// A synthetic copy event - tracks when a Copy type is copied to another binding.
+/// This is separate from state changes since Copy doesn't change the source's state.
+#[derive(Debug, Clone)]
+pub struct CopyEvent {
+    /// Name of the source binding
+    pub from: String,
+    /// Name of the target binding
+    pub to: String,
+    /// Line number where the copy occurred
+    pub line: u32,
+}
+
 /// The ownership analyzer tracks variable state through code.
 pub struct OwnershipAnalyzer {
     bindings: HashMap<BindingId, BindingInfo>,
     scopes: HashMap<ScopeId, Scope>,
     annotations: Vec<Annotation>,
     set_annotations: Vec<SetAnnotation>,
+    /// Synthetic copy events (Copy types copied to another binding)
+    copy_events: Vec<CopyEvent>,
     next_binding_id: u32,
     next_scope_id: u32,
     current_scope: ScopeId,
@@ -41,8 +55,8 @@ pub struct OwnershipAnalyzer {
     source: String,
 
     // Event processing context (for AstIter-based traversal)
-    /// Current let statement being processed (set on Stmt(LetStmt), cleared on Pat)
-    current_let_stmt: Option<ast::LetStmt>,
+    /// Stack of let statements being processed (for nested blocks with let bindings)
+    let_stmt_stack: Vec<ast::LetStmt>,
     /// True when processing function parameters (set on EnterFn, cleared on EnterBlock)
     in_fn_params: bool,
     /// Current function being processed (for parameter type lookup)
@@ -77,13 +91,14 @@ impl OwnershipAnalyzer {
             scopes,
             annotations: Vec::new(),
             set_annotations: Vec::new(),
+            copy_events: Vec::new(),
             next_binding_id: 0,
             next_scope_id: 1,
             current_scope: root_scope_id,
             current_fn_name: String::new(),
             source: String::new(),
             // Context fields
-            current_let_stmt: None,
+            let_stmt_stack: Vec::new(),
             in_fn_params: false,
             current_fn: None,
             current_closure: None,
@@ -391,6 +406,42 @@ impl OwnershipAnalyzer {
         }
     }
 
+    /// Record a copy of a binding (for Copy types in let bindings).
+    /// Unlike move, the source remains valid after copy.
+    /// This creates a synthetic event - the source's state doesn't change.
+    pub fn record_copy(
+        &mut self,
+        _from: BindingId,
+        from_name: String,
+        _to: BindingId,
+        to_name: String,
+        range: TextRange,
+    ) {
+        // Calculate line number from range
+        let line = self.offset_to_line(u32::from(range.start()));
+
+        // Add synthetic copy event (no state change to source)
+        self.copy_events.push(CopyEvent {
+            from: from_name,
+            to: to_name,
+            line,
+        });
+    }
+
+    /// Get the recorded copy events.
+    pub fn copy_events(&self) -> &[CopyEvent] {
+        &self.copy_events
+    }
+
+    /// Get Copy type info for all tracked bindings.
+    /// Returns a map from variable name to whether it's a Copy type.
+    pub fn copy_types(&self) -> HashMap<String, bool> {
+        self.bindings
+            .values()
+            .map(|b| (b.name.clone(), b.is_copy))
+            .collect()
+    }
+
     /// Record a shared borrow of a binding.
     /// This also marks the original as "shared" (shr) - temporarily read-only.
     pub fn record_shared_borrow(&mut self, from: BindingId, range: TextRange) -> BindingId {
@@ -670,9 +721,9 @@ impl OwnershipAnalyzer {
     fn handle_stmt(&mut self, stmt: &ast::Stmt) {
         match stmt {
             ast::Stmt::LetStmt(let_stmt) => {
-                // Store context for when we see the Pat event
+                // Push onto stack for when we see the Pat event
                 // Snapshot will be taken after the Pat event processes the binding
-                self.current_let_stmt = Some(let_stmt.clone());
+                self.let_stmt_stack.push(let_stmt.clone());
             }
             ast::Stmt::ExprStmt(_) => {
                 // Expression will be handled by Expr event
@@ -712,7 +763,7 @@ impl OwnershipAnalyzer {
 
             // Use visit_param which handles the type
             self.visit_param(pat, type_str.as_deref());
-        } else if let Some(let_stmt) = self.current_let_stmt.take() {
+        } else if let Some(let_stmt) = self.let_stmt_stack.pop() {
             // This is a let binding - use the full let statement context
             self.handle_let_binding(pat, &let_stmt);
         } else {
@@ -739,14 +790,11 @@ impl OwnershipAnalyzer {
             None
         });
 
-        // Check if the initializer is a plain path expression (move source)
-        let move_source = let_stmt.initializer().and_then(|init| {
+        // Check if the initializer is a plain path expression (potential move or copy source)
+        let transfer_source = let_stmt.initializer().and_then(|init| {
             if let ast::Expr::PathExpr(path_expr) = &init {
-                if let Some((_name, binding_id, binding)) = self.resolve_path(path_expr) {
-                    // Only track as move source if it's not a Copy type
-                    if !binding.is_copy {
-                        return Some((binding_id, init.syntax().text_range()));
-                    }
+                if let Some((name, binding_id, binding)) = self.resolve_path(path_expr) {
+                    return Some((name, binding_id, binding.is_copy, init.syntax().text_range()));
                 }
             }
             None
@@ -781,9 +829,9 @@ impl OwnershipAnalyzer {
             }
         }
 
-        // Track the binding ID that will be created (for simple IdentPat)
-        let target_binding_id = if let ast::Pat::IdentPat(_) = pat {
-            Some(BindingId(self.next_binding_id))
+        // Track the binding ID and name that will be created (for simple IdentPat)
+        let target_info = if let ast::Pat::IdentPat(ident_pat) = pat {
+            ident_pat.name().map(|n| (BindingId(self.next_binding_id), n.text().to_string()))
         } else {
             None
         };
@@ -791,9 +839,17 @@ impl OwnershipAnalyzer {
         // Create a normal owned binding
         self.visit_pat_with_type(pat, false, is_copy);
 
-        // If this is a move (let y = x where x is non-Copy), record the move
-        if let Some((source_id, range)) = move_source {
-            self.record_move(source_id, target_binding_id, range);
+        // Record transfer (move or copy) from source to target
+        if let Some((source_name, source_id, source_is_copy, range)) = transfer_source {
+            if let Some((target_id, target_name)) = target_info {
+                if source_is_copy {
+                    // Copy: source remains valid
+                    self.record_copy(source_id, source_name, target_id, target_name, range);
+                } else {
+                    // Move: source becomes invalid
+                    self.record_move(source_id, Some(target_id), range);
+                }
+            }
         }
 
         // Snapshot after binding creation
@@ -936,19 +992,119 @@ impl OwnershipAnalyzer {
 
     /// Check if an expression produces a non-Copy type.
     ///
-    /// Assumes non-Copy by default. The semantic layer (rust-analyzer)
-    /// provides accurate Copy detection and overrides this in rendering.
-    fn is_non_copy_expr(&self, _expr: &ast::Expr) -> bool {
-        true // Assume non-Copy; semantic layer corrects this
+    /// Conservative analysis: returns false (Copy) when we can prove it,
+    /// true (non-Copy) when uncertain. The semantic layer provides
+    /// accurate detection and overrides this in rendering.
+    fn is_non_copy_expr(&self, expr: &ast::Expr) -> bool {
+        match expr {
+            // Block expression: check the tail expression
+            ast::Expr::BlockExpr(block) => {
+                if let Some(stmt_list) = block.stmt_list() {
+                    if let Some(tail) = stmt_list.tail_expr() {
+                        return self.is_non_copy_expr(&tail);
+                    }
+                }
+                true // No tail expression, assume non-Copy
+            }
+            // Path expression: check if the binding is Copy
+            // Note: We search all bindings, not just in-scope ones, because
+            // we may be checking a tail expression after its scope was exited.
+            ast::Expr::PathExpr(path) => {
+                if let Some(path) = path.path() {
+                    if path.qualifier().is_none() {
+                        if let Some(segment) = path.segment() {
+                            if let Some(name_ref) = segment.name_ref() {
+                                let name = name_ref.text();
+                                // Search all bindings by name
+                                for binding in self.bindings.values() {
+                                    if binding.name == name {
+                                        return !binding.is_copy;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                true // Unknown binding, assume non-Copy
+            }
+            // Parenthesized expression: check inner
+            ast::Expr::ParenExpr(paren) => {
+                paren.expr().map(|e| self.is_non_copy_expr(&e)).unwrap_or(true)
+            }
+            // Literals are Copy
+            ast::Expr::Literal(_) => false,
+            // Array expressions of Copy types
+            ast::Expr::ArrayExpr(arr) => {
+                // Check if all elements are Copy
+                match arr.kind() {
+                    ast::ArrayExprKind::ElementList(mut elems) => {
+                        elems.any(|e| self.is_non_copy_expr(&e))
+                    }
+                    ast::ArrayExprKind::Repeat { initializer, .. } => {
+                        // [expr; N] - check the element type
+                        initializer.map(|e| self.is_non_copy_expr(&e)).unwrap_or(true)
+                    }
+                }
+            }
+            // Tuple expressions of Copy types
+            ast::Expr::TupleExpr(tuple) => {
+                tuple.fields().any(|f| self.is_non_copy_expr(&f))
+            }
+            // Field access: can't easily determine, assume non-Copy
+            // (could be Copy if the field type is Copy, but we don't know)
+            ast::Expr::FieldExpr(_) => true,
+            // Index expression: assume Copy for array indexing
+            ast::Expr::IndexExpr(_) => false, // Array indexing typically yields Copy
+            // Method calls, function calls: assume non-Copy
+            ast::Expr::MethodCallExpr(_) | ast::Expr::CallExpr(_) => true,
+            // Everything else: assume non-Copy
+            _ => true,
+        }
     }
 
     /// Check if a type string represents a Copy type.
     ///
-    /// Only detects references as Copy (they always are).
-    /// The semantic layer provides accurate Copy detection.
+    /// Detects primitives, references, and common Copy types.
+    /// The semantic layer (rust-analyzer) provides more accurate detection.
     fn is_copy_type(&self, type_str: &str) -> bool {
+        let t = type_str.trim();
+
         // References are always Copy
-        type_str.trim().starts_with('&')
+        if t.starts_with('&') {
+            return true;
+        }
+
+        // Primitive types
+        if matches!(
+            t,
+            "bool" | "char"
+                | "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
+                | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
+                | "f32" | "f64"
+                | "()" // unit type
+        ) {
+            return true;
+        }
+
+        // Arrays of primitives: [T; N]
+        if t.starts_with('[') && t.ends_with(']') {
+            if let Some(inner) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+                // Extract element type before ';'
+                if let Some(elem_type) = inner.split(';').next() {
+                    return self.is_copy_type(elem_type.trim());
+                }
+            }
+        }
+
+        // Tuples of Copy types: (T, U, ...)
+        if t.starts_with('(') && t.ends_with(')') && t != "()" {
+            let inner = &t[1..t.len() - 1];
+            return inner.split(',').all(|part| self.is_copy_type(part.trim()));
+        }
+
+        // Option<Copy>, Result<Copy, Copy> etc. - conservative: assume non-Copy
+        // The semantic layer will correct this
+        false
     }
 
     fn visit_pat_with_type(&mut self, pat: &ast::Pat, is_mutable: bool, is_copy: bool) {
@@ -1296,9 +1452,8 @@ fn main() {
     }
 
     #[test]
-    fn test_primitive_treated_as_move() {
-        // Note: Engine treats all non-reference types as non-Copy (move).
-        // Accurate Copy detection is handled by the semantic layer (rust-analyzer).
+    fn test_primitive_treated_as_copy() {
+        // Engine detects primitives like i32 as Copy types.
         let source = r#"
 fn take_int(x: i32) {}
 fn main() {
@@ -1309,11 +1464,73 @@ fn main() {
         let mut analyzer = OwnershipAnalyzer::new();
         let annotations = analyzer.analyze(source).unwrap();
 
-        // Engine treats i32 as moved (semantic layer will correct this)
+        // i32 is Copy, so it should be Copied not Moved
         let move_ann = annotations.iter().find(|a| {
             a.binding == "x" && matches!(a.state, BindingState::Moved { .. })
         });
-        assert!(move_ann.is_some(), "Engine should treat primitive as moved");
+        assert!(move_ann.is_none(), "Primitive i32 should not be moved (it's Copy)");
+
+        let copy_ann = annotations.iter().find(|a| {
+            a.binding == "x" && matches!(a.state, BindingState::Copied)
+        });
+        assert!(copy_ann.is_some(), "Primitive i32 should be copied");
+    }
+
+    #[test]
+    fn test_array_of_primitives_is_copy() {
+        // Arrays of Copy types (like [u32; 5]) should be detected as Copy.
+        let source = r#"
+fn process(counts: [u32; 5]) {
+    let k = counts;   // Should be a copy, not a move
+    let m = k;        // Should also be a copy
+}
+"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        let annotations = analyzer.analyze(source).unwrap();
+
+        // counts should NOT be moved (it's Copy)
+        let counts_moved = annotations.iter().find(|a| {
+            a.binding == "counts" && matches!(a.state, BindingState::Moved { .. })
+        });
+        assert!(counts_moved.is_none(), "Array [u32; 5] should not be moved (it's Copy)");
+
+        // k should NOT be moved
+        let k_moved = annotations.iter().find(|a| {
+            a.binding == "k" && matches!(a.state, BindingState::Moved { .. })
+        });
+        assert!(k_moved.is_none(), "k (copy of array) should not be moved");
+
+        // Check copy events were recorded
+        let copies = analyzer.copy_events();
+        assert!(copies.iter().any(|c| c.from == "counts" && c.to == "k"),
+            "Should have copy event counts → k");
+        assert!(copies.iter().any(|c| c.from == "k" && c.to == "m"),
+            "Should have copy event k → m");
+    }
+
+    #[test]
+    fn test_copy_event_line_number_in_for_loop() {
+        // Copy events inside for loops should have the correct line number
+        let source = r#"fn process(arr: [u32; 5]) {
+    for i in 0..5 {
+        let x = arr;
+        println!("{}", x[0]);
+    }
+    println!("{:?}", arr);
+}"#;
+        let mut analyzer = OwnershipAnalyzer::new();
+        analyzer.analyze(source).unwrap();
+
+        let copies = analyzer.copy_events();
+        eprintln!("Copy events: {:?}", copies);
+
+        // Find the copy event arr → x
+        let copy = copies.iter().find(|c| c.from == "arr" && c.to == "x");
+        assert!(copy.is_some(), "Should have copy event arr → x");
+
+        // Line 2 (0-indexed) is "        let x = arr;"
+        let copy = copy.unwrap();
+        assert_eq!(copy.line, 2, "Copy event should be at line 2 (0-indexed), not {}", copy.line);
     }
 
     #[test]

@@ -79,6 +79,10 @@ enum Cmd {
         #[bpaf(short, long)]
         all: bool,
 
+        /// Strip comments from source before rendering
+        #[bpaf(long)]
+        strip_comments: bool,
+
         /// Serve HTML output via local HTTP server (only with --style=html)
         #[bpaf(long)]
         serve: bool,
@@ -101,7 +105,7 @@ fn main() -> Result<()> {
     let cmd = cmd().run();
 
     match cmd {
-        Cmd::Annotate { file, style, all, serve, port } => {
+        Cmd::Annotate { file, style, all, strip_comments, serve, port } => {
             if serve && style != Style::Html {
                 bail!("--serve can only be used with --style=html");
             }
@@ -118,7 +122,9 @@ fn main() -> Result<()> {
                 }
             };
 
-            let config = RenderConfig::new().with_filter_copy(!all);
+            let config = RenderConfig::new()
+                .with_filter_copy(!all)
+                .with_strip_comments(strip_comments);
 
             let output = if let Some(ref path) = file_path {
                 render_source_semantic(path, &source, render_style, config.clone())

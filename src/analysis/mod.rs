@@ -12,5 +12,5 @@ pub use state::{
     Annotation, BindingId, BindingState, Capabilities, OwnershipEvent, OwnershipSet,
     Scope, SetAnnotation, SetEntry, SetEntryState, TransitionError,
 };
-pub use engine::OwnershipAnalyzer;
+pub use engine::{CopyEvent, OwnershipAnalyzer};
 pub use semantic::{DiagnosticSeverity, LastUseInfo, RaDiagnostic, SemanticAnalyzer, SemanticResult};

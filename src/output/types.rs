@@ -102,6 +102,8 @@ pub struct RenderConfig {
     pub comment_column: usize,
     /// Show verbose explanations
     pub verbose: bool,
+    /// Strip comments from source before rendering
+    pub strip_comments: bool,
 }
 
 impl RenderConfig {
@@ -110,6 +112,7 @@ impl RenderConfig {
             filter_copy_types: true,
             comment_column: 58,
             verbose: false,
+            strip_comments: false,
         }
     }
 
@@ -120,6 +123,11 @@ impl RenderConfig {
 
     pub fn with_comment_column(mut self, col: usize) -> Self {
         self.comment_column = col;
+        self
+    }
+
+    pub fn with_strip_comments(mut self, strip: bool) -> Self {
+        self.strip_comments = strip;
         self
     }
 }

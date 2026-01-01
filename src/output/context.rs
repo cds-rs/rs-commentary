@@ -1,6 +1,6 @@
 //! Render context - holds analyzed data for renderers.
 
-use crate::analysis::{OwnershipSet, SetAnnotation, SetEntry, SetEntryState};
+use crate::analysis::{CopyEvent, OwnershipSet, SetAnnotation, SetEntry, SetEntryState};
 use crate::util::StateTimeline;
 use super::types::RenderConfig;
 use std::collections::HashMap;
@@ -19,6 +19,8 @@ pub struct RenderContext<'a> {
     semantic_copy_types: HashMap<String, bool>,
     /// Semantic drop lines for NLL tracking.
     semantic_drop_lines: HashMap<(String, u32), u32>,
+    /// Synthetic copy events: line -> copies on that line.
+    copy_events_by_line: HashMap<u32, Vec<CopyEvent>>,
 }
 
 impl<'a> RenderContext<'a> {
@@ -96,6 +98,7 @@ impl<'a> RenderContext<'a> {
             timeline,
             semantic_copy_types: copy_types,
             semantic_drop_lines: HashMap::new(),
+            copy_events_by_line: HashMap::new(),
         }
     }
 
@@ -135,5 +138,23 @@ impl<'a> RenderContext<'a> {
     /// Set semantic Copy type info for accurate filtering.
     pub fn set_semantic_copy_types(&mut self, copy_types: HashMap<String, bool>) {
         self.semantic_copy_types = copy_types;
+    }
+
+    /// Set copy events from the analyzer.
+    pub fn set_copy_events(&mut self, events: &[CopyEvent]) {
+        for event in events {
+            self.copy_events_by_line
+                .entry(event.line)
+                .or_default()
+                .push(event.clone());
+        }
+    }
+
+    /// Get copy events for a specific line.
+    pub fn get_copy_events(&self, line: u32) -> &[CopyEvent] {
+        self.copy_events_by_line
+            .get(&line)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 }
