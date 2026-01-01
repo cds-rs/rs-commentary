@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 use bpaf::Bpaf;
-use rs_commentary::output::{render_source, render_source_semantic, RenderConfig, RenderStyle};
+use rs_commentary::output::{render_source_semantic, RenderConfig, RenderStyle};
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -112,26 +112,19 @@ fn main() -> Result<()> {
 
             let render_style: RenderStyle = style.into();
 
-            let (source, file_path) = match file {
-                Some(path) => (fs::read_to_string(&path)?, Some(path)),
-                None => {
-                    use std::io::Read;
-                    let mut source = String::new();
-                    std::io::stdin().read_to_string(&mut source)?;
-                    (source, None)
-                }
-            };
+            let file_path = file.ok_or_else(|| {
+                anyhow::anyhow!("file path required (stdin not supported - must be in a cargo project)")
+            })?;
+            let source = fs::read_to_string(&file_path)?;
 
             let config = RenderConfig::new()
                 .with_filter_copy(!all)
                 .with_strip_comments(strip_comments);
 
-            let output = if let Some(ref path) = file_path {
-                render_source_semantic(path, &source, render_style, config.clone())
-                    .unwrap_or_else(|| render_source(&source, render_style, config))
-            } else {
-                render_source(&source, render_style, config)
-            };
+            let output = render_source_semantic(&file_path, &source, render_style, config)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("failed to load cargo project (file must be in a cargo workspace)")
+                })?;
 
             if serve {
                 serve_html(&output, port)?;

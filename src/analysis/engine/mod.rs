@@ -71,6 +71,8 @@ pub struct OwnershipAnalyzer {
     fn_scope: Option<ScopeId>,
     /// Scope ID of the current block (for dropped bindings at closing brace)
     block_scope_stack: Vec<ScopeId>,
+    /// Semantic copy types: declaration offset -> is_copy (from rust-analyzer)
+    semantic_copy_types: HashMap<u32, bool>,
 }
 
 impl OwnershipAnalyzer {
@@ -106,7 +108,15 @@ impl OwnershipAnalyzer {
             in_closure_params: false,
             fn_scope: None,
             block_scope_stack: Vec::new(),
+            semantic_copy_types: HashMap::new(),
         }
+    }
+
+    /// Set semantic copy type information from rust-analyzer.
+    ///
+    /// This provides authoritative type info for Copy/Move determination.
+    pub fn set_semantic_copy_types(&mut self, copy_types: HashMap<u32, bool>) {
+        self.semantic_copy_types = copy_types;
     }
 
     // ========================================================================
@@ -800,12 +810,16 @@ impl OwnershipAnalyzer {
             None
         });
 
-        // Determine if Copy: check type hint first, then initializer expression
-        let is_copy = if let Some(ref t) = type_hint {
+        // Determine if Copy: check semantic info first, then fall back to heuristics
+        let decl_offset = u32::from(pat.syntax().text_range().start());
+        let is_copy = if let Some(&is_copy) = self.semantic_copy_types.get(&decl_offset) {
+            // Use authoritative semantic info from rust-analyzer
+            is_copy
+        } else if let Some(ref t) = type_hint {
+            // Fall back: check type annotation (for tests without semantic analysis)
             self.is_copy_type(t)
-        } else if let Some(ref init) = let_stmt.initializer() {
-            !self.is_non_copy_expr(init)
         } else {
+            // No semantic info, no type hint: assume non-Copy (conservative)
             false
         };
 
@@ -988,78 +1002,6 @@ impl OwnershipAnalyzer {
         }
 
         self.annotations.push(Annotation::new(range, name_str, state, explanation));
-    }
-
-    /// Check if an expression produces a non-Copy type.
-    ///
-    /// Conservative analysis: returns false (Copy) when we can prove it,
-    /// true (non-Copy) when uncertain. The semantic layer provides
-    /// accurate detection and overrides this in rendering.
-    fn is_non_copy_expr(&self, expr: &ast::Expr) -> bool {
-        match expr {
-            // Block expression: check the tail expression
-            ast::Expr::BlockExpr(block) => {
-                if let Some(stmt_list) = block.stmt_list() {
-                    if let Some(tail) = stmt_list.tail_expr() {
-                        return self.is_non_copy_expr(&tail);
-                    }
-                }
-                true // No tail expression, assume non-Copy
-            }
-            // Path expression: check if the binding is Copy
-            // Note: We search all bindings, not just in-scope ones, because
-            // we may be checking a tail expression after its scope was exited.
-            ast::Expr::PathExpr(path) => {
-                if let Some(path) = path.path() {
-                    if path.qualifier().is_none() {
-                        if let Some(segment) = path.segment() {
-                            if let Some(name_ref) = segment.name_ref() {
-                                let name = name_ref.text();
-                                // Search all bindings by name
-                                for binding in self.bindings.values() {
-                                    if binding.name == name {
-                                        return !binding.is_copy;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                true // Unknown binding, assume non-Copy
-            }
-            // Parenthesized expression: check inner
-            ast::Expr::ParenExpr(paren) => {
-                paren.expr().map(|e| self.is_non_copy_expr(&e)).unwrap_or(true)
-            }
-            // Literals are Copy
-            ast::Expr::Literal(_) => false,
-            // Array expressions of Copy types
-            ast::Expr::ArrayExpr(arr) => {
-                // Check if all elements are Copy
-                match arr.kind() {
-                    ast::ArrayExprKind::ElementList(mut elems) => {
-                        elems.any(|e| self.is_non_copy_expr(&e))
-                    }
-                    ast::ArrayExprKind::Repeat { initializer, .. } => {
-                        // [expr; N] - check the element type
-                        initializer.map(|e| self.is_non_copy_expr(&e)).unwrap_or(true)
-                    }
-                }
-            }
-            // Tuple expressions of Copy types
-            ast::Expr::TupleExpr(tuple) => {
-                tuple.fields().any(|f| self.is_non_copy_expr(&f))
-            }
-            // Field access: can't easily determine, assume non-Copy
-            // (could be Copy if the field type is Copy, but we don't know)
-            ast::Expr::FieldExpr(_) => true,
-            // Index expression: assume Copy for array indexing
-            ast::Expr::IndexExpr(_) => false, // Array indexing typically yields Copy
-            // Method calls, function calls: assume non-Copy
-            ast::Expr::MethodCallExpr(_) | ast::Expr::CallExpr(_) => true,
-            // Everything else: assume non-Copy
-            _ => true,
-        }
     }
 
     /// Check if a type string represents a Copy type.
@@ -1479,10 +1421,11 @@ fn main() {
     #[test]
     fn test_array_of_primitives_is_copy() {
         // Arrays of Copy types (like [u32; 5]) should be detected as Copy.
+        // Note: Type annotations required without semantic analysis.
         let source = r#"
 fn process(counts: [u32; 5]) {
-    let k = counts;   // Should be a copy, not a move
-    let m = k;        // Should also be a copy
+    let k: [u32; 5] = counts;   // Should be a copy, not a move
+    let m: [u32; 5] = k;        // Should also be a copy
 }
 "#;
         let mut analyzer = OwnershipAnalyzer::new();

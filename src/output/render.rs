@@ -117,14 +117,12 @@ fn collapse_blank_lines(output: &str) -> String {
     result.join("\n")
 }
 
-/// Render source with the specified style.
+/// Render source with the specified style (AST-only, for tests).
 ///
-/// Returns annotated source code. Check `style.category()` to determine
-/// whether the output is valid Rust or rich text.
-///
-/// Note: For `RenderStyle::Validated`, use `render_source_semantic` instead
-/// which provides rust-analyzer diagnostics.
-pub fn render_source(source: &str, style: RenderStyle, config: RenderConfig) -> String {
+/// This is an internal function used for testing. Production code should use
+/// `render_source_semantic()` which provides accurate type information.
+#[cfg(test)]
+pub(crate) fn render_source(source: &str, style: RenderStyle, config: RenderConfig) -> String {
     // Analyze with original source (positions must be accurate)
     let mut analyzer = OwnershipAnalyzer::new();
 
@@ -225,8 +223,15 @@ pub fn render_source_semantic(
         .map(|info| ((info.name.clone(), info.decl_line), info.kind))
         .collect();
 
+    // Extract copy types keyed by declaration offset for ownership analyzer
+    let copy_types_by_offset: HashMap<u32, bool> = last_use_info
+        .iter()
+        .map(|(decl_offset, info)| (u32::from(*decl_offset), info.is_copy()))
+        .collect();
+
     // Run ownership analysis (with original source for accurate positions)
     let mut ownership_analyzer = OwnershipAnalyzer::new();
+    ownership_analyzer.set_semantic_copy_types(copy_types_by_offset);
     let Ok(_) = ownership_analyzer.analyze(source) else {
         return None;
     };
@@ -303,13 +308,14 @@ mod tests {
 
     #[test]
     fn test_array_copy_through_block() {
-        // Arrays of primitives are Copy, even through block expressions
+        // Arrays of primitives are Copy, even through block expressions.
+        // Note: Type annotations required without semantic analysis.
         let source = r#"fn process(counts: [u32; 5]) {
-    let book_groups = {
-        let mut k = counts;
+    let book_groups: [u32; 5] = {
+        let mut k: [u32; 5] = counts;
         k
     };
-    let next = book_groups;  // This should be a copy, not move
+    let next: [u32; 5] = book_groups;  // This should be a copy, not move
     println!("{:?}", book_groups);  // book_groups still valid
 }"#;
         let output = render_source(source, RenderStyle::Diagnostic, RenderConfig::default());
@@ -325,13 +331,14 @@ mod tests {
         // Copy annotation should appear at the line where the copy happens,
         // not at a later use of the variable.
         // This mimics the user's book-store code structure.
+        // Note: Type annotations required without semantic analysis.
         let source = r#"fn process(counts: [u32; 5]) {
-    let book_groups = {
-        let mut k = counts;
+    let book_groups: [u32; 5] = {
+        let mut k: [u32; 5] = counts;
         k
     };
     for i in 0..5 {
-        let next = book_groups;
+        let next: [u32; 5] = book_groups;
     }
     use_array(book_groups);
 }
@@ -341,12 +348,12 @@ fn use_array(_: [u32; 5]) {}"#;
         let output = render_source(source, RenderStyle::Diagnostic, config);
         eprintln!("--- For loop copy output (strip_comments=true) ---\n{output}\n---");
 
-        // The "book_groups: copied → next" annotation should appear near line 7 (let next = book_groups),
+        // The "book_groups: copied → next" annotation should appear near line 7 (let next...),
         // not at line 9 (use_array(book_groups))
         let lines: Vec<&str> = output.lines().collect();
 
-        // Find the line with "let next = book_groups"
-        let let_next_idx = lines.iter().position(|l| l.contains("let next = book_groups")).unwrap();
+        // Find the line with "let next" (has type annotation now)
+        let let_next_idx = lines.iter().position(|l| l.contains("let next:")).unwrap();
         // Find the line with "use_array(book_groups)"
         let use_array_idx = lines.iter().position(|l| l.contains("use_array(book_groups)")).unwrap();
 

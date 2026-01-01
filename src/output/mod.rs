@@ -21,7 +21,7 @@ pub mod renderers;
 
 // Re-export public types
 pub use context::RenderContext;
-pub use render::{render_source, render_source_semantic};
+pub use render::render_source_semantic;
 pub use renderers::{
     ColumnarRenderer, DiagnosticRenderer, GroupedRenderer, HtmlRenderer, InlineRenderer,
     SetNotationRenderer, ValidatedRenderContext, ValidatedRenderer, VerticalSpansRenderer,
