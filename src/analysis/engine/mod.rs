@@ -811,7 +811,16 @@ impl OwnershipAnalyzer {
         });
 
         // Determine if Copy: check semantic info first, then fall back to heuristics
-        let decl_offset = u32::from(pat.syntax().text_range().start());
+        // Use name offset (not pattern offset) to match semantic analysis keys.
+        // For `let mut x`, pat includes "mut x" but semantic keys use just "x".
+        let decl_offset = if let ast::Pat::IdentPat(ident_pat) = pat {
+            ident_pat
+                .name()
+                .map(|n| u32::from(n.syntax().text_range().start()))
+                .unwrap_or_else(|| u32::from(pat.syntax().text_range().start()))
+        } else {
+            u32::from(pat.syntax().text_range().start())
+        };
         let is_copy = if let Some(&is_copy) = self.semantic_copy_types.get(&decl_offset) {
             // Use authoritative semantic info from rust-analyzer
             is_copy
@@ -926,17 +935,18 @@ impl OwnershipAnalyzer {
                 }
             }
 
-            // Plain variable - potential move
+            // Plain variable - potential move or copy into call
             ast::Expr::PathExpr(path_expr) => {
                 if let Some((name, binding_id, binding)) = self.resolve_path(path_expr) {
                     let range = arg.syntax().text_range();
                     if binding.is_copy {
-                        self.annotations.push(Annotation::new(
-                            range,
-                            name.clone(),
-                            BindingState::Copied,
-                            format!("{}: copied (Copy type)", name),
-                        ));
+                        // Create copy event for function call (Copy types remain valid)
+                        let line = self.offset_to_line(u32::from(range.start()));
+                        self.copy_events.push(CopyEvent {
+                            from: name.clone(),
+                            to: "call".to_string(),
+                            line,
+                        });
                     } else {
                         self.record_move(binding_id, None, range);
                     }
@@ -1412,10 +1422,12 @@ fn main() {
         });
         assert!(move_ann.is_none(), "Primitive i32 should not be moved (it's Copy)");
 
-        let copy_ann = annotations.iter().find(|a| {
-            a.binding == "x" && matches!(a.state, BindingState::Copied)
-        });
-        assert!(copy_ann.is_some(), "Primitive i32 should be copied");
+        // Check for copy event (created when Copy type passed to function)
+        let copies = analyzer.copy_events();
+        assert!(
+            copies.iter().any(|c| c.from == "x" && c.to == "call"),
+            "Primitive i32 should create copy event when passed to function"
+        );
     }
 
     #[test]
