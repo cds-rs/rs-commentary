@@ -22,7 +22,10 @@ Annotates Rust code with ownership state at each line:
    │         └─ r: ○●○ shared borrow
  4 │     println!("{}", r);
    │     ^^^^^^^^^^^^^^ note: `r` dropped (last use)
- 5 │ }
+ 5 │     takes_ref(&s);
+   │               ─
+   │               └─ s: borrowed → takes_ref
+ 6 │ }
    ╰─
 ```
 
@@ -118,6 +121,7 @@ Configure your editor to use `rs-commentary lsp` as a language server alongside 
 - **Multiple output styles**: Terminal, HTML slides, LSP hints
 - **NLL-aware drops**: Tracks when variables are dropped at last use via rust-analyzer
 - **Accurate Copy detection**: Uses rust-analyzer's type system to filter Copy types
+- **Call-site transfers**: Shows what happens at function calls (`copied → fn`, `mut borrowed → fn`)
 - **Macro support**: Tracks borrows in `println!`, `format!`, `vec!`, etc.
 - **State transitions**: Shows when ownership state changes (borrowed, frozen, restored)
 - **Borrow tracking**: Visualizes when borrows end and owners regain capabilities

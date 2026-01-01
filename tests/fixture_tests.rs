@@ -106,3 +106,36 @@ fn test_param_last_use_detection() {
         score.decl_line
     );
 }
+
+#[test]
+fn test_for_loop_variable_is_copy() {
+    // Test that for-loop iteration variables are correctly detected as Copy types.
+    // Previously, for-loop patterns were always marked as non-Copy because the
+    // offset-based lookup failed to find the semantic type info.
+    //
+    // With the TypeOracle refactor, we query rust-analyzer directly at the AST node,
+    // which correctly identifies `group_size: usize` as Copy.
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("test-fixtures/drop_test/src/for_loop.rs");
+    let source = std::fs::read_to_string(&path).expect("for_loop.rs should exist");
+
+    let config = RenderConfig::default();
+    let result = render_source_semantic(&path, &source, RenderStyle::Diagnostic, config);
+
+    let output = result.expect("Semantic analysis should work for fixtures workspace");
+
+    eprintln!("=== Diagnostic output ===\n{}", output);
+
+    // The output should show "copied → take" not "moved → take"
+    // This verifies that group_size (usize) is correctly detected as Copy
+    assert!(
+        output.contains("copied") || output.contains("⊕→"),
+        "For-loop variable (usize) should be detected as Copy, showing 'copied' annotation.\nOutput:\n{}",
+        output
+    );
+    assert!(
+        !output.contains("moved → take"),
+        "For-loop variable should NOT show as 'moved' - it's a Copy type.\nOutput:\n{}",
+        output
+    );
+}

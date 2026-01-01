@@ -787,6 +787,88 @@ fn compute_drop_line(decl_line: u32, last_use_line: u32, loop_ranges: &[(u32, u3
     best_loop_end.unwrap_or(last_use_line + 1)
 }
 
+// ============================================================================
+// TypeOracle implementation - on-demand type queries
+// ============================================================================
+
+use super::TypeOracle;
+
+/// Type oracle backed by rust-analyzer's semantic analysis.
+///
+/// This provides on-demand type queries by looking up AST nodes by offset
+/// in the semantically-analyzed tree.
+pub struct SemanticTypeOracle<'a> {
+    host: &'a AnalysisHost,
+    file_id: FileId,
+}
+
+impl<'a> SemanticTypeOracle<'a> {
+    /// Create a new type oracle for a specific file.
+    pub fn new(host: &'a AnalysisHost, file_id: FileId) -> Self {
+        Self { host, file_id }
+    }
+}
+
+impl TypeOracle for SemanticTypeOracle<'_> {
+    fn is_copy(&self, pat: &ast::IdentPat) -> Option<bool> {
+        let db = self.host.raw_database();
+        let sema = Semantics::new(db);
+
+        // Parse the file through Semantics so nodes are connected to the DB
+        let file = sema.parse_guess_edition(self.file_id);
+
+        // Find the corresponding IdentPat in the sema-parsed tree by offset
+        let offset = pat.syntax().text_range().start();
+        let sema_pat: ast::IdentPat = sema.find_node_at_offset_with_descend(file.syntax(), offset)?;
+
+        // Get the type of this binding
+        let ty = sema.type_of_binding_in_pat(&sema_pat)?;
+
+        // References are Copy (the reference itself, not the referent)
+        if ty.is_reference() || ty.is_mutable_reference() {
+            return Some(true);
+        }
+
+        Some(ty.is_copy(db))
+    }
+
+    fn is_scalar(&self, pat: &ast::IdentPat) -> Option<bool> {
+        let db = self.host.raw_database();
+        let sema = Semantics::new(db);
+
+        // Parse the file through Semantics
+        let file = sema.parse_guess_edition(self.file_id);
+
+        // Find the corresponding IdentPat by offset
+        let offset = pat.syntax().text_range().start();
+        let sema_pat: ast::IdentPat = sema.find_node_at_offset_with_descend(file.syntax(), offset)?;
+
+        // Get the type
+        let ty = sema.type_of_binding_in_pat(&sema_pat)?;
+
+        // Check if it's a scalar primitive
+        let ty_str = ty.display(db, ra_ap_syntax::Edition::Edition2021).to_string();
+        Some(matches!(
+            ty_str.as_str(),
+            "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
+                | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
+                | "f32" | "f64"
+                | "bool"
+                | "char"
+                | "()"
+        ))
+    }
+}
+
+impl SemanticAnalyzer {
+    /// Create a type oracle for the given file.
+    ///
+    /// Returns `None` if the file is not found in the workspace.
+    pub fn type_oracle(&self, file_id: FileId) -> SemanticTypeOracle<'_> {
+        SemanticTypeOracle::new(&self.host, file_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

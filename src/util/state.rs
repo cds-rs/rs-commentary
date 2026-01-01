@@ -465,6 +465,8 @@ impl StateTimeline {
     /// Get all variable transitions for a line: (prev, curr) pairs.
     /// This is the unified view that treats ∅ as the initial/final state.
     /// Returns transitions for: new vars, changed vars, unchanged vars, dropped vars.
+    ///
+    /// If no state was recorded for this line, carries forward the previous line's state.
     pub fn get_var_transitions(&self, line_num: u32) -> Vec<VarTransition> {
         let current = self.get(line_num);
         let prev = self.find_prev_in_scope(line_num);
@@ -473,18 +475,32 @@ impl StateTimeline {
         let mut transitions = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
+        // Use current state if it has meaningful data, otherwise carry forward from prev.
+        // An empty states map means no SetAnnotation was created for this line.
+        let effective_curr = current
+            .filter(|c| !c.states.is_empty())
+            .or(prev);
+
         // Process current live variables
-        if let Some(curr) = current {
+        if let Some(curr) = effective_curr {
             for (name, (state, mutable)) in &curr.states {
                 if matches!(state, SetEntryState::Dropped) {
                     continue;
                 }
                 seen.insert(name.clone());
 
-                let prev_state = prev.and_then(|p| p.states.get(name)).cloned();
+                // Only show as "new" if we have explicit current state AND no prev
+                // If we're carrying forward, prev == curr so show as unchanged
+                let prev_state = if current.is_some() {
+                    prev.and_then(|p| p.states.get(name)).cloned()
+                } else {
+                    // Carrying forward: prev = curr, so show same state (unchanged)
+                    Some((state.clone(), *mutable))
+                };
+
                 transitions.push(VarTransition {
                     name: name.clone(),
-                    prev: prev_state, // None = ∅ (new var)
+                    prev: prev_state,
                     curr: Some((state.clone(), *mutable)),
                 });
             }

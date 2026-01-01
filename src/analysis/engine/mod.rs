@@ -10,6 +10,7 @@ use super::state::{
     Annotation, BindingId, BindingState, OwnershipEvent, OwnershipSet, Scope, ScopeId,
     SetAnnotation,
 };
+use super::TypeOracle;
 use crate::util::{AstEvent, AstIter};
 use anyhow::Result;
 use ra_ap_syntax::{
@@ -31,23 +32,58 @@ pub struct BindingInfo {
     pub current_state: BindingState,
 }
 
-/// A synthetic copy event - tracks when a Copy type is copied to another binding.
-/// This is separate from state changes since Copy doesn't change the source's state.
+/// Transfer kind at a call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferKind {
+    /// Ownership moves to callee.
+    Move,
+    /// Shared borrow (&T).
+    SharedBorrow,
+    /// Mutable borrow (&mut T).
+    MutBorrow,
+    /// Copy (no ownership change).
+    Copy,
+}
+
+impl TransferKind {
+    pub fn symbol(&self) -> &'static str {
+        match self {
+            TransferKind::Move => "→",
+            TransferKind::SharedBorrow => "&→",
+            TransferKind::MutBorrow => "&mut→",
+            TransferKind::Copy => "⊕→",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            TransferKind::Move => "moved",
+            TransferKind::SharedBorrow => "borrowed",
+            TransferKind::MutBorrow => "mut borrowed",
+            TransferKind::Copy => "copied",
+        }
+    }
+}
+
+/// A call-site transfer event: tracks what happens to arguments at function calls.
+/// Copy types don't change state; moves and borrows do.
 #[derive(Debug, Clone)]
 pub struct CopyEvent {
     /// Name of the source binding
     pub from: String,
-    /// Name of the target binding ("call" for function arguments)
+    /// Name of the target (function name or variable)
     pub to: String,
-    /// Line number where the copy occurred
+    /// Line number where the transfer occurred
     pub line: u32,
+    /// Kind of transfer
+    pub kind: TransferKind,
     /// If true, this is a low-value annotation (scalar primitive in function call).
     /// Renderers can choose to suppress these for noise reduction.
     pub is_scalar_in_call: bool,
 }
 
 /// The ownership analyzer tracks variable state through code.
-pub struct OwnershipAnalyzer {
+pub struct OwnershipAnalyzer<'oracle> {
     bindings: HashMap<BindingId, BindingInfo>,
     scopes: HashMap<ScopeId, Scope>,
     annotations: Vec<Annotation>,
@@ -81,9 +117,11 @@ pub struct OwnershipAnalyzer {
     semantic_copy_types: HashMap<u32, bool>,
     /// Semantic scalar types: declaration offset -> is_scalar (from rust-analyzer)
     semantic_scalar_types: HashMap<u32, bool>,
+    /// Type oracle for on-demand type queries (optional, from rust-analyzer)
+    type_oracle: Option<&'oracle dyn TypeOracle>,
 }
 
-impl OwnershipAnalyzer {
+impl<'oracle> OwnershipAnalyzer<'oracle> {
     pub fn new() -> Self {
         let root_scope_id = ScopeId(0);
         let mut scopes = HashMap::new();
@@ -118,12 +156,22 @@ impl OwnershipAnalyzer {
             block_scope_stack: Vec::new(),
             semantic_copy_types: HashMap::new(),
             semantic_scalar_types: HashMap::new(),
+            type_oracle: None,
         }
+    }
+
+    /// Set the type oracle for on-demand type queries.
+    ///
+    /// When set, the analyzer will query this oracle for Copy/scalar type info
+    /// at the point of use, rather than relying on pre-collected offset mappings.
+    pub fn set_type_oracle(&mut self, oracle: &'oracle dyn TypeOracle) {
+        self.type_oracle = Some(oracle);
     }
 
     /// Set semantic copy type information from rust-analyzer.
     ///
     /// This provides authoritative type info for Copy/Move determination.
+    /// Deprecated: prefer `set_type_oracle` for on-demand queries.
     pub fn set_semantic_copy_types(&mut self, copy_types: HashMap<u32, bool>) {
         self.semantic_copy_types = copy_types;
     }
@@ -455,6 +503,7 @@ impl OwnershipAnalyzer {
             from: from_name,
             to: to_name,
             line,
+            kind: TransferKind::Copy,
             is_scalar_in_call: false, // Let bindings always show
         });
     }
@@ -933,8 +982,20 @@ impl OwnershipAnalyzer {
             ast::Expr::RefExpr(ref_expr) if ref_expr.mut_token().is_none() => {
                 if let Some(ast::Expr::PathExpr(path_expr)) = ref_expr.expr() {
                     if let Some((name, binding_id, _)) = self.resolve_path(&path_expr) {
+                        let range = arg.syntax().text_range();
+                        let line = self.offset_to_line(u32::from(range.start()));
+
+                        // Record CopyEvent for call-site description
+                        self.copy_events.push(CopyEvent {
+                            from: name.clone(),
+                            to: call_target.to_string(),
+                            line,
+                            kind: TransferKind::SharedBorrow,
+                            is_scalar_in_call: false,
+                        });
+
                         self.annotations.push(Annotation::new(
-                            arg.syntax().text_range(),
+                            range,
                             name,
                             BindingState::SharedBorrow { from: binding_id },
                             "shared borrow passed to function".to_string(),
@@ -943,44 +1004,80 @@ impl OwnershipAnalyzer {
                 }
             }
 
-            // &mut x - reborrow, original is suspended
+            // &mut x - mutable borrow in call context
             ast::Expr::RefExpr(ref_expr) => {
                 if let Some(ast::Expr::PathExpr(path_expr)) = ref_expr.expr() {
                     if let Some((name, _binding_id, _)) = self.resolve_path(&path_expr) {
+                        let range = arg.syntax().text_range();
+                        let line = self.offset_to_line(u32::from(range.start()));
+
+                        // Record CopyEvent for call-site description
+                        self.copy_events.push(CopyEvent {
+                            from: name.clone(),
+                            to: call_target.to_string(),
+                            line,
+                            kind: TransferKind::MutBorrow,
+                            is_scalar_in_call: false,
+                        });
+
                         let reborrow_id = BindingId(self.next_binding_id);
                         self.next_binding_id += 1;
                         self.annotations.push(Annotation::new(
-                            arg.syntax().text_range(),
+                            range,
                             name,
                             BindingState::Suspended { reborrowed_to: reborrow_id },
-                            "reborrowed to function call, original suspended".to_string(),
+                            "mutable borrow passed to function".to_string(),
                         ));
                     }
                 }
             }
 
-            // Plain variable - potential move or copy into call
+            // Plain variable - potential move, copy, or reborrow into call
             ast::Expr::PathExpr(path_expr) => {
                 if let Some((name, binding_id, binding)) = self.resolve_path(path_expr) {
                     let range = arg.syntax().text_range();
-                    // Skip copy events for reference types - they're reborrows, not copies.
-                    // The state timeline already shows them as borrows.
-                    let is_borrow = matches!(
-                        binding.current_state,
-                        BindingState::SharedBorrow { .. } | BindingState::MutBorrow { .. }
-                    );
-                    if is_borrow {
-                        // Reference types: no annotation needed, state shows the borrow
-                    } else if binding.is_copy {
-                        // Create copy event for function call (Copy types remain valid)
-                        let line = self.offset_to_line(u32::from(range.start()));
+                    let line = self.offset_to_line(u32::from(range.start()));
+
+                    // Determine transfer kind based on binding state
+                    let is_shared_borrow = matches!(binding.current_state, BindingState::SharedBorrow { .. });
+                    let is_mut_borrow = matches!(binding.current_state, BindingState::MutBorrow { .. });
+
+                    if is_shared_borrow {
+                        // Reference reborrowed into call
                         self.copy_events.push(CopyEvent {
                             from: name.clone(),
                             to: call_target.to_string(),
                             line,
+                            kind: TransferKind::SharedBorrow,
+                            is_scalar_in_call: false,
+                        });
+                    } else if is_mut_borrow {
+                        // Mutable reference reborrowed into call
+                        self.copy_events.push(CopyEvent {
+                            from: name.clone(),
+                            to: call_target.to_string(),
+                            line,
+                            kind: TransferKind::MutBorrow,
+                            is_scalar_in_call: false,
+                        });
+                    } else if binding.is_copy {
+                        // Copy type: value copied into call
+                        self.copy_events.push(CopyEvent {
+                            from: name.clone(),
+                            to: call_target.to_string(),
+                            line,
+                            kind: TransferKind::Copy,
                             is_scalar_in_call: binding.is_scalar,
                         });
                     } else {
+                        // Non-copy owned type: moved into call
+                        self.copy_events.push(CopyEvent {
+                            from: name.clone(),
+                            to: call_target.to_string(),
+                            line,
+                            kind: TransferKind::Move,
+                            is_scalar_in_call: false,
+                        });
                         self.record_move(binding_id, None, range);
                     }
                 }
@@ -1098,17 +1195,28 @@ impl OwnershipAnalyzer {
             ast::Pat::IdentPat(ident_pat) => {
                 if let Some(name) = ident_pat.name() {
                     let is_mut = is_mutable || ident_pat.mut_token().is_some();
+
+                    // Query type oracle for Copy/scalar status, falling back to passed values
+                    let (actual_is_copy, actual_is_scalar) = if let Some(oracle) = &self.type_oracle {
+                        (
+                            oracle.is_copy(ident_pat).unwrap_or(is_copy),
+                            oracle.is_scalar(ident_pat).unwrap_or(is_scalar),
+                        )
+                    } else {
+                        (is_copy, is_scalar)
+                    };
+
                     self.new_binding(
                         name.text().to_string(),
                         is_mut,
-                        is_copy,
-                        is_scalar,
+                        actual_is_copy,
+                        actual_is_scalar,
                         pat.syntax().text_range(),
                     );
                 }
             }
             ast::Pat::TuplePat(tuple_pat) => {
-                // Tuple elements may have different scalar status; conservatively use false
+                // Tuple elements may have different scalar status; query oracle for each
                 for field in tuple_pat.fields() {
                     self.visit_pat_with_type(&field, is_mutable, is_copy, false);
                 }
@@ -1278,7 +1386,7 @@ impl OwnershipAnalyzer {
     }
 }
 
-impl Default for OwnershipAnalyzer {
+impl Default for OwnershipAnalyzer<'_> {
     fn default() -> Self {
         Self::new()
     }

@@ -74,10 +74,14 @@ When borrowed, the original binding's capabilities are temporarily reduced:
 | `engine/macros.rs` | Format macro parsing (println!, format!, dbg!, etc.) |
 | `semantic.rs` | rust-analyzer integration for accurate type info |
 | `state.rs` | Core state machine types (`BindingState`, `OwnershipEvent`) |
+| `mod.rs` | `TypeOracle` trait for on-demand type queries |
 
-The engine assumes all types are non-Copy; the semantic layer corrects this
-using `Type::is_copy()` from rust-analyzer's HIR. The semantic module uses
-`SemanticContext` to bundle common parameters (sema, file_id, source, loop_ranges).
+The engine uses `TypeOracle` to query Copy status at each AST node during
+traversal. `SemanticTypeOracle` implements this via rust-analyzer's
+`find_node_at_offset_with_descend` and `type_of_binding_in_pat`.
+
+The semantic module uses `SemanticContext` to bundle common parameters
+(sema, file_id, source, loop_ranges).
 
 ## AstIter (src/util/ast_visitor.rs)
 
@@ -257,15 +261,28 @@ rs-commentary annotate file.rs --all              # include Copy types
 ## Copy Type Detection
 
 rs-commentary uses rust-analyzer's HIR (High-level Intermediate Representation)
-for accurate Copy trait detection via `Type::is_copy()`. This requires:
+for accurate Copy trait detection. This requires:
 
 1. **Cargo project**: The file must be part of a cargo workspace
 2. **Sysroot loading**: Standard library is auto-discovered for trait resolution
 
+### TypeOracle
+
+The `TypeOracle` trait provides on-demand type queries during AST traversal:
+
 ```rust
-// SemanticAnalyzer checks if binding implements Copy
-let is_copy = sema.type_of_binding_in_pat(pat)?.is_copy(db);
+pub trait TypeOracle {
+    fn is_copy(&self, pat: &ast::IdentPat) -> Option<bool>;
+    fn is_scalar(&self, pat: &ast::IdentPat) -> Option<bool>;
+}
 ```
+
+`SemanticTypeOracle` implements this using `find_node_at_offset_with_descend`
+to locate the semantic node corresponding to each AST pattern, then queries
+`type_of_binding_in_pat()` for the actual type.
+
+This fixes cases where AST analysis alone gets it wrong (e.g., for-loop
+variables like `for x in iter` where `x` might be `&mut T` but looks owned).
 
 By default, Copy types are filtered from output. Use `--all` to show them:
 
@@ -277,6 +294,26 @@ rs-commentary annotate file.rs --all   # Include Copy types
 **Macro handling**:
 - `println!`, `format!`, `dbg!` etc. implicitly borrow
 - Both `println!("{}", x)` and `println!("{x}")` detected
+
+## Call-Site Transfer Annotations
+
+Function calls show what happens to each argument:
+
+```
+find_min(book_counts, &mut cache);
+         ───────────       ─────
+         |                 └─ cache: mut borrowed → find_min
+         └─ book_counts: copied → find_min
+```
+
+Transfer kinds:
+- `copied → fn`: Copy type passed by value
+- `moved → fn`: Non-Copy type passed by value
+- `borrowed → fn`: Shared borrow passed (`&x`)
+- `mut borrowed → fn`: Mutable borrow passed (`&mut x`)
+
+The analyzer creates `CopyEvent` records during `process_call_arg()`, which
+renderers consume to show transfer annotations alongside state changes.
 
 ## NLL Support
 

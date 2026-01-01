@@ -62,36 +62,66 @@ impl RichTextRenderer for DiagnosticRenderer {
             // Get unified annotations (state changes + drops, sorted right-to-left)
             let mut annotations = get_line_annotations(line, &changes, &pending_drops, &ctx.timeline);
 
-            // Add copy event annotations (skip scalar primitives in function calls)
-            for copy in copy_events {
+            // Add call-site transfer annotations (skip scalar primitives in function calls)
+            for transfer in copy_events {
+                use crate::analysis::TransferKind;
                 // Skip low-value annotations: scalar primitives (i32, usize, etc.) passed to functions
-                if copy.is_scalar_in_call {
+                if transfer.is_scalar_in_call {
                     continue;
                 }
-                if let Some(pos) = crate::output::helpers::find_var_position(line, &copy.from) {
-                    // Only show "still valid" if:
-                    // 1. The variable is used afterward (not dead), AND
-                    // 2. We haven't already shown "still valid" for this variable (via tracker)
-                    let is_dead = ctx.is_dead_after(&copy.from, line_num_u32);
-                    let show_still_valid = !is_dead && tracker.should_show_still_valid(&copy.from);
-                    let label = if show_still_valid {
-                        format!("copied → {} (Copy); {} still valid", copy.to, copy.from)
-                    } else {
-                        format!("copied → {} (Copy)", copy.to)
+                if let Some(pos) = crate::output::helpers::find_var_position(line, &transfer.from) {
+                    // Only show "still valid" for Copy types that are used afterward
+                    let is_dead = ctx.is_dead_after(&transfer.from, line_num_u32);
+                    let show_still_valid = matches!(transfer.kind, TransferKind::Copy)
+                        && !is_dead
+                        && tracker.should_show_still_valid(&transfer.from);
+
+                    let kind_desc = match transfer.kind {
+                        TransferKind::Copy => "copied",
+                        TransferKind::Move => "moved",
+                        TransferKind::SharedBorrow => "borrowed",
+                        TransferKind::MutBorrow => "mut borrowed",
                     };
+                    let label = if show_still_valid {
+                        format!("{} → {}; {} still valid", kind_desc, transfer.to, transfer.from)
+                    } else {
+                        format!("{} → {}", kind_desc, transfer.to)
+                    };
+                    let is_borrow = matches!(
+                        transfer.kind,
+                        TransferKind::SharedBorrow | TransferKind::MutBorrow
+                    );
                     annotations.push(crate::output::helpers::LineAnnotation {
-                        name: copy.from.clone(),
+                        name: transfer.from.clone(),
                         position: pos,
                         state_label: Some(label),
                         has_drop: false,
                         drop_reason: None,
-                        is_borrow: false, // Copy types are owned, not borrows
+                        is_borrow,
                     });
                 }
             }
 
             // Re-sort by position (rightmost first)
             annotations.sort_by_key(|a| std::cmp::Reverse(a.position));
+
+            // Filter out annotations that won't produce any visible output:
+            // - No state_label AND (no drop OR Copy type with ScopeExit)
+            annotations.retain(|ann| {
+                // Has state label -> will show
+                if ann.state_label.is_some() {
+                    return true;
+                }
+                // Has drop that will be shown
+                if ann.has_drop {
+                    let is_copy_type = ctx.is_copy_type(&ann.name);
+                    let is_copy_scope_exit = is_copy_type
+                        && matches!(ann.drop_reason, Some(crate::util::InvalidationReason::ScopeExit));
+                    // Drop note is shown only if not a Copy+ScopeExit
+                    return !is_copy_scope_exit;
+                }
+                false
+            });
 
             // Render underline annotations
             if !annotations.is_empty() {

@@ -8,7 +8,7 @@ use ra_ap_syntax::ast;
 use ra_ap_syntax::AstNode;
 use std::collections::HashSet;
 
-impl OwnershipAnalyzer {
+impl OwnershipAnalyzer<'_> {
     /// Visit a macro expression like println!, format!, etc.
     /// Formatting macros implicitly borrow their arguments.
     pub(super) fn visit_macro_expr(&mut self, macro_expr: &ast::MacroExpr) {

@@ -9,13 +9,15 @@ use std::collections::{HashMap, HashSet};
 // Unified Line Content - Single source of truth for all renderers
 // ============================================================================
 
-/// Processed copy event with computed "still valid" status.
+/// Processed transfer event with computed "still valid" status.
 #[derive(Debug, Clone)]
 pub struct ProcessedCopy {
-    /// Variable being copied from.
+    /// Variable being transferred.
     pub from: String,
     /// Target (function name or variable).
     pub to: String,
+    /// Kind of transfer (Copy, Move, SharedBorrow, MutBorrow).
+    pub kind: crate::analysis::TransferKind,
     /// Whether the source variable is still used after this line.
     pub still_valid: bool,
     /// Whether this is the first time we're showing "still valid" for this var.
@@ -362,6 +364,7 @@ impl<'a> RenderContext<'a> {
                 ProcessedCopy {
                     from: c.from.clone(),
                     to: c.to.clone(),
+                    kind: c.kind,
                     still_valid,
                     show_still_valid,
                 }

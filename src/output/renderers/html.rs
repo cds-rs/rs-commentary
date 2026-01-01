@@ -294,16 +294,23 @@ fn build_description_from_content(content: &LineContent) -> String {
         ));
     }
 
-    // Describe copy events (using pre-computed "still valid" from LineContent)
-    for copy in &content.copy_events {
-        let still_valid = if copy.show_still_valid {
-            format!("; <code>{}</code> still valid", copy.from)
+    // Describe call-site transfers (copy, move, borrow, mut borrow)
+    for transfer in &content.copy_events {
+        use crate::analysis::TransferKind;
+        let still_valid = if transfer.show_still_valid {
+            format!("; <code>{}</code> still valid", transfer.from)
         } else {
             String::new()
         };
+        let (symbol, desc) = match transfer.kind {
+            TransferKind::Copy => ("⊕", "copied"),
+            TransferKind::Move => ("→", "moved"),
+            TransferKind::SharedBorrow => ("&amp;→", "borrowed"),
+            TransferKind::MutBorrow => ("&amp;mut→", "mut borrowed"),
+        };
         parts.push(format!(
-            "<span class=\"call-transfer\">⟳</span> <code>{}</code> copied → {} (Copy){}",
-            copy.from, copy.to, still_valid
+            "<span class=\"call-transfer\">{}</span> <code>{}</code> {} → {}{}",
+            symbol, transfer.from, desc, transfer.to, still_valid
         ));
     }
 
