@@ -160,14 +160,22 @@ src/
 
 ## Testing
 
-Integration tests use a separate fixtures workspace with real Rust code:
-
 ```bash
 cargo test                           # Run all tests
-cargo test --test fixture_tests      # Run integration tests only
+cargo test --test expectation_tests  # Run spec tests
 ```
 
-The `test-fixtures/` directory contains compilable Rust crates that exercise the full analysis pipeline including rust-analyzer semantic analysis.
+Specs use `//~` comments to define expected ownership states inline:
+
+```rust
+// test-fixtures/specs/src/borrow_shared.rs
+fn downgrades_owner_to_shared() {
+    let x = String::new();      //~ x: owned
+    let y = &x;                 //~ y: ref_shared, x: shared
+}
+```
+
+See [test-fixtures/specs/README.md](test-fixtures/specs/README.md) for how to create, find, and update tests.
 
 ## Runs alongside rust-analyzer
 

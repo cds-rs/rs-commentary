@@ -112,6 +112,7 @@ pub mod analysis;
 pub mod execution;
 pub mod lsp;
 pub mod output;
+pub mod testing;
 pub mod util;
 
 pub use analysis::{Annotation, BindingState, Capabilities};

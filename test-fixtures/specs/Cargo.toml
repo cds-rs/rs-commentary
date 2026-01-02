@@ -1,4 +1,4 @@
 [package]
-name = "drop_test"
+name = "specs"
 version = "0.1.0"
 edition = "2021"
