@@ -129,17 +129,6 @@ pub fn verify_file(path: &Path) -> Result<FileTestResult, VerificationError> {
 /// 3. Compares actual ownership state against `//~` expectations
 /// 4. Returns detailed results for each function
 pub fn verify_source(path: &Path, source: &str) -> Result<FileTestResult, VerificationError> {
-    // Discover test functions
-    let test_cases = discover_test_functions(source);
-
-    if test_cases.is_empty() {
-        // No test functions with expectations - return empty result
-        return Ok(FileTestResult {
-            path: path.to_path_buf(),
-            functions: vec![],
-        });
-    }
-
     // Load semantic analyzer
     let analyzer = match SemanticAnalyzer::load(path) {
         SemanticResult::Available(a) => a,
@@ -154,6 +143,29 @@ pub fn verify_source(path: &Path, source: &str) -> Result<FileTestResult, Verifi
             ))
         }
     };
+
+    verify_source_with_analyzer(path, source, &analyzer)
+}
+
+/// Verify expectations in source code using a pre-loaded analyzer.
+///
+/// Use this when verifying multiple files in the same workspace to avoid
+/// reloading rust-analyzer for each file.
+pub fn verify_source_with_analyzer(
+    path: &Path,
+    source: &str,
+    analyzer: &SemanticAnalyzer,
+) -> Result<FileTestResult, VerificationError> {
+    // Discover test functions
+    let test_cases = discover_test_functions(source);
+
+    if test_cases.is_empty() {
+        // No test functions with expectations - return empty result
+        return Ok(FileTestResult {
+            path: path.to_path_buf(),
+            functions: vec![],
+        });
+    }
 
     let file_id = analyzer.file_id(path).ok_or_else(|| {
         VerificationError::SemanticLoadFailed("Failed to get file ID".to_string())
@@ -204,6 +216,46 @@ pub fn verify_source(path: &Path, source: &str) -> Result<FileTestResult, Verifi
     } else {
         Err(VerificationError::TestFailures(result))
     }
+}
+
+/// Verify multiple files in a workspace, loading the analyzer once.
+///
+/// This is more efficient than calling `verify_file` repeatedly.
+pub fn verify_workspace(
+    files: &[std::path::PathBuf],
+) -> Result<Vec<FileTestResult>, VerificationError> {
+    if files.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Load analyzer once using the first file
+    let analyzer = match SemanticAnalyzer::load(&files[0]) {
+        SemanticResult::Available(a) => a,
+        SemanticResult::NotCargoProject => {
+            return Err(VerificationError::SemanticLoadFailed(
+                "Not a cargo project".to_string(),
+            ))
+        }
+        SemanticResult::LoadFailed => {
+            return Err(VerificationError::SemanticLoadFailed(
+                "Load failed".to_string(),
+            ))
+        }
+    };
+
+    let mut results = Vec::new();
+    for path in files {
+        let source = std::fs::read_to_string(path)
+            .map_err(|e| VerificationError::AnalysisFailed(format!("Failed to read file: {}", e)))?;
+
+        match verify_source_with_analyzer(path, &source, &analyzer) {
+            Ok(result) => results.push(result),
+            Err(VerificationError::TestFailures(result)) => results.push(result),
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(results)
 }
 
 /// Verify expectations for a single function.

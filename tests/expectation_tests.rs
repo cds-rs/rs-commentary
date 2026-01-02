@@ -18,8 +18,16 @@
 //!     let y = &x;             //~ y: ref_shared, x: shared
 //! }
 //! ```
+//!
+//! # Performance Note
+//!
+//! Tests are slow (~25s) because rust-analyzer loads the full workspace.
+//! Future optimization: compile rs-commentary once, then shell out to the
+//! binary for each file. Parse JSON/diagnostic output instead of using
+//! in-process analysis. This would allow parallel subprocess execution
+//! without rust-analyzer contention.
 
-use rs_commentary::testing::{format_results, verify_file, VerificationError};
+use rs_commentary::testing::{format_results, verify_workspace};
 use std::path::PathBuf;
 
 fn fixtures_dir() -> PathBuf {
@@ -61,31 +69,25 @@ fn run_expectation_tests() {
         return;
     }
 
+    // Load analyzer once for all files
+    let results = match verify_workspace(&files) {
+        Ok(r) => r,
+        Err(e) => {
+            panic!("Failed to load workspace: {}", e);
+        }
+    };
+
     let mut total_pass = 0;
     let mut total_fail = 0;
     let mut all_output = String::new();
 
-    for path in &files {
-        match verify_file(path) {
-            Ok(result) => {
-                if result.functions.is_empty() {
-                    // No expectations in this file, skip
-                    continue;
-                }
-                total_pass += result.pass_count();
-                total_fail += result.fail_count();
-                all_output.push_str(&format_results(&result));
-            }
-            Err(VerificationError::TestFailures(result)) => {
-                total_pass += result.pass_count();
-                total_fail += result.fail_count();
-                all_output.push_str(&format_results(&result));
-            }
-            Err(e) => {
-                all_output.push_str(&format!("{}: {}\n", path.display(), e));
-                total_fail += 1;
-            }
+    for result in &results {
+        if result.functions.is_empty() {
+            continue;
         }
+        total_pass += result.pass_count();
+        total_fail += result.fail_count();
+        all_output.push_str(&format_results(result));
     }
 
     println!("\n{}", all_output);
@@ -96,44 +98,3 @@ fn run_expectation_tests() {
     }
 }
 
-/// Test shared borrow specs.
-#[test]
-fn test_borrow_shared_specs() {
-    let path = specs_dir().join("borrow_shared.rs");
-    run_spec_file(&path, "borrow_shared");
-}
-
-/// Test mutable borrow specs.
-#[test]
-fn test_borrow_mut_specs() {
-    let path = specs_dir().join("borrow_mut.rs");
-    run_spec_file(&path, "borrow_mut");
-}
-
-/// Test move semantics specs.
-#[test]
-fn test_move_semantics_specs() {
-    let path = specs_dir().join("move_semantics.rs");
-    run_spec_file(&path, "move_semantics");
-}
-
-fn run_spec_file(path: &PathBuf, name: &str) {
-    if !path.exists() {
-        println!("{}.rs not found, skipping", name);
-        return;
-    }
-
-    match verify_file(path) {
-        Ok(result) => {
-            println!("{}", format_results(&result));
-            assert!(result.passed(), "All {} tests should pass", name);
-        }
-        Err(VerificationError::TestFailures(result)) => {
-            println!("{}", format_results(&result));
-            panic!("{} tests failed", name);
-        }
-        Err(e) => {
-            panic!("Error running {} tests: {}", name, e);
-        }
-    }
-}
