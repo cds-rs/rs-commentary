@@ -38,7 +38,7 @@ pub struct BindingId(pub u32);
 pub enum BindingKind {
     /// Owned value that implements Copy (i32, bool, [u32; 5], etc.)
     OwnedCopy,
-    /// Owned value with move semantics (String, Vec<T>, Box<T>, etc.)
+    /// Owned value with move semantics (String, `Vec<T>`, `Box<T>`, etc.)
     OwnedMove,
     /// Shared reference (&T) - borrows the referent
     SharedRef,
@@ -80,6 +80,16 @@ impl BindingKind {
 /// Events that trigger ownership state transitions.
 ///
 /// These represent the semantic actions in Rust code that affect ownership.
+/// Each event is passed to [`BindingState::transition`] to compute the new state.
+///
+/// # Examples
+///
+/// ```text
+/// let x = String::new();     // x: Owned
+/// let r = &x;                // SharedBorrow { by: r } → x becomes Shared
+/// drop(r);                   // BorrowEnd { borrow_id: r } → x restored to Owned
+/// let y = x;                 // Move { to: y } → x becomes Moved
+/// ```
 #[derive(Debug, Clone)]
 pub enum OwnershipEvent {
     /// A shared borrow (&T) is taken from this binding
@@ -200,7 +210,47 @@ impl std::fmt::Display for Capabilities {
     }
 }
 
-/// Current state of a binding.
+/// Current state of a binding in the ownership state machine.
+///
+/// All state transitions go through [`BindingState::transition`], which validates
+/// that transitions are legal and returns the new state.
+///
+/// # State Diagram
+///
+/// ```text
+///                     ┌──────────┐
+///      let x = ...    │  Owned   │
+///     ─────────────►  │  (ORW)   │
+///                     └────┬─────┘
+///                          │
+///          ┌───────────────┼───────────────┐
+///          │               │               │
+///          ▼               ▼               ▼
+///     ┌─────────┐    ┌──────────┐    ┌──────────┐
+///     │   &x    │    │  &mut x  │    │  move x  │
+///     │ Shared  │    │  Frozen  │    │  Moved   │
+///     │  (OR)   │    │   (O)    │    │   (∅)    │
+///     └────┬────┘    └────┬─────┘    └──────────┘
+///          │              │
+///          ▼              ▼
+///     ┌─────────┐    ┌──────────┐
+///     │ borrow  │    │ borrow   │
+///     │  ends   │    │  ends    │
+///     │ → Owned │    │ → Owned  │
+///     └─────────┘    └──────────┘
+/// ```
+///
+/// # Capability Summary
+///
+/// | State | Notation | Capabilities |
+/// |-------|----------|--------------|
+/// | `Owned { mutable: true }` | `●●●` | O R W |
+/// | `Owned { mutable: false }` | `●●○` | O R |
+/// | `Shared` | `●●○` | O R (temporarily loses W) |
+/// | `Frozen` | `●○○` | O only (can't access) |
+/// | `SharedBorrow` | `○●○` | R |
+/// | `MutBorrow` | `○●●` | R W |
+/// | `Moved` / `Dropped` | `†` | ∅ |
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BindingState {
     /// Binding owns the value (O R W or O R depending on mutability)

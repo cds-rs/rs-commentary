@@ -4,7 +4,7 @@ A Rust ownership state visualizer. Shows O/R/W (Ownership/Read/Write) capabiliti
 
 ## Status
 
-Experimental. This project is for educational purposes and learning Rust's ownership model.
+Experimental. This project is for educational purposes and learning Rust's ownership model. It is probably wrong, in fact, assume it is!
 
 ## What it does
 

@@ -1,14 +1,39 @@
 //! Output formatting for ownership annotations.
 //!
-//! ## Module Structure
+//! This module provides a pluggable renderer framework for displaying
+//! ownership state annotations in various formats.
 //!
-//! - `types` - Core enums and config
-//! - `context` - RenderContext for renderers
-//! - `traits` - ValidRustRenderer, RichTextRenderer
+//! # Available Styles
+//!
+//! | Style | Description |
+//! |-------|-------------|
+//! | `diagnostic` | Rustc-style with line numbers, underlines (default) |
+//! | `inline` | Comments at end of each line |
+//! | `html` | Interactive HTML with hover tooltips |
+//! | `columnar` | Fixed columns per variable |
+//! | `grouped` | Horizontal rules between state changes |
+//!
+//! # Renderer Traits
+//!
+//! Two traits define the renderer interface:
+//!
+//! - [`ValidRustRenderer`] - Produces valid Rust (comments only)
+//! - [`RichTextRenderer`] - Produces formatted output (may not be valid Rust)
+//!
+//! # Adding a New Renderer
+//!
+//! 1. Implement [`ValidRustRenderer`] or [`RichTextRenderer`]
+//! 2. Add variant to [`RenderStyle`] enum in `types.rs`
+//! 3. Add case in `render_source_semantic()` match
+//!
+//! # Module Structure
+//!
+//! - `types` - Core enums ([`RenderStyle`], [`RenderConfig`])
+//! - `context` - [`RenderContext`] aggregates data for renderers
+//! - `traits` - Renderer trait definitions
 //! - `helpers` - Shared formatting functions
-//! - `renderers/` - All renderer implementations
-//! - `lsp/` - LSP-specific formatters (hover, inlay hints)
-//! - `render` - Top-level render functions
+//! - [`renderers`] - All renderer implementations
+//! - [`lsp`] - LSP-specific formatters (hover, inlay hints)
 
 mod context;
 mod helpers;

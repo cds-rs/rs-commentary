@@ -1,344 +1,44 @@
 # rs-commentary Design
 
-## Vision
+> For API documentation, run `cargo doc --open`. This file covers design
+> decisions, rationale, and future directions not suitable for rustdoc.
 
-rs-commentary makes Rust's ownership system visible. It annotates source code with ownership, borrowing, and move state at each binding, helping developers understand what the borrow checker sees.
+## Design Principles
 
-## Core Concept: Capabilities
+1. **Cargo projects only**: Require rust-analyzer for accurate type analysis
+2. **Show state, not rules**: Concrete examples over abstract explanations
+3. **Annotate changes**: Mark where state transitions happen
+4. **Local reasoning**: One function at a time, no cross-function tracking
 
-Every binding has three capabilities:
+## Non-Goals
 
-| Capability | Meaning |
-|------------|---------|
-| **O** (Ownership) | Can transfer ownership (move or drop) |
-| **R** (Read) | Can read the value |
-| **W** (Write) | Can mutate the value |
+- Standalone file analysis (must be in cargo project)
+- Cross-function analysis
+- Lifetime bound visualization
+- Replacing rust-analyzer
 
-### State Table
-
-| State | Notation | Capabilities | Example |
-|-------|----------|--------------|---------|
-| Owned (mut) | `●●●` | O R W | `let mut x = val;` |
-| Owned (immut) | `●●○` | O R | `let x = val;` |
-| Shared (borrowed) | `●●○` | O R | `x` while `&x` exists |
-| Frozen | `●○○` | O | `x` while `&mut x` exists |
-| Shared borrow | `○●○` | R | `r` in `let r = &x;` |
-| Mutable borrow | `○●●` | R W | `r` in `let r = &mut x;` |
-| Moved/Dropped | `†` | ∅ | after move or scope end |
-
-### Aliasing XOR Mutability
-
-When borrowed, the original binding's capabilities are temporarily reduced:
-
-- **Shared (`&x`)**: Original becomes read-only (O R) - can't mutate while alias exists
-- **Frozen (`&mut x`)**: Original loses all access (O only) - exclusive access transferred
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      rs-commentary                          │
-├─────────────────────────────────────────────────────────────┤
-│  CLI                                                        │
-│    rs-commentary annotate file.rs --style=diagnostic        │
-├─────────────────────────────────────────────────────────────┤
-│  LSP Server                                                 │
-│    textDocument/inlayHint, textDocument/hover               │
-├─────────────────────────────────────────────────────────────┤
-│  Output Layer (src/output/)                                 │
-│    Renderer trait + multiple styles                         │
-│    RenderContext builds from analysis                       │
-├─────────────────────────────────────────────────────────────┤
-│  Utilities (src/util/)                                      │
-│    AstIter - lazy iterator over AST events                  │
-│    StateTimeline - time-traveling state machine             │
-│    Position utilities - offset/line conversion              │
-├─────────────────────────────────────────────────────────────┤
-│  Analysis Engine (src/analysis/)                            │
-│    engine.rs - OwnershipAnalyzer, AST visitor               │
-│    semantic.rs - rust-analyzer integration                  │
-│      └─ Type::is_copy() for Copy detection                  │
-│      └─ find_all_refs() for NLL drop detection              │
-│    state.rs - BindingState machine, SetAnnotation           │
-├─────────────────────────────────────────────────────────────┤
-│  ra_ap_syntax / ra_ap_ide / ra_ap_hir                       │
-│    Rust parser, IDE features, and HIR from rust-analyzer    │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Analysis Module Structure
+## Analysis Module Structure
 
 | File | Purpose |
 |------|---------|
 | `engine/mod.rs` | AST-based ownership analyzer, tracks state transitions |
 | `engine/macros.rs` | Format macro parsing (println!, format!, dbg!, etc.) |
 | `semantic.rs` | rust-analyzer integration for accurate type info |
-| `state.rs` | Core state machine types (`BindingState`, `OwnershipEvent`) |
-| `mod.rs` | `TypeOracle` trait for on-demand type queries |
+| `state.rs` | Core state machine types (BindingState, OwnershipEvent) |
+| `mod.rs` | TypeOracle trait for on-demand type queries |
 
-The engine uses `TypeOracle` to query Copy status at each AST node during
-traversal. `SemanticTypeOracle` implements this via rust-analyzer's
+## TypeOracle
+
+The engine queries Copy status at each AST node during traversal via the
+`TypeOracle` trait. `SemanticTypeOracle` implements this using rust-analyzer's
 `find_node_at_offset_with_descend` and `type_of_binding_in_pat`.
 
-The semantic module uses `SemanticContext` to bundle common parameters
-(sema, file_id, source, loop_ranges).
+This fixes cases where AST analysis alone fails:
+- For-loop variables: `for x in iter` where `x` might be `&mut T`
+- Generic parameters resolved through trait bounds
+- Type aliases and newtype patterns
 
-## AstIter (src/util/ast_visitor.rs)
-
-Stack-based lazy iterator that yields AST events during traversal:
-
-```rust
-pub enum AstEvent {
-    // Scope boundaries (paired enter/exit)
-    EnterFn(ast::Fn), ExitFn,
-    EnterBlock(ast::BlockExpr), ExitBlock,
-    EnterFor(ast::ForExpr), ExitFor,
-    EnterMatchArm(ast::MatchArm), ExitMatchArm,
-    EnterClosure(ast::ClosureExpr), ExitClosure,
-
-    // Nodes
-    Item(ast::Item), Impl(ast::Impl), Stmt(ast::Stmt),
-    Expr(ast::Expr), Pat { pat: ast::Pat, is_mut: bool },
-
-    // Special contexts
-    CallArg(ast::Expr),
-    MethodReceiver { receiver: ast::Expr, method_call: ast::MethodCallExpr },
-    Macro(ast::MacroExpr),
-}
-
-// Usage: consumers fold over events with their own state machine
-for event in AstIter::new(&source_file) {
-    ownership.process(&event);
-    call_detector.process(&event);
-}
-```
-
-Entry points:
-- `AstIter::new(&SourceFile)` - traverse entire file
-- `AstIter::from_fn(&ast::Fn)` - traverse single function
-- `AstIter::from_expr(&ast::Expr)` - traverse expression tree
-
-Benefits:
-- Single traversal implementation shared across modules
-- Composable: multiple consumers can process same event stream
-- Lazy: only traverses as far as needed
-- Extensible: add new event types without changing consumers
-
-## State Machine
-
-All state changes go through `BindingState::transition(event)`:
-
-```rust
-pub enum OwnershipEvent {
-    SharedBorrow { by: BindingId },
-    MutBorrow { by: BindingId },
-    BorrowEnd { borrow_id: BindingId },
-    Move { to: Option<BindingId> },
-    Copy,
-    ScopeExit,
-}
-```
-
-```
-                    ┌──────────┐
-     let x = ...    │  Owned   │
-    ─────────────►  │  (ORW)   │
-                    └────┬─────┘
-                         │
-         ┌───────────────┼───────────────┐
-         │               │               │
-         ▼               ▼               ▼
-    ┌─────────┐    ┌──────────┐    ┌──────────┐
-    │   &x    │    │  &mut x  │    │  move x  │
-    │ x → shr │    │ x → frz  │    │  x → ∅   │
-    └────┬────┘    └────┬─────┘    └──────────┘
-         │              │
-         ▼              ▼
-    ┌─────────┐    ┌──────────┐
-    │ borrow  │    │ borrow   │
-    │  ends   │    │  ends    │
-    │ x → ORW │    │ x → ORW  │
-    └─────────┘    └──────────┘
-```
-
-## StateTimeline (src/util/state.rs)
-
-Time-traveling state machine for rendering. Records state at each line:
-
-```rust
-let mut timeline = StateTimeline::new();
-
-// Record state as you process lines
-timeline.record(line_num, &entries, line_text);
-
-// Query any point in history
-let state_at_line_5 = timeline.get(5);
-
-// Get what changed on a line
-let changes = timeline.get_changes(line_num);
-
-// Detect NLL drops
-let drops = timeline.get_pending_drops(line_num);
-
-// Rewind for re-processing
-timeline.rewind_to(3);
-
-// Set semantic drop data from rust-analyzer
-timeline.set_semantic_last_uses(last_uses_map);
-```
-
-Key features:
-- Automatic scope reset at function boundaries
-- Drop detection (variables in prev but not current)
-- Change detection (new vars, state transitions)
-- Scope-aware queries (don't compare across functions)
-- Semantic drop override when rust-analyzer data available
-
-## Renderer Framework (src/output/renderer.rs)
-
-Pluggable output styles via trait:
-
-```rust
-pub trait Renderer {
-    fn render(&self, ctx: &RenderContext) -> String;
-}
-```
-
-### Available Styles
-
-| Style | Description |
-|-------|-------------|
-| `diagnostic` | Rustc-style with line numbers, underlines (default) |
-| `inline` | Comments at end of each line |
-| `columnar` | Fixed columns per variable |
-| `grouped` | Horizontal rules between changes |
-
-### Example: diagnostic (default)
-
-```
-   ╭─
- 1 │ fn main() {
- 2 │     let mut x = String::from("hello");
-   │             ─
-   │             └─ x: ●●● owned mut
-   │
- 3 │     let r = &x;
-   │         ─    ──
-   │         |    └─ x: ●●○ shared (borrowed) (was owned)
-   │         |
-   │         └─ r: ○●○ &x
-   │         └─ note: `r` dropped (last use)
-   │
- 4 │     println!("{}", r);
- 5 │     x.push_str(" world");
-   │     ─
-   │     └─ x: ●●● owned mut (was shared)
-   │
- 6 │ }
-   ╰─
-```
-
-Drop annotations are integrated with variable annotations, showing right-to-left
-with vertical connectors between variables. A blank line separates annotation
-blocks from the next source line.
-
-### Adding a Renderer
-
-1. Implement `Renderer` trait
-2. Add variant to `RenderStyle` enum
-3. Add case in `render_source()` match
-
-## CLI
-
-```bash
-rs-commentary annotate file.rs                    # diagnostic (default)
-rs-commentary annotate file.rs --style=inline
-rs-commentary annotate file.rs --style=columnar
-rs-commentary annotate file.rs --style=grouped
-rs-commentary annotate file.rs --all              # include Copy types
-```
-
-## Copy Type Detection
-
-rs-commentary uses rust-analyzer's HIR (High-level Intermediate Representation)
-for accurate Copy trait detection. This requires:
-
-1. **Cargo project**: The file must be part of a cargo workspace
-2. **Sysroot loading**: Standard library is auto-discovered for trait resolution
-
-### TypeOracle
-
-The `TypeOracle` trait provides on-demand type queries during AST traversal:
-
-```rust
-pub trait TypeOracle {
-    fn is_copy(&self, pat: &ast::IdentPat) -> Option<bool>;
-    fn is_scalar(&self, pat: &ast::IdentPat) -> Option<bool>;
-}
-```
-
-`SemanticTypeOracle` implements this using `find_node_at_offset_with_descend`
-to locate the semantic node corresponding to each AST pattern, then queries
-`type_of_binding_in_pat()` for the actual type.
-
-This fixes cases where AST analysis alone gets it wrong (e.g., for-loop
-variables like `for x in iter` where `x` might be `&mut T` but looks owned).
-
-By default, Copy types are filtered from output. Use `--all` to show them:
-
-```bash
-rs-commentary annotate file.rs         # Non-Copy types only (default)
-rs-commentary annotate file.rs --all   # Include Copy types
-```
-
-**Macro handling**:
-- `println!`, `format!`, `dbg!` etc. implicitly borrow
-- Both `println!("{}", x)` and `println!("{x}")` detected
-
-## Call-Site Transfer Annotations
-
-Function calls show what happens to each argument:
-
-```
-find_min(book_counts, &mut cache);
-         ───────────       ─────
-         |                 └─ cache: mut borrowed → find_min
-         └─ book_counts: copied → find_min
-```
-
-Transfer kinds:
-- `copied → fn`: Copy type passed by value
-- `moved → fn`: Non-Copy type passed by value
-- `borrowed → fn`: Shared borrow passed (`&x`)
-- `mut borrowed → fn`: Mutable borrow passed (`&mut x`)
-
-The analyzer creates `CopyEvent` records during `process_call_arg()`, which
-renderers consume to show transfer annotations alongside state changes.
-
-## NLL Support
-
-Borrows end at last use, not scope end:
-
-```rust
-let r = &x;           // r created, x shared
-println!("{}", r);    // last use of r
-                      // └─ note: `r` dropped (last use)
-x.push_str("!");      // x restored to ●●●
-```
-
-### Semantic Drop Detection (src/analysis/semantic.rs)
-
-When analyzing files in a cargo project, rs-commentary uses rust-analyzer's
-`find_all_refs` API to find the actual last use of each binding:
-
-```rust
-// SemanticAnalyzer finds accurate last-use locations
-let last_uses = analyzer.find_all_last_uses(file_id, source);
-```
-
-This provides accurate NLL drop points instead of heuristic detection.
-
-### Loop-Aware Drops
+## Loop-Aware Drops
 
 Variables declared outside a loop but last used inside should drop after the
 loop ends, not at their last textual use:
@@ -351,22 +51,19 @@ while n > 0 {
 }                                     // digit_count drops HERE, not inside loop
 ```
 
-The `compute_drop_line()` function detects when a variable's last use is
-inside a loop it wasn't declared in, and moves the drop to after the loop.
+The `compute_drop_line()` function in semantic.rs detects when a variable's
+last use is inside a loop it wasn't declared in, and adjusts the drop line
+to after the loop.
 
-## Design Principles
+## Macro Handling
 
-1. **Cargo projects only** - Require rust-analyzer for accurate analysis
-2. **Show state, not rules** - Concrete examples over abstract explanations
-3. **Annotate changes** - Mark where state transitions happen
-4. **Local reasoning** - One function at a time, no cross-function analysis
+Format macros implicitly borrow their arguments:
+- `println!("{}", x)` borrows x
+- `println!("{x}")` inline format also borrows x
+- `dbg!(x)` borrows x (unless x is Copy, then it copies)
 
-## Non-Goals
-
-- Standalone file analysis (must be in cargo project)
-- Cross-function analysis
-- Lifetime bound visualization
-- Replacing rust-analyzer
+The `engine/macros.rs` module parses format strings to detect which variables
+are referenced, generating synthetic borrow events.
 
 ## Future Directions
 

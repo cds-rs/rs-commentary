@@ -25,7 +25,7 @@ pub struct LineState {
 pub enum InvalidationReason {
     /// Value was moved to another binding (value lives on, source is invalid).
     Moved { to: Option<String> },
-    /// Borrow ended at last use (NLL). The borrowed value is freed.
+    /// Borrow ended at last use (Non-Lexical Lifetimes). The borrowed value is freed.
     BorrowEnd,
     /// Value dropped at scope exit (actual deallocation).
     ScopeExit,
@@ -45,11 +45,43 @@ pub struct VariableDrop {
     pub reason: InvalidationReason,
 }
 
-/// A time-traveling state machine for ownership tracking.
+/// Time-traveling state machine for ownership tracking.
 ///
 /// Records state at each line and allows querying any point in history.
-/// Supports function-scoped variable tracking - each function maintains
-/// its own set of live variables, isolated from other functions.
+/// Each function maintains its own set of live variables, isolated from
+/// other functions in the file.
+///
+/// # Usage
+///
+/// ```ignore
+/// let mut timeline = StateTimeline::new();
+///
+/// // Record state as you process lines
+/// timeline.record(line_num, &entries, line_text);
+///
+/// // Query any point in history
+/// let state = timeline.get(5);
+///
+/// // Get what changed on a line
+/// let changes = timeline.get_changes(line_num);
+///
+/// // Detect drops (borrows end at last use per Non-Lexical Lifetimes)
+/// let drops = timeline.get_pending_drops(line_num);
+///
+/// // Rewind for re-processing
+/// timeline.rewind_to(3);
+///
+/// // Override with rust-analyzer data for accurate drop detection
+/// timeline.set_semantic_last_uses(last_uses_map);
+/// ```
+///
+/// # Key Features
+///
+/// - **Scope isolation**: Variables reset at function boundaries
+/// - **Drop detection**: Identifies variables that went out of scope
+/// - **Change detection**: Tracks new bindings and state transitions
+/// - **Semantic overrides**: Uses rust-analyzer last-use data when available
+/// - **Rewind support**: Can reset to earlier state for re-processing
 #[derive(Debug, Default)]
 pub struct StateTimeline {
     /// State snapshot at each line number.

@@ -1,9 +1,35 @@
-//! Semantic analysis using rust-analyzer's ra_ap_ide and ra_ap_hir.
+//! Semantic analysis using rust-analyzer.
 //!
-//! When a file is part of a cargo project, this provides:
-//! - Accurate type inference
-//! - Macro expansion
-//! - Copy/Drop trait detection via `Type::is_copy()`
+//! This module integrates with rust-analyzer's HIR (High-level Intermediate
+//! Representation) to provide accurate type information that's impossible
+//! to determine from syntax alone.
+//!
+//! # Capabilities
+//!
+//! - **Copy trait detection**: Uses `Type::is_copy()` for accurate Copy detection
+//! - **Drop point detection**: Uses `find_all_refs()` to find last-use locations
+//! - **Type inference**: Resolves types through generics, traits, and macros
+//! - **Scalar detection**: Identifies primitive types for noise filtering
+//!
+//! # Requirements
+//!
+//! - File must be part of a **Cargo project** (has `Cargo.toml` ancestor)
+//! - Sysroot is auto-discovered for standard library trait resolution
+//!
+//! # Non-Lexical Lifetimes (NLL)
+//!
+//! In modern Rust, borrows end at their last use, not at scope end. This is
+//! called Non-Lexical Lifetimes (NLL). This module detects accurate drop points:
+//!
+//! ```text
+//! let r = &x;           // r created, x shared
+//! println!("{}", r);    // last use of r
+//!                       // └─ r dropped here
+//! x.push_str("!");      // x restored to ●●●
+//! ```
+//!
+//! The [`SemanticAnalyzer::find_all_last_uses`] method uses rust-analyzer's
+//! reference finding to determine these drop points.
 
 use crate::analysis::state::{Annotation, BindingKind, BindingState};
 use anyhow::{Context, Result};
@@ -94,6 +120,35 @@ struct SemanticContext<'a, 'db> {
 }
 
 /// Semantic analyzer backed by rust-analyzer.
+///
+/// Provides accurate type information by loading the full Cargo workspace
+/// and querying rust-analyzer's semantic model.
+///
+/// # Loading
+///
+/// Use [`SemanticAnalyzer::load`] to attempt loading. Returns [`SemanticResult`]
+/// to handle non-Cargo projects gracefully:
+///
+/// ```ignore
+/// match SemanticAnalyzer::load(file_path) {
+///     SemanticResult::Available(analyzer) => {
+///         // Full semantic analysis available
+///         let last_uses = analyzer.find_all_last_uses(file_id, source)?;
+///     }
+///     SemanticResult::NotCargoProject => {
+///         // Fall back to syntax-only analysis
+///     }
+///     SemanticResult::LoadFailed => {
+///         // Error already logged
+///     }
+/// }
+/// ```
+///
+/// # Key Methods
+///
+/// - `find_all_last_uses` - NLL drop detection
+/// - `get_diagnostics` - Compiler errors/warnings
+/// - `get_hover` - Type information at a position
 pub struct SemanticAnalyzer {
     host: AnalysisHost,
     vfs: Vfs,

@@ -1,4 +1,4 @@
-//! Iterator-based AST traversal.
+//! Iterator-based Abstract Syntax Tree (AST) traversal.
 //!
 //! Provides a lazy iterator over AST events, allowing consumers to fold/scan
 //! with their own state machines. This eliminates duplicate traversal code
@@ -28,30 +28,59 @@ use ra_ap_syntax::AstNode;
 
 /// Events yielded during AST traversal.
 ///
-/// AST nodes are thin wrappers around Arc-based SyntaxNode, so cloning is cheap.
+/// Events fall into three categories:
+///
+/// - **Scope boundaries**: Paired enter/exit events for constructs that create scopes
+///   (functions, blocks, for loops, match arms, closures)
+/// - **Nodes**: Individual AST nodes (items, statements, expressions, patterns)
+/// - **Special contexts**: Events that provide additional semantic context
+///   (call arguments, method receivers, macros)
+///
+/// AST nodes are thin wrappers around `Arc`-based `SyntaxNode`, so cloning is cheap.
 #[derive(Debug, Clone)]
 pub enum AstEvent {
-    // === Scope boundaries ===
+    // === Scope boundaries (paired enter/exit) ===
+    /// Entering a function body. Parameters are yielded as `Pat` events after this.
     EnterFn(ast::Fn),
+    /// Exiting a function body.
     ExitFn,
+    /// Entering a block expression `{ ... }`.
     EnterBlock(ast::BlockExpr),
+    /// Exiting a block expression.
     ExitBlock,
+    /// Entering a for loop. The loop variable is yielded as a `Pat` event after this.
     EnterFor(ast::ForExpr),
+    /// Exiting a for loop.
     ExitFor,
+    /// Entering a match arm. The pattern is yielded as a `Pat` event after this.
     EnterMatchArm(ast::MatchArm),
+    /// Exiting a match arm.
     ExitMatchArm,
+    /// Entering a closure. Parameters are yielded as `Pat` events after this.
     EnterClosure(ast::ClosureExpr),
+    /// Exiting a closure.
     ExitClosure,
 
     // === Nodes ===
+    /// Top-level item (function, struct, impl, etc.).
     Item(ast::Item),
+    /// Impl block.
     Impl(ast::Impl),
+    /// Statement in a block.
     Stmt(ast::Stmt),
+    /// Expression.
     Expr(ast::Expr),
-    Pat { pat: ast::Pat, is_mut: bool },
+    /// Pattern (in let bindings, function params, match arms, etc.).
+    Pat {
+        pat: ast::Pat,
+        /// Whether the pattern has `mut` (e.g., `let mut x`).
+        is_mut: bool,
+    },
 
     // === Special contexts ===
-    /// Argument in a function/method call (for borrow detection)
+    /// Argument in a function/method call.
+    ///
+    /// Used for detecting borrows and moves at call sites.
     CallArg {
         arg: ast::Expr,
         /// The call target name (function or method name)
@@ -106,9 +135,38 @@ enum YieldEvent {
 
 /// Lazy iterator over AST events.
 ///
-/// Uses a stack-based approach for traversal, making it truly lazy.
-/// Events are yielded in pre-order (enter before children) with
-/// explicit exit events for scope boundaries.
+/// Uses a stack-based approach for traversal, yielding events in pre-order
+/// (enter before children) with explicit exit events for scope boundaries.
+///
+/// # Entry Points
+///
+/// - [`AstIter::new`] - Traverse an entire source file
+/// - [`AstIter::from_fn`] - Traverse a single function
+/// - [`AstIter::from_expr`] - Traverse an expression tree
+///
+/// # Benefits
+///
+/// - **Single implementation**: Traversal logic is defined once, shared by all consumers
+/// - **Composable**: Multiple consumers can process the same event stream
+/// - **Lazy**: Only traverses as far as needed (early exit possible)
+/// - **Extensible**: Add new event types without changing consumers
+///
+/// # Event Flow
+///
+/// ```text
+/// SourceFile
+///   └─ Item (function)
+///        └─ EnterFn
+///             └─ Pat (parameters)
+///             └─ EnterBlock
+///                  └─ Stmt
+///                       └─ Expr / Pat / CallArg / ...
+///             └─ ExitBlock
+///        └─ ExitFn
+/// ```
+///
+/// Scope boundaries (`EnterFn`/`ExitFn`, `EnterBlock`/`ExitBlock`, etc.) are
+/// always paired, allowing consumers to maintain scope stacks.
 pub struct AstIter {
     stack: Vec<WorkItem>,
 }
@@ -135,12 +193,175 @@ impl AstIter {
         }
     }
 
+    /// Push [`CallExpr`] children onto the stack.
+    ///
+    /// Processes arguments in reverse order (so they're visited left-to-right),
+    /// emitting [`CallArg`](YieldEvent::CallArg) events for each argument.
+    fn push_call_children(&mut self, call_expr: &ast::CallExpr) {
+        let call_target = call_expr
+            .expr()
+            .and_then(|e| {
+                if let ast::Expr::PathExpr(path) = e {
+                    path.path().map(|p| p.syntax().text().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "call".to_string());
+
+        if let Some(args) = call_expr.arg_list() {
+            let args_vec: Vec<_> = args.args().collect();
+            for arg in args_vec.into_iter().rev() {
+                self.stack.push(WorkItem::Expr(arg.clone()));
+                self.stack.push(WorkItem::Yield(YieldEvent::CallArg {
+                    arg,
+                    call_target: call_target.clone(),
+                }));
+            }
+        }
+        if let Some(callee) = call_expr.expr() {
+            self.stack.push(WorkItem::Expr(callee));
+        }
+    }
+
+    /// Push [`MethodCallExpr`] children onto the stack.
+    ///
+    /// Processes arguments in reverse order, then the receiver. Emits
+    /// [`MethodReceiver`](YieldEvent::MethodReceiver) for the receiver and
+    /// [`CallArg`](YieldEvent::CallArg) for each argument.
+    fn push_method_call_children(&mut self, method_call: &ast::MethodCallExpr) {
+        let call_target = method_call
+            .name_ref()
+            .map(|n| n.text().to_string())
+            .unwrap_or_else(|| "call".to_string());
+
+        if let Some(args) = method_call.arg_list() {
+            let args_vec: Vec<_> = args.args().collect();
+            for arg in args_vec.into_iter().rev() {
+                self.stack.push(WorkItem::Expr(arg.clone()));
+                self.stack.push(WorkItem::Yield(YieldEvent::CallArg {
+                    arg,
+                    call_target: call_target.clone(),
+                }));
+            }
+        }
+        if let Some(receiver) = method_call.receiver() {
+            self.stack.push(WorkItem::Expr(receiver.clone()));
+            self.stack
+                .push(WorkItem::Yield(YieldEvent::MethodReceiver {
+                    receiver,
+                    method_call: method_call.clone(),
+                }));
+        }
+    }
+
+    /// Push [`IfExpr`] children onto the stack.
+    ///
+    /// Handles `if`/`else if`/`else` chains by recursively pushing nested
+    /// `IfExpr` nodes. Children are pushed in reverse order (else, then, condition)
+    /// so they're visited in source order.
+    fn push_if_children(&mut self, if_expr: &ast::IfExpr) {
+        if let Some(else_branch) = if_expr.else_branch() {
+            match else_branch {
+                ast::ElseBranch::Block(block) => {
+                    self.stack.push(WorkItem::Block(block));
+                }
+                ast::ElseBranch::IfExpr(nested_if) => {
+                    self.stack
+                        .push(WorkItem::Expr(ast::Expr::IfExpr(nested_if)));
+                }
+            }
+        }
+        if let Some(then_branch) = if_expr.then_branch() {
+            self.stack.push(WorkItem::Block(then_branch));
+        }
+        if let Some(cond) = if_expr.condition() {
+            self.stack.push(WorkItem::Expr(cond));
+        }
+    }
+
+    /// Push [`ForExpr`] children onto the stack.
+    ///
+    /// For loops create their own scope for the loop variable. Emits
+    /// [`EnterFor`](YieldEvent::EnterFor) before the pattern and `ExitFor`
+    /// after the body. The iterable expression is visited outside the loop scope.
+    fn push_for_children(&mut self, for_expr: &ast::ForExpr) {
+        self.stack.push(WorkItem::ExitFor);
+        if let Some(body) = for_expr.loop_body() {
+            self.stack.push(WorkItem::Block(body));
+        }
+        if let Some(pat) = for_expr.pat() {
+            let is_mut = matches!(&pat, ast::Pat::IdentPat(id) if id.mut_token().is_some());
+            self.stack.push(WorkItem::Pat { pat, is_mut });
+        }
+        self.stack
+            .push(WorkItem::Yield(YieldEvent::EnterFor(for_expr.clone())));
+        if let Some(iterable) = for_expr.iterable() {
+            self.stack.push(WorkItem::Expr(iterable));
+        }
+    }
+
+    /// Push [`MatchExpr`] children onto the stack.
+    ///
+    /// Each match arm creates its own scope. Emits [`EnterMatchArm`](YieldEvent::EnterMatchArm)
+    /// before each arm's pattern and `ExitMatchArm` after its body. Arms are processed
+    /// in reverse order so they're visited top-to-bottom. Guard expressions are
+    /// visited between the pattern and body.
+    fn push_match_children(&mut self, match_expr: &ast::MatchExpr) {
+        if let Some(arm_list) = match_expr.match_arm_list() {
+            let arms: Vec<_> = arm_list.arms().collect();
+            for arm in arms.into_iter().rev() {
+                self.stack.push(WorkItem::ExitMatchArm);
+                if let Some(body) = arm.expr() {
+                    self.stack.push(WorkItem::Expr(body));
+                }
+                if let Some(guard) = arm.guard() {
+                    if let Some(cond) = guard.condition() {
+                        self.stack.push(WorkItem::Expr(cond));
+                    }
+                }
+                if let Some(pat) = arm.pat() {
+                    self.stack.push(WorkItem::Pat { pat, is_mut: false });
+                }
+                self.stack
+                    .push(WorkItem::Yield(YieldEvent::EnterMatchArm(arm)));
+            }
+        }
+        if let Some(scrutinee) = match_expr.expr() {
+            self.stack.push(WorkItem::Expr(scrutinee));
+        }
+    }
+
+    /// Push [`ClosureExpr`] children onto the stack.
+    ///
+    /// Closures create their own scope for parameters. Emits
+    /// [`EnterClosure`](YieldEvent::EnterClosure) before parameters and
+    /// `ExitClosure` after the body. Parameters are processed in reverse
+    /// order so they're visited left-to-right.
+    fn push_closure_children(&mut self, closure: &ast::ClosureExpr) {
+        self.stack.push(WorkItem::ExitClosure);
+        if let Some(body) = closure.body() {
+            self.stack.push(WorkItem::Expr(body));
+        }
+        if let Some(param_list) = closure.param_list() {
+            let params: Vec<_> = param_list.params().collect();
+            for param in params.into_iter().rev() {
+                if let Some(pat) = param.pat() {
+                    let is_mut =
+                        matches!(&pat, ast::Pat::IdentPat(id) if id.mut_token().is_some());
+                    self.stack.push(WorkItem::Pat { pat, is_mut });
+                }
+            }
+        }
+        self.stack
+            .push(WorkItem::Yield(YieldEvent::EnterClosure(closure.clone())));
+    }
+
     /// Push children of an expression onto the stack (in reverse order for correct traversal).
     fn push_expr_children(&mut self, expr: &ast::Expr) {
         match expr {
-            ast::Expr::PathExpr(_) | ast::Expr::Literal(_) | ast::Expr::UnderscoreExpr(_) => {
-                // Leaf nodes - no children
-            }
+            // Leaf nodes - no children
+            ast::Expr::PathExpr(_) | ast::Expr::Literal(_) | ast::Expr::UnderscoreExpr(_) => {}
 
             ast::Expr::RefExpr(ref_expr) => {
                 if let Some(inner) = ref_expr.expr() {
@@ -148,85 +369,16 @@ impl AstIter {
                 }
             }
 
-            ast::Expr::CallExpr(call_expr) => {
-                // Extract function name from callee
-                let call_target = call_expr
-                    .expr()
-                    .and_then(|e| {
-                        if let ast::Expr::PathExpr(path) = e {
-                            path.path().map(|p| p.syntax().text().to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_else(|| "call".to_string());
-
-                // Push in reverse: args (reversed), then callee
-                if let Some(args) = call_expr.arg_list() {
-                    let args_vec: Vec<_> = args.args().collect();
-                    for arg in args_vec.into_iter().rev() {
-                        self.stack.push(WorkItem::Expr(arg.clone()));
-                        self.stack.push(WorkItem::Yield(YieldEvent::CallArg {
-                            arg,
-                            call_target: call_target.clone(),
-                        }));
-                    }
-                }
-                if let Some(callee) = call_expr.expr() {
-                    self.stack.push(WorkItem::Expr(callee));
-                }
-            }
-
-            ast::Expr::MethodCallExpr(method_call) => {
-                // Extract method name
-                let call_target = method_call
-                    .name_ref()
-                    .map(|n| n.text().to_string())
-                    .unwrap_or_else(|| "call".to_string());
-
-                // Push in reverse: args, then receiver
-                if let Some(args) = method_call.arg_list() {
-                    let args_vec: Vec<_> = args.args().collect();
-                    for arg in args_vec.into_iter().rev() {
-                        self.stack.push(WorkItem::Expr(arg.clone()));
-                        self.stack.push(WorkItem::Yield(YieldEvent::CallArg {
-                            arg,
-                            call_target: call_target.clone(),
-                        }));
-                    }
-                }
-                if let Some(receiver) = method_call.receiver() {
-                    self.stack.push(WorkItem::Expr(receiver.clone()));
-                    self.stack
-                        .push(WorkItem::Yield(YieldEvent::MethodReceiver {
-                            receiver,
-                            method_call: method_call.clone(),
-                        }));
-                }
-            }
+            // Complex nodes - delegate to helpers
+            ast::Expr::CallExpr(e) => self.push_call_children(e),
+            ast::Expr::MethodCallExpr(e) => self.push_method_call_children(e),
+            ast::Expr::IfExpr(e) => self.push_if_children(e),
+            ast::Expr::ForExpr(e) => self.push_for_children(e),
+            ast::Expr::MatchExpr(e) => self.push_match_children(e),
+            ast::Expr::ClosureExpr(e) => self.push_closure_children(e),
 
             ast::Expr::BlockExpr(block) => {
                 self.stack.push(WorkItem::Block(block.clone()));
-            }
-
-            ast::Expr::IfExpr(if_expr) => {
-                // Push in reverse: else, then, condition
-                if let Some(else_branch) = if_expr.else_branch() {
-                    match else_branch {
-                        ast::ElseBranch::Block(block) => {
-                            self.stack.push(WorkItem::Block(block));
-                        }
-                        ast::ElseBranch::IfExpr(nested_if) => {
-                            self.stack.push(WorkItem::Expr(ast::Expr::IfExpr(nested_if)));
-                        }
-                    }
-                }
-                if let Some(then_branch) = if_expr.then_branch() {
-                    self.stack.push(WorkItem::Block(then_branch));
-                }
-                if let Some(cond) = if_expr.condition() {
-                    self.stack.push(WorkItem::Expr(cond));
-                }
             }
 
             ast::Expr::LoopExpr(loop_expr) => {
@@ -242,69 +394,6 @@ impl AstIter {
                 if let Some(cond) = while_expr.condition() {
                     self.stack.push(WorkItem::Expr(cond));
                 }
-            }
-
-            ast::Expr::ForExpr(for_expr) => {
-                // For loops have their own scope
-                self.stack.push(WorkItem::ExitFor);
-                if let Some(body) = for_expr.loop_body() {
-                    self.stack.push(WorkItem::Block(body));
-                }
-                if let Some(pat) = for_expr.pat() {
-                    let is_mut =
-                        matches!(&pat, ast::Pat::IdentPat(id) if id.mut_token().is_some());
-                    self.stack.push(WorkItem::Pat { pat, is_mut });
-                }
-                self.stack
-                    .push(WorkItem::Yield(YieldEvent::EnterFor(for_expr.clone())));
-                // Iterable is outside the for scope
-                if let Some(iterable) = for_expr.iterable() {
-                    self.stack.push(WorkItem::Expr(iterable));
-                }
-            }
-
-            ast::Expr::MatchExpr(match_expr) => {
-                if let Some(arm_list) = match_expr.match_arm_list() {
-                    let arms: Vec<_> = arm_list.arms().collect();
-                    for arm in arms.into_iter().rev() {
-                        self.stack.push(WorkItem::ExitMatchArm);
-                        if let Some(body) = arm.expr() {
-                            self.stack.push(WorkItem::Expr(body));
-                        }
-                        if let Some(guard) = arm.guard() {
-                            if let Some(cond) = guard.condition() {
-                                self.stack.push(WorkItem::Expr(cond));
-                            }
-                        }
-                        if let Some(pat) = arm.pat() {
-                            self.stack.push(WorkItem::Pat { pat, is_mut: false });
-                        }
-                        self.stack
-                            .push(WorkItem::Yield(YieldEvent::EnterMatchArm(arm)));
-                    }
-                }
-                if let Some(scrutinee) = match_expr.expr() {
-                    self.stack.push(WorkItem::Expr(scrutinee));
-                }
-            }
-
-            ast::Expr::ClosureExpr(closure) => {
-                self.stack.push(WorkItem::ExitClosure);
-                if let Some(body) = closure.body() {
-                    self.stack.push(WorkItem::Expr(body));
-                }
-                if let Some(param_list) = closure.param_list() {
-                    let params: Vec<_> = param_list.params().collect();
-                    for param in params.into_iter().rev() {
-                        if let Some(pat) = param.pat() {
-                            let is_mut =
-                                matches!(&pat, ast::Pat::IdentPat(id) if id.mut_token().is_some());
-                            self.stack.push(WorkItem::Pat { pat, is_mut });
-                        }
-                    }
-                }
-                self.stack
-                    .push(WorkItem::Yield(YieldEvent::EnterClosure(closure.clone())));
             }
 
             ast::Expr::ReturnExpr(return_expr) => {
@@ -821,5 +910,167 @@ fn foo() {
         assert!(enter_fn_pos < enter_block_pos);
         assert!(enter_block_pos < exit_block_pos);
         assert!(exit_block_pos < exit_fn_pos);
+    }
+
+    // Tests for complex expression types handled by push_expr_children
+
+    #[test]
+    fn test_call_expr_no_args() {
+        let source = r#"
+fn main() {
+    foo();
+}
+"#;
+        let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
+        let file = parse.tree();
+
+        let events: Vec<_> = AstIter::new(&file).collect();
+
+        // Should have an Expr event for the call, but no CallArg events
+        assert!(events.iter().any(|e| matches!(e, AstEvent::Expr(_))));
+        assert!(!events.iter().any(|e| matches!(e, AstEvent::CallArg { .. })));
+    }
+
+    #[test]
+    fn test_if_else_chain() {
+        let source = r#"
+fn main() {
+    if a {
+        1
+    } else if b {
+        2
+    } else {
+        3
+    }
+}
+"#;
+        let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
+        let file = parse.tree();
+
+        let events: Vec<_> = AstIter::new(&file).collect();
+
+        // Should have multiple EnterBlock/ExitBlock pairs for each branch
+        let enter_block_count = events
+            .iter()
+            .filter(|e| matches!(e, AstEvent::EnterBlock(_)))
+            .count();
+        let exit_block_count = events
+            .iter()
+            .filter(|e| matches!(e, AstEvent::ExitBlock))
+            .count();
+
+        // 1 fn body + 3 if/else blocks = 4 block pairs
+        assert_eq!(enter_block_count, 4);
+        assert_eq!(exit_block_count, 4);
+    }
+
+    #[test]
+    fn test_match_with_guards() {
+        let source = r#"
+fn main() {
+    match x {
+        Some(v) if v > 0 => v,
+        Some(v) => -v,
+        None => 0,
+    }
+}
+"#;
+        let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
+        let file = parse.tree();
+
+        let events: Vec<_> = AstIter::new(&file).collect();
+
+        // Should have 3 match arms
+        let enter_arm_count = events
+            .iter()
+            .filter(|e| matches!(e, AstEvent::EnterMatchArm(_)))
+            .count();
+        assert_eq!(enter_arm_count, 3);
+
+        // Should have Pat events for the patterns (Some(v) bindings)
+        let pat_count = events
+            .iter()
+            .filter(|e| matches!(e, AstEvent::Pat { .. }))
+            .count();
+        assert!(pat_count >= 3); // At least one per arm
+    }
+
+    #[test]
+    fn test_closure_with_move() {
+        let source = r#"
+fn main() {
+    let x = String::new();
+    let f = move || x.len();
+}
+"#;
+        let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
+        let file = parse.tree();
+
+        let events: Vec<_> = AstIter::new(&file).collect();
+
+        // Should have EnterClosure and ExitClosure
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AstEvent::EnterClosure(_))));
+        assert!(events.iter().any(|e| matches!(e, AstEvent::ExitClosure)));
+
+        // Should have MethodReceiver for x.len()
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AstEvent::MethodReceiver { .. })));
+    }
+
+    #[test]
+    fn test_nested_impl_fns() {
+        let source = r#"
+struct Foo;
+
+impl Foo {
+    fn outer(&self) {
+        fn inner() {
+            let x = 1;
+        }
+        inner();
+    }
+}
+"#;
+        let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
+        let file = parse.tree();
+
+        let events: Vec<_> = AstIter::new(&file).collect();
+
+        // Should have 2 EnterFn events (outer and inner)
+        let enter_fn_count = events
+            .iter()
+            .filter(|e| matches!(e, AstEvent::EnterFn(_)))
+            .count();
+        assert_eq!(enter_fn_count, 2);
+
+        // Should have 2 ExitFn events
+        let exit_fn_count = events
+            .iter()
+            .filter(|e| matches!(e, AstEvent::ExitFn))
+            .count();
+        assert_eq!(exit_fn_count, 2);
+    }
+
+    #[test]
+    fn test_stmt_with_nested_item() {
+        let source = r#"
+fn main() {
+    struct Local { x: i32 }
+    let s = Local { x: 1 };
+}
+"#;
+        let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
+        let file = parse.tree();
+
+        let events: Vec<_> = AstIter::new(&file).collect();
+
+        // Should have Item event for the nested struct
+        assert!(events.iter().any(|e| matches!(e, AstEvent::Item(_))));
+
+        // Should still have Pat event for the let binding
+        assert!(events.iter().any(|e| matches!(e, AstEvent::Pat { .. })));
     }
 }

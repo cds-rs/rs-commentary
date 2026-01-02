@@ -32,16 +32,26 @@ pub struct BindingInfo {
     pub current_state: BindingState,
 }
 
-/// Transfer kind at a call site.
+/// What happens to a value when passed to a function.
+///
+/// Used to generate call-site annotations showing the transfer semantics:
+///
+/// ```text
+/// process(data, &config, &mut cache);
+///         ────  ───────  ──────────
+///         │     │        └─ cache: mut borrowed → process
+///         │     └─ config: borrowed → process
+///         └─ data: moved → process
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferKind {
-    /// Ownership moves to callee.
+    /// Ownership moves to callee (non-Copy types passed by value).
     Move,
-    /// Shared borrow (&T).
+    /// Shared borrow (`&T`) - callee gets read access.
     SharedBorrow,
-    /// Mutable borrow (&mut T).
+    /// Mutable borrow (`&mut T`) - callee gets exclusive access.
     MutBorrow,
-    /// Copy (no ownership change).
+    /// Copy - value duplicated, original unchanged (Copy types).
     Copy,
 }
 
@@ -65,20 +75,32 @@ impl TransferKind {
     }
 }
 
-/// A call-site transfer event: tracks what happens to arguments at function calls.
-/// Copy types don't change state; moves and borrows do.
+/// Records what happens to an argument at a function call site.
+///
+/// Created during [`OwnershipAnalyzer`] traversal for each argument passed
+/// to a function or method. Renderers consume these to show transfer annotations.
+///
+/// # Example
+///
+/// For `find_min(book_counts, &mut cache)`:
+///
+/// ```text
+/// CopyEvent { from: "book_counts", to: "find_min", kind: Copy, ... }
+/// CopyEvent { from: "cache", to: "find_min", kind: MutBorrow, ... }
+/// ```
 #[derive(Debug, Clone)]
 pub struct CopyEvent {
-    /// Name of the source binding
+    /// Name of the source binding (the argument variable).
     pub from: String,
-    /// Name of the target (function name or variable)
+    /// Name of the call target (function or method name).
     pub to: String,
-    /// Line number where the transfer occurred
+    /// Line number where the transfer occurred (0-indexed).
     pub line: u32,
-    /// Kind of transfer
+    /// What kind of transfer: move, copy, borrow, or mut borrow.
     pub kind: TransferKind,
-    /// If true, this is a low-value annotation (scalar primitive in function call).
-    /// Renderers can choose to suppress these for noise reduction.
+    /// True if this is a scalar primitive (`i32`, `bool`, etc.).
+    ///
+    /// Renderers may suppress scalar annotations to reduce noise.
     pub is_scalar_in_call: bool,
 }
 
@@ -852,61 +874,78 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
         }
     }
 
-    /// Handle a let binding (pattern from a let statement).
-    fn handle_let_binding(&mut self, pat: &ast::Pat, let_stmt: &ast::LetStmt) {
-        // Extract type info if available
-        let type_hint = let_stmt.ty().map(|ty| ty.syntax().text().to_string());
+    /// Detect `let r = &x` or `let r = &mut x`. Returns (source_binding_id, is_mut).
+    fn detect_borrow_init(&self, let_stmt: &ast::LetStmt) -> Option<(BindingId, bool)> {
+        let init = let_stmt.initializer()?;
+        let ref_expr = match &init {
+            ast::Expr::RefExpr(r) => r,
+            _ => return None,
+        };
+        let is_mut = ref_expr.mut_token().is_some();
+        let inner = ref_expr.expr()?;
+        let path = match inner {
+            ast::Expr::PathExpr(p) => p,
+            _ => return None,
+        };
+        let (_, binding_id, _) = self.resolve_path(&path)?;
+        Some((binding_id, is_mut))
+    }
 
-        // Check if the initializer is a reference expression
-        let borrow_info = let_stmt.initializer().and_then(|init| {
-            if let ast::Expr::RefExpr(ref_expr) = &init {
-                let is_mut = ref_expr.mut_token().is_some();
-                if let Some(ast::Expr::PathExpr(path_expr)) = ref_expr.expr() {
-                    if let Some((_name, binding_id, _)) = self.resolve_path(&path_expr) {
-                        return Some((binding_id, is_mut));
-                    }
-                }
-            }
-            None
-        });
+    /// Detect `let y = x` (potential move/copy). Returns (name, id, is_copy, range).
+    fn detect_transfer_init(
+        &self,
+        let_stmt: &ast::LetStmt,
+    ) -> Option<(String, BindingId, bool, TextRange)> {
+        let init = let_stmt.initializer()?;
+        let path = match &init {
+            ast::Expr::PathExpr(p) => p,
+            _ => return None,
+        };
+        let (name, id, binding) = self.resolve_path(path)?;
+        Some((name, id, binding.is_copy, init.syntax().text_range()))
+    }
 
-        // Check if the initializer is a plain path expression (potential move or copy source)
-        let transfer_source = let_stmt.initializer().and_then(|init| {
-            if let ast::Expr::PathExpr(path_expr) = &init {
-                if let Some((name, binding_id, binding)) = self.resolve_path(path_expr) {
-                    return Some((name, binding_id, binding.is_copy, init.syntax().text_range()));
-                }
-            }
-            None
-        });
-
-        // Determine if Copy: check semantic info first, then fall back to heuristics
-        // Use name offset (not pattern offset) to match semantic analysis keys.
-        // For `let mut x`, pat includes "mut x" but semantic keys use just "x".
-        let decl_offset = if let ast::Pat::IdentPat(ident_pat) = pat {
+    /// Get the declaration offset for semantic lookups.
+    /// For `let mut x`, returns the offset of `x` (not `mut x`).
+    fn get_decl_offset(&self, pat: &ast::Pat) -> u32 {
+        if let ast::Pat::IdentPat(ident_pat) = pat {
             ident_pat
                 .name()
                 .map(|n| u32::from(n.syntax().text_range().start()))
                 .unwrap_or_else(|| u32::from(pat.syntax().text_range().start()))
         } else {
             u32::from(pat.syntax().text_range().start())
-        };
+        }
+    }
+
+    /// Determine Copy/scalar status from semantic info or type hint.
+    fn infer_binding_type(&self, pat: &ast::Pat, let_stmt: &ast::LetStmt) -> (bool, bool) {
+        let decl_offset = self.get_decl_offset(pat);
+        let type_hint = let_stmt.ty().map(|ty| ty.syntax().text().to_string());
+
         let is_copy = if let Some(&is_copy) = self.semantic_copy_types.get(&decl_offset) {
-            // Use authoritative semantic info from rust-analyzer
             is_copy
         } else if let Some(ref t) = type_hint {
-            // Fall back: check type annotation (for tests without semantic analysis)
             self.is_copy_type(t)
         } else {
-            // No semantic info, no type hint: assume non-Copy (conservative)
             false
         };
 
-        // Look up scalar info from semantic analysis
-        let is_scalar = self.semantic_scalar_types.get(&decl_offset).copied().unwrap_or(false);
+        let is_scalar = self
+            .semantic_scalar_types
+            .get(&decl_offset)
+            .copied()
+            .unwrap_or(false);
 
-        // If this is a reference binding (let r = &x), create a borrow binding
-        if let Some((borrowed_from, is_mut_borrow)) = borrow_info {
+        (is_copy, is_scalar)
+    }
+
+    /// Handle a let binding (pattern from a let statement).
+    fn handle_let_binding(&mut self, pat: &ast::Pat, let_stmt: &ast::LetStmt) {
+        let (is_copy, is_scalar) = self.infer_binding_type(pat, let_stmt);
+
+        // Handle borrow bindings: let r = &x
+        if let Some((borrowed_from, is_mut_borrow)) = self.detect_borrow_init(let_stmt) {
             if let ast::Pat::IdentPat(ident_pat) = pat {
                 if let Some(name) = ident_pat.name() {
                     let is_mut = ident_pat.mut_token().is_some();
@@ -917,9 +956,7 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
                         borrowed_from,
                         pat.syntax().text_range(),
                     );
-                    // Snapshot after binding creation
-                    let end = u32::from(let_stmt.syntax().text_range().end());
-                    self.snapshot_set(end);
+                    self.snapshot_set(u32::from(let_stmt.syntax().text_range().end()));
                     return;
                 }
             }
@@ -927,7 +964,9 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
 
         // Track the binding ID and name that will be created (for simple IdentPat)
         let target_info = if let ast::Pat::IdentPat(ident_pat) = pat {
-            ident_pat.name().map(|n| (BindingId(self.next_binding_id), n.text().to_string()))
+            ident_pat
+                .name()
+                .map(|n| (BindingId(self.next_binding_id), n.text().to_string()))
         } else {
             None
         };
@@ -936,21 +975,17 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
         self.visit_pat_with_type(pat, false, is_copy, is_scalar);
 
         // Record transfer (move or copy) from source to target
-        if let Some((source_name, source_id, source_is_copy, range)) = transfer_source {
+        if let Some((source_name, source_id, source_is_copy, range)) = self.detect_transfer_init(let_stmt) {
             if let Some((target_id, target_name)) = target_info {
                 if source_is_copy {
-                    // Copy: source remains valid
                     self.record_copy(source_id, source_name, target_id, target_name, range);
                 } else {
-                    // Move: source becomes invalid
                     self.record_move(source_id, Some(target_id), range);
                 }
             }
         }
 
-        // Snapshot after binding creation
-        let end = u32::from(let_stmt.syntax().text_range().end());
-        self.snapshot_set(end);
+        self.snapshot_set(u32::from(let_stmt.syntax().text_range().end()));
     }
 
     /// Process an expression (for state tracking).
@@ -975,114 +1010,106 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
         }
     }
 
+    /// Handle `&x` passed to function call.
+    fn handle_shared_borrow_arg(&mut self, ref_expr: &ast::RefExpr, call_target: &str) {
+        let Some(ast::Expr::PathExpr(path_expr)) = ref_expr.expr() else {
+            return;
+        };
+        let Some((name, binding_id, _)) = self.resolve_path(&path_expr) else {
+            return;
+        };
+
+        let range = ref_expr.syntax().text_range();
+        let line = self.offset_to_line(u32::from(range.start()));
+
+        self.copy_events.push(CopyEvent {
+            from: name.clone(),
+            to: call_target.to_string(),
+            line,
+            kind: TransferKind::SharedBorrow,
+            is_scalar_in_call: false,
+        });
+
+        self.annotations.push(Annotation::new(
+            range,
+            name,
+            BindingState::SharedBorrow { from: binding_id },
+            "shared borrow passed to function".to_string(),
+        ));
+    }
+
+    /// Handle `&mut x` passed to function call.
+    fn handle_mut_borrow_arg(&mut self, ref_expr: &ast::RefExpr, call_target: &str) {
+        let Some(ast::Expr::PathExpr(path_expr)) = ref_expr.expr() else {
+            return;
+        };
+        let Some((name, _binding_id, _)) = self.resolve_path(&path_expr) else {
+            return;
+        };
+
+        let range = ref_expr.syntax().text_range();
+        let line = self.offset_to_line(u32::from(range.start()));
+
+        self.copy_events.push(CopyEvent {
+            from: name.clone(),
+            to: call_target.to_string(),
+            line,
+            kind: TransferKind::MutBorrow,
+            is_scalar_in_call: false,
+        });
+
+        let reborrow_id = BindingId(self.next_binding_id);
+        self.next_binding_id += 1;
+        self.annotations.push(Annotation::new(
+            range,
+            name,
+            BindingState::Suspended { reborrowed_to: reborrow_id },
+            "mutable borrow passed to function".to_string(),
+        ));
+    }
+
+    /// Handle plain `x` passed to function call.
+    fn handle_value_arg(&mut self, path_expr: &ast::PathExpr, call_target: &str) {
+        let Some((name, binding_id, binding)) = self.resolve_path(path_expr) else {
+            return;
+        };
+
+        let range = path_expr.syntax().text_range();
+        let line = self.offset_to_line(u32::from(range.start()));
+
+        // Determine transfer kind based on binding state
+        let kind = match &binding.current_state {
+            BindingState::SharedBorrow { .. } => TransferKind::SharedBorrow,
+            BindingState::MutBorrow { .. } => TransferKind::MutBorrow,
+            _ if binding.is_copy => TransferKind::Copy,
+            _ => TransferKind::Move,
+        };
+
+        self.copy_events.push(CopyEvent {
+            from: name.clone(),
+            to: call_target.to_string(),
+            line,
+            kind,
+            is_scalar_in_call: binding.is_scalar && kind == TransferKind::Copy,
+        });
+
+        if kind == TransferKind::Move {
+            self.record_move(binding_id, None, range);
+        }
+    }
+
     /// Process a call argument (potential move or borrow).
     fn process_call_arg(&mut self, arg: &ast::Expr, call_target: &str) {
         match arg {
-            // &x - shared borrow in call context
             ast::Expr::RefExpr(ref_expr) if ref_expr.mut_token().is_none() => {
-                if let Some(ast::Expr::PathExpr(path_expr)) = ref_expr.expr() {
-                    if let Some((name, binding_id, _)) = self.resolve_path(&path_expr) {
-                        let range = arg.syntax().text_range();
-                        let line = self.offset_to_line(u32::from(range.start()));
-
-                        // Record CopyEvent for call-site description
-                        self.copy_events.push(CopyEvent {
-                            from: name.clone(),
-                            to: call_target.to_string(),
-                            line,
-                            kind: TransferKind::SharedBorrow,
-                            is_scalar_in_call: false,
-                        });
-
-                        self.annotations.push(Annotation::new(
-                            range,
-                            name,
-                            BindingState::SharedBorrow { from: binding_id },
-                            "shared borrow passed to function".to_string(),
-                        ));
-                    }
-                }
+                self.handle_shared_borrow_arg(ref_expr, call_target);
             }
-
-            // &mut x - mutable borrow in call context
             ast::Expr::RefExpr(ref_expr) => {
-                if let Some(ast::Expr::PathExpr(path_expr)) = ref_expr.expr() {
-                    if let Some((name, _binding_id, _)) = self.resolve_path(&path_expr) {
-                        let range = arg.syntax().text_range();
-                        let line = self.offset_to_line(u32::from(range.start()));
-
-                        // Record CopyEvent for call-site description
-                        self.copy_events.push(CopyEvent {
-                            from: name.clone(),
-                            to: call_target.to_string(),
-                            line,
-                            kind: TransferKind::MutBorrow,
-                            is_scalar_in_call: false,
-                        });
-
-                        let reborrow_id = BindingId(self.next_binding_id);
-                        self.next_binding_id += 1;
-                        self.annotations.push(Annotation::new(
-                            range,
-                            name,
-                            BindingState::Suspended { reborrowed_to: reborrow_id },
-                            "mutable borrow passed to function".to_string(),
-                        ));
-                    }
-                }
+                self.handle_mut_borrow_arg(ref_expr, call_target);
             }
-
-            // Plain variable - potential move, copy, or reborrow into call
             ast::Expr::PathExpr(path_expr) => {
-                if let Some((name, binding_id, binding)) = self.resolve_path(path_expr) {
-                    let range = arg.syntax().text_range();
-                    let line = self.offset_to_line(u32::from(range.start()));
-
-                    // Determine transfer kind based on binding state
-                    let is_shared_borrow = matches!(binding.current_state, BindingState::SharedBorrow { .. });
-                    let is_mut_borrow = matches!(binding.current_state, BindingState::MutBorrow { .. });
-
-                    if is_shared_borrow {
-                        // Reference reborrowed into call
-                        self.copy_events.push(CopyEvent {
-                            from: name.clone(),
-                            to: call_target.to_string(),
-                            line,
-                            kind: TransferKind::SharedBorrow,
-                            is_scalar_in_call: false,
-                        });
-                    } else if is_mut_borrow {
-                        // Mutable reference reborrowed into call
-                        self.copy_events.push(CopyEvent {
-                            from: name.clone(),
-                            to: call_target.to_string(),
-                            line,
-                            kind: TransferKind::MutBorrow,
-                            is_scalar_in_call: false,
-                        });
-                    } else if binding.is_copy {
-                        // Copy type: value copied into call
-                        self.copy_events.push(CopyEvent {
-                            from: name.clone(),
-                            to: call_target.to_string(),
-                            line,
-                            kind: TransferKind::Copy,
-                            is_scalar_in_call: binding.is_scalar,
-                        });
-                    } else {
-                        // Non-copy owned type: moved into call
-                        self.copy_events.push(CopyEvent {
-                            from: name.clone(),
-                            to: call_target.to_string(),
-                            line,
-                            kind: TransferKind::Move,
-                            is_scalar_in_call: false,
-                        });
-                        self.record_move(binding_id, None, range);
-                    }
-                }
+                self.handle_value_arg(path_expr, call_target);
             }
-
             _ => {}
         }
     }
