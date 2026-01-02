@@ -71,7 +71,7 @@ enum Cmd {
     /// Annotate source with ownership state
     #[bpaf(command)]
     Annotate {
-        /// Output style
+        /// Output style [inline, columnar, grouped, diagnostic (default), set-notation, vertical-spans, html, validated]
         #[bpaf(short, long, argument("STYLE"), fallback(Style::default()))]
         style: Style,
 
