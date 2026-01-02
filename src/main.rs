@@ -60,7 +60,7 @@ impl From<Style> for RenderStyle {
 }
 
 #[derive(Debug, Clone, Bpaf)]
-#[bpaf(options, version)]
+#[bpaf(options, version, fallback_to_usage)]
 /// Rust ownership state visualizer: annotates code with move/borrow/ownership state
 ///
 /// NOTATION:
@@ -102,7 +102,28 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
-    let cmd = cmd().run();
+    use bpaf::Args;
+
+    let cmd = match cmd().run_inner(Args::current_args()) {
+        Ok(cmd) => cmd,
+        Err(bpaf::ParseFailure::Stdout(msg, _)) => {
+            print!("{}", msg);
+            std::process::exit(0);
+        }
+        Err(bpaf::ParseFailure::Completion(c)) => {
+            print!("{}", c);
+            std::process::exit(0);
+        }
+        Err(bpaf::ParseFailure::Stderr(_)) => {
+            // Show help on any parse error
+            if let Err(bpaf::ParseFailure::Stdout(help, _)) =
+                cmd().run_inner(Args::from(&["--help"]))
+            {
+                print!("{}", help);
+            }
+            std::process::exit(1);
+        }
+    };
 
     match cmd {
         Cmd::Annotate { file, style, all, strip_comments, serve, port } => {
