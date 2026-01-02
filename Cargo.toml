@@ -1,6 +1,6 @@
 [package]
 name = "rs-commentary"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Rust ownership state visualizer - annotates code with move/borrow/ownership state"
 license = "MIT"
