@@ -82,10 +82,11 @@ impl RichTextRenderer for DiagnosticRenderer {
                         TransferKind::SharedBorrow => "borrowed",
                         TransferKind::MutBorrow => "mut borrowed",
                     };
+                    let target = transfer.context.target_name();
                     let label = if show_still_valid {
-                        format!("{} → {}; {} still valid", kind_desc, transfer.to, transfer.from)
+                        format!("{} → {}; {} still valid", kind_desc, target, transfer.from)
                     } else {
-                        format!("{} → {}", kind_desc, transfer.to)
+                        format!("{} → {}", kind_desc, target)
                     };
                     let is_borrow = matches!(
                         transfer.kind,

@@ -943,6 +943,46 @@ impl TypeOracle for SemanticTypeOracle<'_> {
             Some(BindingKind::OwnedMove)
         }
     }
+
+    fn expand_macro_vars(&self, macro_call: &ast::MacroCall) -> Option<Vec<String>> {
+        let db = self.host.raw_database();
+        let sema = Semantics::new(db);
+
+        // Parse the file through Semantics so nodes are connected to the DB
+        let file = sema.parse_guess_edition(self.file_id);
+
+        // Find the corresponding MacroCall in the sema-parsed tree by offset
+        let offset = macro_call.syntax().text_range().start();
+        let sema_call: ast::MacroCall = sema.find_node_at_offset_with_descend(file.syntax(), offset)?;
+
+        // Try to expand the macro using expand_macro_call
+        let expanded = sema.expand_macro_call(&sema_call)?;
+
+        // Walk the expanded syntax tree to find PathExpr nodes (variable references)
+        let mut vars = Vec::new();
+        for node in expanded.descendants() {
+            if let Some(path_expr) = ast::PathExpr::cast(node) {
+                if let Some(path) = path_expr.path() {
+                    // Get the simple name (skip qualified paths like std::fmt::...)
+                    if path.qualifier().is_none() {
+                        if let Some(segment) = path.segment() {
+                            if let Some(name) = segment.name_ref() {
+                                let name_str = name.text().to_string();
+                                // Skip common non-variable identifiers
+                                if !name_str.starts_with(char::is_uppercase)
+                                    && !vars.contains(&name_str)
+                                {
+                                    vars.push(name_str);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(vars)
+    }
 }
 
 impl SemanticAnalyzer {

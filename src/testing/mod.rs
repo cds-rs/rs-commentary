@@ -200,12 +200,8 @@ pub fn verify_source_with_analyzer(
         VerificationError::SemanticLoadFailed("Failed to get file ID".to_string())
     })?;
 
-    // Get semantic info for accurate type detection
+    // Get semantic info for NLL tracking
     let last_use_info = analyzer.find_all_last_uses(file_id, source);
-    let copy_types: HashMap<String, bool> = last_use_info
-        .values()
-        .map(|info| (info.name.clone(), info.is_copy()))
-        .collect();
 
     // Extract NLL borrow ends: reference bindings with their drop lines
     // Key by (name, decl_line) to avoid collisions across functions
@@ -229,9 +225,9 @@ pub fn verify_source_with_analyzer(
 
     let set_annotations = ownership_analyzer.set_annotations();
 
-    // Build render context to get computed states
+    // Build render context - Copy type info flows through SetEntry.is_copy
     let config = RenderConfig::default();
-    let ctx = RenderContext::new_with_semantic(source, set_annotations, config, copy_types);
+    let ctx = RenderContext::new(source, set_annotations, config);
 
     // Verify each test function
     let lines: Vec<&str> = source.lines().collect();

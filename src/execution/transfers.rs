@@ -1,6 +1,6 @@
-//! Call transfer analysis - what's moved/borrowed at each call site.
+//! Transfer analysis - what's moved/borrowed at call sites and macros.
 //!
-//! Analyzes function call arguments to determine ownership transfers:
+//! Analyzes function call arguments and macro invocations to determine ownership transfers:
 //! - Move: ownership transfers to callee
 //! - SharedBorrow: &T reference passed
 //! - MutBorrow: &mut T reference passed
@@ -9,7 +9,32 @@
 use ra_ap_syntax::ast::{self, HasArgList};
 use ra_ap_syntax::AstNode;
 
-/// A transfer happening at a call site.
+/// Context in which a transfer occurs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferContext {
+    /// Transfer as a function argument: `foo(x)`
+    FunctionArg { callee: String },
+    /// Transfer as a method receiver: `x.foo()`
+    MethodReceiver { method: String },
+    /// Transfer inside a macro: `println!("{x}")`
+    MacroArg { macro_name: String },
+    /// Transfer via let binding: `let y = x;`
+    LetBinding { to: String },
+}
+
+impl TransferContext {
+    /// Get the target name (function, method, macro, or binding).
+    pub fn target_name(&self) -> &str {
+        match self {
+            TransferContext::FunctionArg { callee } => callee,
+            TransferContext::MethodReceiver { method } => method,
+            TransferContext::MacroArg { macro_name } => macro_name,
+            TransferContext::LetBinding { to } => to,
+        }
+    }
+}
+
+/// A transfer happening at a call site (legacy, for standalone analysis).
 #[derive(Debug, Clone)]
 pub struct CallTransfer {
     /// Variable being transferred.
@@ -20,7 +45,7 @@ pub struct CallTransfer {
     pub column: u32,
 }
 
-/// Kind of ownership transfer at a call.
+/// Kind of ownership transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferKind {
     /// Ownership moves to callee.
@@ -94,7 +119,7 @@ pub fn analyze_method_call_transfers(
 }
 
 /// Analyze a single argument expression.
-fn analyze_argument(expr: &ast::Expr, copy_types: &[&str]) -> Option<CallTransfer> {
+fn analyze_argument(expr: &ast::Expr, _copy_types: &[&str]) -> Option<CallTransfer> {
     let column = expr
         .syntax()
         .text_range()
@@ -126,20 +151,13 @@ fn analyze_argument(expr: &ast::Expr, copy_types: &[&str]) -> Option<CallTransfe
             None
         }
 
-        // Plain variable - move or copy
+        // Plain variable - assume move (conservative; actual analysis uses TypeOracle)
         ast::Expr::PathExpr(path) => {
             let name = path.path()?.syntax().text().to_string();
 
-            // Check if it's a Copy type (simple heuristic)
-            let kind = if is_likely_copy(&name, copy_types) {
-                TransferKind::Copy
-            } else {
-                TransferKind::Move
-            };
-
             Some(CallTransfer {
                 variable: name,
-                kind,
+                kind: TransferKind::Move,
                 column,
             })
         }
@@ -160,20 +178,6 @@ fn extract_var_name(expr: &ast::Expr) -> Option<String> {
         }
         _ => None,
     }
-}
-
-/// Heuristic: is this variable likely a Copy type?
-fn is_likely_copy(name: &str, copy_types: &[&str]) -> bool {
-    // Check explicit copy types list
-    if copy_types.contains(&name) {
-        return true;
-    }
-
-    // Simple names that are conventionally Copy
-    matches!(
-        name,
-        "i" | "j" | "k" | "n" | "x" | "y" | "z" | "len" | "count" | "index" | "idx"
-    )
 }
 
 #[cfg(test)]
@@ -224,13 +228,13 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_transfer() {
+    fn test_plain_path_transfer() {
         let call = parse_call("foo(x)");
         let transfers = analyze_call_transfers(&call, &[]);
 
-        // x is conventionally a Copy type name
+        // Without semantic analysis, plain paths are conservatively Move
         assert_eq!(transfers.len(), 1);
-        assert_eq!(transfers[0].kind, TransferKind::Copy);
+        assert_eq!(transfers[0].kind, TransferKind::Move);
     }
 
     #[test]
@@ -240,7 +244,7 @@ mod tests {
 
         assert_eq!(transfers.len(), 3);
         assert_eq!(transfers[0].kind, TransferKind::SharedBorrow);
-        assert_eq!(transfers[1].kind, TransferKind::Copy); // x
+        assert_eq!(transfers[1].kind, TransferKind::Move); // x - Move without semantics
         assert_eq!(transfers[2].kind, TransferKind::MutBorrow);
     }
 }

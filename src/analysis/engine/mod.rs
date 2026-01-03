@@ -1,8 +1,14 @@
-//! Core analysis engine that tracks ownership state through code.
+//! Event-driven ownership analysis engine.
 //!
-//! This module uses the state machine defined in `state.rs` for all
-//! ownership state transitions. See [`BindingState::transition`] for
-//! the complete transition table.
+//! This module processes AST events from [`AstIter`] and tracks ownership state
+//! using the state machine defined in `state.rs`. Key design principles:
+//!
+//! - **Event-first**: All AST access goes through AstIter events
+//! - **TypeOracle**: Single source of truth for type info (Copy, scalar, etc.)
+//! - **Unified transfers**: All value transfers use [`TransferEvent`]
+//! - **Inline captures**: Move closure captures detected during PathExpr processing
+//!
+//! See [`BindingState::transition`] for the complete state transition table.
 
 mod macros;
 
@@ -11,10 +17,11 @@ use super::state::{
     SetAnnotation,
 };
 use super::TypeOracle;
+use crate::execution::TransferContext;
 use crate::util::{AstEvent, AstIter};
 use anyhow::Result;
 use ra_ap_syntax::{
-    ast::{self, HasArgList, HasName},
+    ast::{self, HasName},
     AstNode, SourceFile, TextRange,
 };
 use std::collections::HashMap;
@@ -77,25 +84,31 @@ impl TransferKind {
     }
 }
 
-/// Records what happens to an argument at a function call site.
+/// Records what happens to a binding at a transfer point (call or macro).
 ///
 /// Created during [`OwnershipAnalyzer`] traversal for each argument passed
-/// to a function or method. Renderers consume these to show transfer annotations.
+/// to a function, method, or macro. Renderers consume these to show transfer annotations.
 ///
 /// # Example
 ///
 /// For `find_min(book_counts, &mut cache)`:
 ///
 /// ```text
-/// CopyEvent { from: "book_counts", to: "find_min", kind: Copy, ... }
-/// CopyEvent { from: "cache", to: "find_min", kind: MutBorrow, ... }
+/// TransferEvent { from: "book_counts", context: FunctionArg("find_min"), kind: Copy, ... }
+/// TransferEvent { from: "cache", context: FunctionArg("find_min"), kind: MutBorrow, ... }
+/// ```
+///
+/// For `println!("{x}")`:
+///
+/// ```text
+/// TransferEvent { from: "x", context: MacroArg("println"), kind: SharedBorrow, ... }
 /// ```
 #[derive(Debug, Clone)]
-pub struct CopyEvent {
-    /// Name of the source binding (the argument variable).
+pub struct TransferEvent {
+    /// Name of the source binding.
     pub from: String,
-    /// Name of the call target (function or method name).
-    pub to: String,
+    /// Context of the transfer (function arg, method receiver, or macro).
+    pub context: TransferContext,
     /// Line number where the transfer occurred (0-indexed).
     pub line: u32,
     /// What kind of transfer: move, copy, borrow, or mut borrow.
@@ -105,6 +118,9 @@ pub struct CopyEvent {
     /// Renderers may suppress scalar annotations to reduce noise.
     pub is_scalar_in_call: bool,
 }
+
+/// Backwards compatibility alias.
+pub type CopyEvent = TransferEvent;
 
 /// The ownership analyzer tracks variable state through code.
 pub struct OwnershipAnalyzer<'oracle> {
@@ -137,11 +153,7 @@ pub struct OwnershipAnalyzer<'oracle> {
     fn_scope: Option<ScopeId>,
     /// Scope ID of the current block (for dropped bindings at closing brace)
     block_scope_stack: Vec<ScopeId>,
-    /// Semantic copy types: declaration offset -> is_copy (from rust-analyzer)
-    semantic_copy_types: HashMap<u32, bool>,
-    /// Semantic scalar types: declaration offset -> is_scalar (from rust-analyzer)
-    semantic_scalar_types: HashMap<u32, bool>,
-    /// Type oracle for on-demand type queries (optional, from rust-analyzer)
+    /// Type oracle for on-demand type queries (required for semantic analysis)
     type_oracle: Option<&'oracle dyn TypeOracle>,
     /// NLL drop info for reference bindings: (name, decl_line) -> drop_line
     /// When we reach drop_line, we should end the borrow and restore the source.
@@ -150,6 +162,11 @@ pub struct OwnershipAnalyzer<'oracle> {
     ended_borrows: std::collections::HashSet<(String, u32)>,
     /// Current for-loop expression (for iterator borrow tracking)
     current_for_expr: Option<ast::ForExpr>,
+    /// Stack of scopes where move closures were entered.
+    /// Used for event-driven capture tracking: when a PathExpr resolves to
+    /// a binding from a scope older than the first move closure scope in this
+    /// stack, it's a capture that may need to be moved.
+    move_closure_scopes: Vec<ScopeId>,
 }
 
 impl<'oracle> OwnershipAnalyzer<'oracle> {
@@ -185,12 +202,11 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
             in_closure_params: false,
             fn_scope: None,
             block_scope_stack: Vec::new(),
-            semantic_copy_types: HashMap::new(),
-            semantic_scalar_types: HashMap::new(),
             type_oracle: None,
             nll_borrow_ends: HashMap::new(),
             ended_borrows: std::collections::HashSet::new(),
             current_for_expr: None,
+            move_closure_scopes: Vec::new(),
         }
     }
 
@@ -205,26 +221,10 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
 
     /// Set the type oracle for on-demand type queries.
     ///
-    /// When set, the analyzer will query this oracle for Copy/scalar type info
-    /// at the point of use, rather than relying on pre-collected offset mappings.
+    /// Required for semantic analysis. The analyzer queries this oracle for
+    /// Copy/scalar type info at the point of use.
     pub fn set_type_oracle(&mut self, oracle: &'oracle dyn TypeOracle) {
         self.type_oracle = Some(oracle);
-    }
-
-    /// Set semantic copy type information from rust-analyzer.
-    ///
-    /// This provides authoritative type info for Copy/Move determination.
-    /// Deprecated: prefer `set_type_oracle` for on-demand queries.
-    pub fn set_semantic_copy_types(&mut self, copy_types: HashMap<u32, bool>) {
-        self.semantic_copy_types = copy_types;
-    }
-
-    /// Set semantic scalar type information from rust-analyzer.
-    ///
-    /// Scalar primitives (i32, usize, bool, etc.) create low-value copy
-    /// annotations when passed to functions. Renderers can suppress these.
-    pub fn set_semantic_scalar_types(&mut self, scalar_types: HashMap<u32, bool>) {
-        self.semantic_scalar_types = scalar_types;
     }
 
     // ========================================================================
@@ -328,45 +328,46 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
         // Add each binding to the set based on its current state
         for binding_id in binding_ids {
             if let Some(binding) = self.bindings.get(&binding_id) {
+                let is_copy = binding.is_copy;
                 match &binding.current_state {
                     BindingState::Owned { mutable } => {
-                        set.add_owned(binding.name.clone(), *mutable);
+                        set.add_owned(binding.name.clone(), *mutable, is_copy);
                     }
                     BindingState::Shared { original_mutable, borrowed_by } => {
                         let borrow_names: Vec<String> = borrowed_by
                             .iter()
                             .filter_map(|id| self.bindings.get(id).map(|b| b.name.clone()))
                             .collect();
-                        set.add_shared(binding.name.clone(), *original_mutable, borrow_names);
+                        set.add_shared(binding.name.clone(), *original_mutable, is_copy, borrow_names);
                     }
                     BindingState::Frozen { original_mutable, borrowed_by } => {
                         let borrow_name = self.bindings.get(borrowed_by)
                             .map(|b| b.name.clone())
                             .unwrap_or_else(|| "?".to_string());
-                        set.add_frozen(binding.name.clone(), *original_mutable, borrow_name);
+                        set.add_frozen(binding.name.clone(), *original_mutable, is_copy, borrow_name);
                     }
                     BindingState::SharedBorrow { from } => {
                         let from_name = self.bindings.get(from)
                             .map(|b| b.name.clone())
                             .unwrap_or_else(|| "?".to_string());
-                        set.add_shared_borrow(binding.name.clone(), from_name);
+                        set.add_shared_borrow(binding.name.clone(), is_copy, from_name);
                     }
                     BindingState::MutBorrow { from } => {
                         let from_name = self.bindings.get(from)
                             .map(|b| b.name.clone())
                             .unwrap_or_else(|| "?".to_string());
-                        set.add_mut_borrow(binding.name.clone(), from_name);
+                        set.add_mut_borrow(binding.name.clone(), is_copy, from_name);
                     }
                     BindingState::Moved { to } => {
                         let to_name = to.and_then(|id| self.bindings.get(&id).map(|b| b.name.clone()));
-                        set.add_moved(binding.name.clone(), to_name);
+                        set.add_moved(binding.name.clone(), is_copy, to_name);
                     }
                     BindingState::Dropped => {
-                        set.add_dropped(binding.name.clone());
+                        set.add_dropped(binding.name.clone(), is_copy);
                     }
                     // Other states
                     _ => {
-                        set.add_owned(binding.name.clone(), binding.is_mutable);
+                        set.add_owned(binding.name.clone(), binding.is_mutable, is_copy);
                     }
                 }
             }
@@ -550,9 +551,23 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
         }
     }
 
+    /// Emit a transfer event (for move, copy, or borrow at any transfer site).
+    ///
+    /// This is the unified way to record what happens to a binding when it's
+    /// transferred to another location (let binding, function call, macro, etc.).
+    fn emit_transfer(&mut self, from: String, context: TransferContext, kind: TransferKind, range: TextRange, is_scalar: bool) {
+        let line = self.offset_to_line(u32::from(range.start()));
+        self.copy_events.push(TransferEvent {
+            from,
+            context,
+            line,
+            kind,
+            is_scalar_in_call: is_scalar,
+        });
+    }
+
     /// Record a copy of a binding (for Copy types in let bindings).
     /// Unlike move, the source remains valid after copy.
-    /// This creates a synthetic event - the source's state doesn't change.
     pub fn record_copy(
         &mut self,
         _from: BindingId,
@@ -561,31 +576,18 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
         to_name: String,
         range: TextRange,
     ) {
-        // Calculate line number from range
-        let line = self.offset_to_line(u32::from(range.start()));
-
-        // Add synthetic copy event (no state change to source)
-        self.copy_events.push(CopyEvent {
-            from: from_name,
-            to: to_name,
-            line,
-            kind: TransferKind::Copy,
-            is_scalar_in_call: false, // Let bindings always show
-        });
+        self.emit_transfer(
+            from_name,
+            TransferContext::LetBinding { to: to_name },
+            TransferKind::Copy,
+            range,
+            false, // Let bindings always show
+        );
     }
 
     /// Get the recorded copy events.
     pub fn copy_events(&self) -> &[CopyEvent] {
         &self.copy_events
-    }
-
-    /// Get Copy type info for all tracked bindings.
-    /// Returns a map from variable name to whether it's a Copy type.
-    pub fn copy_types(&self) -> HashMap<String, bool> {
-        self.bindings
-            .values()
-            .map(|b| (b.name.clone(), b.is_copy))
-            .collect()
     }
 
     /// Record a shared borrow of a binding.
@@ -738,6 +740,10 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
             }
 
             AstEvent::ExitClosure => {
+                // Pop move closure scope if this closure pushed one
+                if self.move_closure_scopes.last() == Some(&self.current_scope) {
+                    self.move_closure_scopes.pop();
+                }
                 self.exit_scope();
                 self.current_closure = None;
             }
@@ -838,31 +844,20 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
     /// Handle entering a closure.
     fn handle_enter_closure(&mut self, closure: &ast::ClosureExpr) {
         let is_move = closure.move_token().is_some();
-        let range = closure.syntax().text_range();
 
         // Store closure for parameter type lookup
         self.current_closure = Some(closure.clone());
         self.param_index = 0;
         self.in_closure_params = true;
 
-        // Enter scope first so capture analysis can detect outer variables
+        // Enter scope first
         self.enter_scope();
 
-        // For move closures, capture analysis (now that we're in the closure's scope)
+        // Track move closure scope for event-driven capture detection.
+        // Captures are identified in process_expr when a PathExpr resolves
+        // to a binding from a scope older than this move closure's scope.
         if is_move {
-            if let Some(body) = closure.body() {
-                let captures = self.collect_captures(&body);
-                for (name, binding_id, binding) in captures {
-                    if !binding.is_copy {
-                        self.apply_event_with_annotation(
-                            binding_id,
-                            OwnershipEvent::Move { to: None },
-                            range,
-                            format!("{}: moved into closure", name),
-                        );
-                    }
-                }
-            }
+            self.move_closure_scopes.push(self.current_scope);
         }
     }
 
@@ -955,44 +950,10 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
         Some((name, id, binding.is_copy, init.syntax().text_range()))
     }
 
-    /// Get the declaration offset for semantic lookups.
-    /// For `let mut x`, returns the offset of `x` (not `mut x`).
-    fn get_decl_offset(&self, pat: &ast::Pat) -> u32 {
-        if let ast::Pat::IdentPat(ident_pat) = pat {
-            ident_pat
-                .name()
-                .map(|n| u32::from(n.syntax().text_range().start()))
-                .unwrap_or_else(|| u32::from(pat.syntax().text_range().start()))
-        } else {
-            u32::from(pat.syntax().text_range().start())
-        }
-    }
-
-    /// Determine Copy/scalar status from semantic info or type hint.
-    fn infer_binding_type(&self, pat: &ast::Pat, let_stmt: &ast::LetStmt) -> (bool, bool) {
-        let decl_offset = self.get_decl_offset(pat);
-        let type_hint = let_stmt.ty().map(|ty| ty.syntax().text().to_string());
-
-        let is_copy = if let Some(&is_copy) = self.semantic_copy_types.get(&decl_offset) {
-            is_copy
-        } else if let Some(ref t) = type_hint {
-            self.is_copy_type(t)
-        } else {
-            false
-        };
-
-        let is_scalar = self
-            .semantic_scalar_types
-            .get(&decl_offset)
-            .copied()
-            .unwrap_or(false);
-
-        (is_copy, is_scalar)
-    }
-
     /// Handle a let binding (pattern from a let statement).
     fn handle_let_binding(&mut self, pat: &ast::Pat, let_stmt: &ast::LetStmt) {
-        let (is_copy, is_scalar) = self.infer_binding_type(pat, let_stmt);
+        // TypeOracle will determine is_copy/is_scalar in visit_pat_with_type
+        let (is_copy, is_scalar) = (false, false);
 
         // Handle borrow bindings: let r = &x
         if let Some((borrowed_from, is_mut_borrow)) = self.detect_borrow_init(let_stmt) {
@@ -1028,9 +989,17 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
         if let Some((source_name, source_id, source_is_copy, range)) = self.detect_transfer_init(let_stmt) {
             if let Some((target_id, target_name)) = target_info {
                 if source_is_copy {
-                    self.record_copy(source_id, source_name, target_id, target_name, range);
+                    self.record_copy(source_id, source_name, target_id, target_name.clone(), range);
                 } else {
                     self.record_move(source_id, Some(target_id), range);
+                    // Emit move transfer event
+                    self.emit_transfer(
+                        source_name,
+                        TransferContext::LetBinding { to: target_name },
+                        TransferKind::Move,
+                        range,
+                        false,
+                    );
                 }
             }
         }
@@ -1155,22 +1124,69 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
 
     /// Process an expression (for state tracking).
     fn process_expr(&mut self, expr: &ast::Expr) {
-        // Handle reference expressions for borrow tracking
-        if let ast::Expr::RefExpr(ref_expr) = expr {
-            let is_mut = ref_expr.mut_token().is_some();
-            if let Some(ast::Expr::PathExpr(path_expr)) = ref_expr.expr() {
-                if let Some((_name, binding_id, _)) = self.resolve_path(&path_expr) {
-                    let range = expr.syntax().text_range();
-                    if is_mut {
-                        self.record_mut_borrow(binding_id, range);
-                    } else {
-                        self.record_shared_borrow(binding_id, range);
+        match expr {
+            // Handle reference expressions for borrow tracking
+            ast::Expr::RefExpr(ref_expr) => {
+                let is_mut = ref_expr.mut_token().is_some();
+                if let Some(ast::Expr::PathExpr(path_expr)) = ref_expr.expr() {
+                    if let Some((_name, binding_id, _)) = self.resolve_path(&path_expr) {
+                        let range = expr.syntax().text_range();
+                        if is_mut {
+                            self.record_mut_borrow(binding_id, range);
+                        } else {
+                            self.record_shared_borrow(binding_id, range);
+                        }
                     }
                 }
             }
+
+            // Handle variable references for move closure captures
+            ast::Expr::PathExpr(path_expr) => {
+                self.check_move_closure_capture(path_expr);
+            }
+
+            // Other expression types handled by iterator traversal or special events
+            _ => {}
         }
-        // Other expression types don't need special handling in process_expr;
-        // they're handled by the iterator's traversal or by CallArg/MethodReceiver events
+    }
+
+    /// Check if a path expression is a capture from a move closure.
+    ///
+    /// When inside a move closure, references to variables from outer scopes
+    /// cause those variables to be moved into the closure (if not Copy).
+    fn check_move_closure_capture(&mut self, path_expr: &ast::PathExpr) {
+        // Only relevant if we're inside a move closure
+        let Some(&move_closure_scope) = self.move_closure_scopes.first() else {
+            return;
+        };
+
+        // Resolve the path to see if it's a local variable
+        let Some((name, binding_id, binding)) = self.resolve_path(path_expr) else {
+            return;
+        };
+
+        // Check if binding is from an outer scope (before the move closure)
+        // A binding is a capture if its scope is older than the move closure scope
+        if binding.scope.0 >= move_closure_scope.0 {
+            return; // Binding is from this closure or nested scope, not a capture
+        }
+
+        // Skip if already moved or if it's Copy
+        if binding.is_copy {
+            return;
+        }
+        if matches!(binding.current_state, BindingState::Moved { .. }) {
+            return;
+        }
+
+        // This is a capture: move the binding into the closure
+        let range = path_expr.syntax().text_range();
+        self.apply_event_with_annotation(
+            binding_id,
+            OwnershipEvent::Move { to: None },
+            range,
+            format!("{}: moved into closure", name),
+        );
     }
 
     /// Handle `&x` passed to function call.
@@ -1183,15 +1199,14 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
         };
 
         let range = ref_expr.syntax().text_range();
-        let line = self.offset_to_line(u32::from(range.start()));
 
-        self.copy_events.push(CopyEvent {
-            from: name.clone(),
-            to: call_target.to_string(),
-            line,
-            kind: TransferKind::SharedBorrow,
-            is_scalar_in_call: false,
-        });
+        self.emit_transfer(
+            name.clone(),
+            TransferContext::FunctionArg { callee: call_target.to_string() },
+            TransferKind::SharedBorrow,
+            range,
+            false,
+        );
 
         self.annotations.push(Annotation::new(
             range,
@@ -1211,15 +1226,14 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
         };
 
         let range = ref_expr.syntax().text_range();
-        let line = self.offset_to_line(u32::from(range.start()));
 
-        self.copy_events.push(CopyEvent {
-            from: name.clone(),
-            to: call_target.to_string(),
-            line,
-            kind: TransferKind::MutBorrow,
-            is_scalar_in_call: false,
-        });
+        self.emit_transfer(
+            name.clone(),
+            TransferContext::FunctionArg { callee: call_target.to_string() },
+            TransferKind::MutBorrow,
+            range,
+            false,
+        );
 
         let reborrow_id = BindingId(self.next_binding_id);
         self.next_binding_id += 1;
@@ -1238,7 +1252,6 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
         };
 
         let range = path_expr.syntax().text_range();
-        let line = self.offset_to_line(u32::from(range.start()));
 
         // Determine transfer kind based on binding state
         let kind = match &binding.current_state {
@@ -1248,13 +1261,14 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
             _ => TransferKind::Move,
         };
 
-        self.copy_events.push(CopyEvent {
-            from: name.clone(),
-            to: call_target.to_string(),
-            line,
+        let is_scalar = binding.is_scalar && kind == TransferKind::Copy;
+        self.emit_transfer(
+            name.clone(),
+            TransferContext::FunctionArg { callee: call_target.to_string() },
             kind,
-            is_scalar_in_call: binding.is_scalar && kind == TransferKind::Copy,
-        });
+            range,
+            is_scalar,
+        );
 
         if kind == TransferKind::Move {
             self.record_move(binding_id, None, range);
@@ -1293,7 +1307,18 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
         let name_str = name.text().to_string();
         let range = pat.syntax().text_range();
 
-        // Determine state based on type
+        // Query TypeOracle for Copy/scalar status
+        let (is_copy, is_scalar) = if let Some(oracle) = &self.type_oracle {
+            (
+                oracle.is_copy(ident_pat).unwrap_or(false),
+                oracle.is_scalar(ident_pat).unwrap_or(false),
+            )
+        } else {
+            // No oracle available - conservative defaults
+            (false, false)
+        };
+
+        // Determine state based on type annotation
         let (state, explanation) = match type_str {
             Some(t) if t.trim().starts_with("&mut ") => (
                 BindingState::MutBorrow { from: BindingId(0) }, // placeholder
@@ -1303,7 +1328,7 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
                 BindingState::SharedBorrow { from: BindingId(0) }, // placeholder
                 format!("{}: shared borrow parameter (R only)", name_str),
             ),
-            Some(t) if self.is_copy_type(t) => (
+            _ if is_copy => (
                 BindingState::Owned { mutable: ident_pat.mut_token().is_some() },
                 format!("{}: owned Copy parameter", name_str),
             ),
@@ -1318,13 +1343,12 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
         self.next_binding_id += 1;
 
         let decl_line = self.offset_to_line(range.start().into());
-        let is_copy = type_str.map(|t| self.is_copy_type(t)).unwrap_or(false);
         let info = BindingInfo {
             name: name_str.clone(),
             scope: self.current_scope,
             is_mutable: ident_pat.mut_token().is_some(),
             is_copy,
-            is_scalar: false, // Function params default to non-scalar (conservative)
+            is_scalar,
             decl_line,
             current_state: state.clone(),
         };
@@ -1337,64 +1361,20 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
         self.annotations.push(Annotation::new(range, name_str, state, explanation));
     }
 
-    /// Check if a type string represents a Copy type.
-    ///
-    /// Detects primitives, references, and common Copy types.
-    /// The semantic layer (rust-analyzer) provides more accurate detection.
-    fn is_copy_type(&self, type_str: &str) -> bool {
-        let t = type_str.trim();
-
-        // References are always Copy
-        if t.starts_with('&') {
-            return true;
-        }
-
-        // Primitive types
-        if matches!(
-            t,
-            "bool" | "char"
-                | "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
-                | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
-                | "f32" | "f64"
-                | "()" // unit type
-        ) {
-            return true;
-        }
-
-        // Arrays of primitives: [T; N]
-        if t.starts_with('[') && t.ends_with(']') {
-            if let Some(inner) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-                // Extract element type before ';'
-                if let Some(elem_type) = inner.split(';').next() {
-                    return self.is_copy_type(elem_type.trim());
-                }
-            }
-        }
-
-        // Tuples of Copy types: (T, U, ...)
-        if t.starts_with('(') && t.ends_with(')') && t != "()" {
-            let inner = &t[1..t.len() - 1];
-            return inner.split(',').all(|part| self.is_copy_type(part.trim()));
-        }
-
-        // Option<Copy>, Result<Copy, Copy> etc. - conservative: assume non-Copy
-        // The semantic layer will correct this
-        false
-    }
-
     fn visit_pat_with_type(&mut self, pat: &ast::Pat, is_mutable: bool, is_copy: bool, is_scalar: bool) {
         match pat {
             ast::Pat::IdentPat(ident_pat) => {
                 if let Some(name) = ident_pat.name() {
                     let is_mut = is_mutable || ident_pat.mut_token().is_some();
 
-                    // Query type oracle for Copy/scalar status, falling back to passed values
+                    // Query type oracle for Copy/scalar status (required for accurate analysis)
                     let (actual_is_copy, actual_is_scalar) = if let Some(oracle) = &self.type_oracle {
                         (
-                            oracle.is_copy(ident_pat).unwrap_or(is_copy),
-                            oracle.is_scalar(ident_pat).unwrap_or(is_scalar),
+                            oracle.is_copy(ident_pat).unwrap_or(false),
+                            oracle.is_scalar(ident_pat).unwrap_or(false),
                         )
                     } else {
+                        // No oracle - use conservative defaults
                         (is_copy, is_scalar)
                     };
 
@@ -1541,79 +1521,6 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
         // 1. If NLL just restored the binding, we don't want to re-borrow/move it
         // 2. Method receivers are auto-referenced by Rust, not explicitly moved
         // 3. AstIter handles traversal of nested expressions
-    }
-
-    // ========================================================================
-    // Closure Capture Analysis
-    // ========================================================================
-
-    /// Collect all variable captures in an expression (for closure analysis).
-    fn collect_captures(&self, expr: &ast::Expr) -> Vec<(String, BindingId, BindingInfo)> {
-        let mut captures = Vec::new();
-        self.collect_captures_recursive(expr, &mut captures);
-        captures
-    }
-
-    fn collect_captures_recursive(&self, expr: &ast::Expr, captures: &mut Vec<(String, BindingId, BindingInfo)>) {
-        match expr {
-            ast::Expr::PathExpr(path_expr) => {
-                if let Some((name, id, info)) = self.resolve_path(path_expr) {
-                    // Check if this binding is from an outer scope (a capture)
-                    if info.scope != self.current_scope {
-                        // Only add if not already captured
-                        if !captures.iter().any(|(n, _, _)| n == &name) {
-                            captures.push((name, id, info));
-                        }
-                    }
-                }
-            }
-            ast::Expr::BlockExpr(block) => {
-                for stmt in block.statements() {
-                    if let ast::Stmt::ExprStmt(expr_stmt) = stmt {
-                        if let Some(e) = expr_stmt.expr() {
-                            self.collect_captures_recursive(&e, captures);
-                        }
-                    }
-                }
-                if let Some(tail) = block.tail_expr() {
-                    self.collect_captures_recursive(&tail, captures);
-                }
-            }
-            ast::Expr::CallExpr(call) => {
-                if let Some(e) = call.expr() {
-                    self.collect_captures_recursive(&e, captures);
-                }
-                if let Some(args) = call.arg_list() {
-                    for arg in args.args() {
-                        self.collect_captures_recursive(&arg, captures);
-                    }
-                }
-            }
-            ast::Expr::MethodCallExpr(method) => {
-                if let Some(receiver) = method.receiver() {
-                    self.collect_captures_recursive(&receiver, captures);
-                }
-                if let Some(args) = method.arg_list() {
-                    for arg in args.args() {
-                        self.collect_captures_recursive(&arg, captures);
-                    }
-                }
-            }
-            ast::Expr::RefExpr(ref_expr) => {
-                if let Some(inner) = ref_expr.expr() {
-                    self.collect_captures_recursive(&inner, captures);
-                }
-            }
-            ast::Expr::BinExpr(bin) => {
-                if let Some(lhs) = bin.lhs() {
-                    self.collect_captures_recursive(&lhs, captures);
-                }
-                if let Some(rhs) = bin.rhs() {
-                    self.collect_captures_recursive(&rhs, captures);
-                }
-            }
-            _ => {}
-        }
     }
 
     /// Resolve a path expression to its binding, if it's a simple local variable.
@@ -1794,8 +1701,9 @@ fn main() {
     }
 
     #[test]
-    fn test_primitive_treated_as_copy() {
-        // Engine detects primitives like i32 as Copy types.
+    fn test_without_type_oracle_conservative_move() {
+        // Without TypeOracle, the engine conservatively treats values as Move.
+        // Accurate Copy detection requires semantic analysis via TypeOracle.
         let source = r#"
 fn take_int(x: i32) {}
 fn main() {
@@ -1806,56 +1714,48 @@ fn main() {
         let mut analyzer = OwnershipAnalyzer::new();
         let annotations = analyzer.analyze(source).unwrap();
 
-        // i32 is Copy, so it should be Copied not Moved
+        // Without TypeOracle, even i32 is treated as Move (conservative)
         let move_ann = annotations.iter().find(|a| {
             a.binding == "x" && matches!(a.state, BindingState::Moved { .. })
         });
-        assert!(move_ann.is_none(), "Primitive i32 should not be moved (it's Copy)");
+        assert!(move_ann.is_some(), "Without TypeOracle, values are conservatively moved");
 
-        // Check for copy event (created when Copy type passed to function)
-        let copies = analyzer.copy_events();
-        assert!(
-            copies.iter().any(|c| c.from == "x" && c.to == "take_int"),
-            "Primitive i32 should create copy event when passed to function"
-        );
+        // Check that a transfer event exists (as Move, not Copy)
+        let transfers = analyzer.copy_events();
+        let x_transfer = transfers.iter().find(|c| c.from == "x" && c.context.target_name() == "take_int");
+        assert!(x_transfer.is_some(), "Should have transfer event for x");
+        assert_eq!(x_transfer.unwrap().kind, TransferKind::Move, "Without TypeOracle, transfer is Move");
     }
 
     #[test]
-    fn test_array_of_primitives_is_copy() {
-        // Arrays of Copy types (like [u32; 5]) should be detected as Copy.
-        // Note: Type annotations required without semantic analysis.
+    fn test_let_binding_creates_transfer_event() {
+        // Without TypeOracle, let bindings with path expressions create Move events.
+        // With TypeOracle (semantic analysis), Copy types would create Copy events.
         let source = r#"
 fn process(counts: [u32; 5]) {
-    let k: [u32; 5] = counts;   // Should be a copy, not a move
-    let m: [u32; 5] = k;        // Should also be a copy
+    let k: [u32; 5] = counts;
+    let m: [u32; 5] = k;
 }
 "#;
         let mut analyzer = OwnershipAnalyzer::new();
         let annotations = analyzer.analyze(source).unwrap();
 
-        // counts should NOT be moved (it's Copy)
+        // Without TypeOracle, bindings are conservatively moved
         let counts_moved = annotations.iter().find(|a| {
             a.binding == "counts" && matches!(a.state, BindingState::Moved { .. })
         });
-        assert!(counts_moved.is_none(), "Array [u32; 5] should not be moved (it's Copy)");
+        assert!(counts_moved.is_some(), "Without TypeOracle, values are conservatively moved");
 
-        // k should NOT be moved
-        let k_moved = annotations.iter().find(|a| {
-            a.binding == "k" && matches!(a.state, BindingState::Moved { .. })
-        });
-        assert!(k_moved.is_none(), "k (copy of array) should not be moved");
-
-        // Check copy events were recorded
-        let copies = analyzer.copy_events();
-        assert!(copies.iter().any(|c| c.from == "counts" && c.to == "k"),
-            "Should have copy event counts → k");
-        assert!(copies.iter().any(|c| c.from == "k" && c.to == "m"),
-            "Should have copy event k → m");
+        // Check transfer events exist (as Move, not Copy)
+        let transfers = analyzer.copy_events();
+        let counts_transfer = transfers.iter().find(|c| c.from == "counts" && c.context.target_name() == "k");
+        assert!(counts_transfer.is_some(), "Should have transfer event counts → k");
+        assert_eq!(counts_transfer.unwrap().kind, TransferKind::Move, "Without TypeOracle, transfer is Move");
     }
 
     #[test]
-    fn test_copy_event_line_number_in_for_loop() {
-        // Copy events inside for loops should have the correct line number
+    fn test_transfer_event_line_number() {
+        // Transfer events should have correct line numbers regardless of Copy status
         let source = r#"fn process(arr: [u32; 5]) {
     for i in 0..5 {
         let x = arr;
@@ -1866,16 +1766,16 @@ fn process(counts: [u32; 5]) {
         let mut analyzer = OwnershipAnalyzer::new();
         analyzer.analyze(source).unwrap();
 
-        let copies = analyzer.copy_events();
-        eprintln!("Copy events: {:?}", copies);
+        let transfers = analyzer.copy_events();
+        eprintln!("Transfer events: {:?}", transfers);
 
-        // Find the copy event arr → x
-        let copy = copies.iter().find(|c| c.from == "arr" && c.to == "x");
-        assert!(copy.is_some(), "Should have copy event arr → x");
+        // Find the transfer event arr → x (Move without TypeOracle)
+        let transfer = transfers.iter().find(|c| c.from == "arr" && c.context.target_name() == "x");
+        assert!(transfer.is_some(), "Should have transfer event arr → x");
 
         // Line 2 (0-indexed) is "        let x = arr;"
-        let copy = copy.unwrap();
-        assert_eq!(copy.line, 2, "Copy event should be at line 2 (0-indexed), not {}", copy.line);
+        let transfer = transfer.unwrap();
+        assert_eq!(transfer.line, 2, "Transfer event should be at line 2 (0-indexed), not {}", transfer.line);
     }
 
     #[test]
@@ -2084,7 +1984,9 @@ fn main() {
     }
 
     #[test]
-    fn test_println_macro_borrows_variable() {
+    fn test_macro_analysis_requires_type_oracle() {
+        // Macro analysis requires TypeOracle (semantic analysis from cargo project).
+        // Without TypeOracle, macros are silently skipped.
         let source = r#"
 fn main() {
     let msg = String::from("hello");
@@ -2094,37 +1996,18 @@ fn main() {
         let mut analyzer = OwnershipAnalyzer::new();
         let annotations = analyzer.analyze(source).unwrap();
 
-        // msg should be borrowed by println!, not moved
+        // Without TypeOracle, println! macro is not analyzed
+        // msg remains in its original state (no borrow detected)
         let borrow_ann = annotations.iter().find(|a| {
             a.binding == "msg" && matches!(a.state, BindingState::SharedBorrow { .. })
         });
-        assert!(borrow_ann.is_some(), "Should detect println! borrowing msg");
+        assert!(borrow_ann.is_none(), "Without TypeOracle, macro borrows are not detected");
 
-        // Original should be marked as shr (shared)
-        let shr_ann = annotations.iter().find(|a| {
-            a.binding == "msg" && matches!(a.state, BindingState::Shared { .. })
+        // msg should still be tracked as owned
+        let owned_ann = annotations.iter().find(|a| {
+            a.binding == "msg" && matches!(a.state, BindingState::Owned { .. })
         });
-        assert!(shr_ann.is_some(), "Original msg should be marked as shr");
-    }
-
-    #[test]
-    fn test_println_inline_format_args() {
-        // Test Rust 1.58+ inline format args: println!("{rect1:#?}")
-        let source = r#"
-struct Rect { w: i32, h: i32 }
-fn main() {
-    let rect1 = Rect { w: 10, h: 20 };
-    println!("Rect is {rect1:#?}");
-}
-"#;
-        let mut analyzer = OwnershipAnalyzer::new();
-        let annotations = analyzer.analyze(source).unwrap();
-
-        // rect1 should be borrowed by println! via inline format arg
-        let borrow_ann = annotations.iter().find(|a| {
-            a.binding == "rect1" && matches!(a.state, BindingState::SharedBorrow { .. })
-        });
-        assert!(borrow_ann.is_some(), "Should detect println! borrowing rect1 via inline format arg");
+        assert!(owned_ann.is_some(), "msg should be tracked as owned");
     }
 
     #[test]

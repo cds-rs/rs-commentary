@@ -16,4 +16,4 @@ mod transfers;
 pub use registry::{FunctionInfo, FunctionKind, FunctionRegistry};
 pub use calls::{CallKind, CallSite, detect_calls};
 pub use trace::FunctionView;
-pub use transfers::{analyze_call_transfers, analyze_method_call_transfers, CallTransfer, TransferKind};
+pub use transfers::{analyze_call_transfers, analyze_method_call_transfers, CallTransfer, TransferContext, TransferKind};

@@ -653,6 +653,8 @@ pub struct SetEntry {
     pub name: String,
     /// Whether it's mutable (for owned bindings)
     pub mutable: bool,
+    /// Whether the type implements Copy
+    pub is_copy: bool,
     /// Current state category
     pub state: SetEntryState,
     /// For borrows: name of the binding being borrowed
@@ -699,70 +701,77 @@ impl OwnershipSet {
     }
 
     /// Add an owned binding to the set.
-    pub fn add_owned(&mut self, name: String, mutable: bool) {
+    pub fn add_owned(&mut self, name: String, mutable: bool, is_copy: bool) {
         self.entries.push(SetEntry {
             name,
             mutable,
+            is_copy,
             state: SetEntryState::Owned,
             borrows_from: None,
         });
     }
 
     /// Add a shared (shr) binding - original being borrowed by &T.
-    pub fn add_shared(&mut self, name: String, mutable: bool, borrowed_by: Vec<String>) {
+    pub fn add_shared(&mut self, name: String, mutable: bool, is_copy: bool, borrowed_by: Vec<String>) {
         self.entries.push(SetEntry {
             name,
             mutable,
+            is_copy,
             state: SetEntryState::Shared { borrowed_by },
             borrows_from: None,
         });
     }
 
     /// Add a frozen (frz) binding - original with active &mut.
-    pub fn add_frozen(&mut self, name: String, mutable: bool, borrowed_by: String) {
+    pub fn add_frozen(&mut self, name: String, mutable: bool, is_copy: bool, borrowed_by: String) {
         self.entries.push(SetEntry {
             name,
             mutable,
+            is_copy,
             state: SetEntryState::Frozen { borrowed_by },
             borrows_from: None,
         });
     }
 
     /// Add a shared borrow binding.
-    pub fn add_shared_borrow(&mut self, name: String, borrows_from: String) {
+    pub fn add_shared_borrow(&mut self, name: String, is_copy: bool, borrows_from: String) {
         self.entries.push(SetEntry {
             name,
             mutable: false,
+            is_copy,
             state: SetEntryState::SharedBorrow,
             borrows_from: Some(borrows_from),
         });
     }
 
     /// Add a mutable borrow binding.
-    pub fn add_mut_borrow(&mut self, name: String, borrows_from: String) {
+    pub fn add_mut_borrow(&mut self, name: String, is_copy: bool, borrows_from: String) {
         self.entries.push(SetEntry {
             name,
             mutable: false,
+            is_copy,
             state: SetEntryState::MutBorrow,
             borrows_from: Some(borrows_from),
         });
     }
 
     /// Add a moved binding (value transferred elsewhere).
-    pub fn add_moved(&mut self, name: String, to: Option<String>) {
+    pub fn add_moved(&mut self, name: String, is_copy: bool, to: Option<String>) {
         self.entries.push(SetEntry {
             name,
             mutable: false,
+            is_copy,
             state: SetEntryState::Moved { to },
             borrows_from: None,
         });
     }
 
     /// Add a dropped binding.
-    pub fn add_dropped(&mut self, name: String) {
+    pub fn add_dropped(&mut self, name: String, is_copy: bool) {
         self.entries.push(SetEntry {
             name,
             mutable: false,
+            is_copy,
             state: SetEntryState::Dropped,
             borrows_from: None,
         });
@@ -877,10 +886,10 @@ mod tests {
         let mut set = OwnershipSet::new("main".to_string(), 0);
         assert_eq!(format!("{}", set), "main{}");
 
-        set.add_owned("x".to_string(), true);
+        set.add_owned("x".to_string(), true, false);
         assert_eq!(format!("{}", set), "main{mut x}");
 
-        set.add_shared_borrow("r".to_string(), "x".to_string());
+        set.add_shared_borrow("r".to_string(), false, "x".to_string());
         // After adding borrow, x should become shr, but we test the add methods here
         assert_eq!(format!("{}", set), "main{mut x, r(&x)}");
     }
@@ -888,13 +897,13 @@ mod tests {
     #[test]
     fn test_ownership_set_shr_frz() {
         let mut set = OwnershipSet::new("main".to_string(), 0);
-        set.add_shared("x".to_string(), true, vec!["r".to_string()]);
-        set.add_shared_borrow("r".to_string(), "x".to_string());
+        set.add_shared("x".to_string(), true, false, vec!["r".to_string()]);
+        set.add_shared_borrow("r".to_string(), false, "x".to_string());
         assert_eq!(format!("{}", set), "main{shr x (by r), r(&x)}");
 
         let mut set2 = OwnershipSet::new("main".to_string(), 0);
-        set2.add_frozen("x".to_string(), true, "r".to_string());
-        set2.add_mut_borrow("r".to_string(), "x".to_string());
+        set2.add_frozen("x".to_string(), true, false, "r".to_string());
+        set2.add_mut_borrow("r".to_string(), false, "x".to_string());
         assert_eq!(format!("{}", set2), "main{frz x (by r), r(&mut x)}");
     }
 }

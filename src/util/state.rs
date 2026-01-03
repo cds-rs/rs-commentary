@@ -934,6 +934,7 @@ mod tests {
         SetEntry {
             name: name.to_string(),
             mutable: false,
+            is_copy: false,
             state,
             borrows_from: None,
         }

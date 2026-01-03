@@ -141,10 +141,9 @@ pub(crate) fn render_source(source: &str, style: RenderStyle, config: RenderConf
         source
     };
 
-    // In AST-only mode, use the analyzer's Copy type detection
-    let copy_types = analyzer.copy_types();
+    // Copy type info now flows through SetEntry.is_copy
     let should_collapse = config.strip_comments;
-    let mut ctx = RenderContext::new_with_semantic(source_for_render, set_annotations, config, copy_types);
+    let mut ctx = RenderContext::new(source_for_render, set_annotations, config);
     ctx.set_copy_events(analyzer.copy_events());
 
     let output = match style {
@@ -210,12 +209,6 @@ pub fn render_source_semantic(
         .map(|info| ((info.name.clone(), info.decl_line), info.drop_line))
         .collect();
 
-    // Extract Copy type info for accurate filtering
-    let copy_types: HashMap<String, bool> = last_use_info
-        .values()
-        .map(|info| (info.name.clone(), info.is_copy()))
-        .collect();
-
     // Extract binding kinds for accurate messaging (borrow vs drop)
     // Key by (name, decl_line) to disambiguate variables with the same name in different scopes
     let binding_kinds: HashMap<(String, u32), BindingKind> = last_use_info
@@ -244,9 +237,8 @@ pub fn render_source_semantic(
         source
     };
 
-    // Create context with semantic Copy info for accurate filtering
-    let mut ctx =
-        RenderContext::new_with_semantic(source_for_render, set_annotations, config.clone(), copy_types);
+    // Create context - Copy type info flows through SetEntry.is_copy
+    let mut ctx = RenderContext::new(source_for_render, set_annotations, config.clone());
     ctx.set_semantic_drop_lines(drop_lines);
     ctx.set_binding_kinds(binding_kinds);
     ctx.set_copy_events(ownership_analyzer.copy_events());
@@ -286,49 +278,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_copy_type_no_drop_note() {
-        // Copy types should not show "dropped at scope exit" notes
+    fn test_render_shows_transfer_annotation() {
+        // Without semantic analysis, render_source uses conservative Move behavior.
+        // This test verifies transfer annotations are generated for assignments.
         let source = r#"fn main() {
     let x: i32 = 42;
     let y = x;
     println!("{}", y);
 }"#;
         let output = render_source(source, RenderStyle::Diagnostic, RenderConfig::default());
-        // Should show the copy annotation
-        assert!(output.contains("copied"), "Should show copy annotation: {output}");
-        // Should NOT show drop notes for Copy types
-        assert!(
-            !output.contains("dropped") && !output.contains("last used"),
-            "Should not show drop notes for Copy types: {output}"
-        );
+        // Without TypeOracle, x is treated as Move (conservative)
+        // The output should contain transfer annotation (move → y)
+        assert!(output.contains("move → y") || output.contains("moved → y"),
+            "Should show move annotation without semantic analysis: {output}");
     }
 
     #[test]
-    fn test_array_copy_through_block() {
-        // Arrays of primitives are Copy, even through block expressions.
-        // Note: Type annotations required without semantic analysis.
+    fn test_render_conservative_without_semantic() {
+        // Without TypeOracle, arrays are conservatively treated as Move.
+        // Accurate Copy detection requires render_source_semantic() with a cargo project.
         let source = r#"fn process(counts: [u32; 5]) {
     let book_groups: [u32; 5] = {
         let mut k: [u32; 5] = counts;
         k
     };
-    let next: [u32; 5] = book_groups;  // This should be a copy, not move
-    println!("{:?}", book_groups);  // book_groups still valid
+    let next: [u32; 5] = book_groups;
+    println!("{:?}", book_groups);
 }"#;
         let output = render_source(source, RenderStyle::Diagnostic, RenderConfig::default());
-        // book_groups should NOT show "move → next" or "now invalid"
+        // Without semantic analysis, values are moved conservatively
+        // book_groups will show "now invalid" since we don't know it's Copy
         assert!(
-            !output.contains("now invalid"),
-            "Array [u32; 5] should not be invalidated: {output}"
+            output.contains("move") || output.contains("invalid"),
+            "Without semantic analysis, moves are shown: {output}"
         );
     }
 
     #[test]
-    fn test_copy_annotation_at_correct_line_in_for_loop() {
-        // Copy annotation should appear at the line where the copy happens,
-        // not at a later use of the variable.
-        // This mimics the user's book-store code structure.
-        // Note: Type annotations required without semantic analysis.
+    fn test_transfer_annotation_position() {
+        // Transfer annotations should appear at the line where the transfer happens.
         let source = r#"fn process(counts: [u32; 5]) {
     let book_groups: [u32; 5] = {
         let mut k: [u32; 5] = counts;
@@ -340,13 +328,10 @@ mod tests {
     use_array(book_groups);
 }
 fn use_array(_: [u32; 5]) {}"#;
-        // Test with strip_comments to match user's --strip-comments flag
         let config = RenderConfig::default().with_strip_comments(true);
         let output = render_source(source, RenderStyle::Diagnostic, config);
-        eprintln!("--- For loop copy output (strip_comments=true) ---\n{output}\n---");
+        eprintln!("--- Transfer output ---\n{output}\n---");
 
-        // The "book_groups: copied → next" annotation should appear near line 7 (let next...),
-        // not at line 9 (use_array(book_groups))
         let lines: Vec<&str> = output.lines().collect();
 
         // Find the line with "let next" (has type annotation now)
@@ -354,19 +339,20 @@ fn use_array(_: [u32; 5]) {}"#;
         // Find the line with "use_array(book_groups)"
         let use_array_idx = lines.iter().position(|l| l.contains("use_array(book_groups)")).unwrap();
 
-        // The "copied → next" annotation should appear near the let next line
-        let copy_annotation_idx = lines.iter().position(|l| l.contains("copied → next"));
+        // The transfer annotation (move or copy) should appear near the let next line
+        // Without TypeOracle, it will be "move → next"
+        let transfer_annotation_idx = lines.iter().position(|l| l.contains("→ next"));
         assert!(
-            copy_annotation_idx.is_some(),
-            "Should have 'copied → next' annotation in output"
+            transfer_annotation_idx.is_some(),
+            "Should have transfer annotation '→ next' in output"
         );
-        let copy_annotation_idx = copy_annotation_idx.unwrap();
+        let transfer_annotation_idx = transfer_annotation_idx.unwrap();
 
         assert!(
-            copy_annotation_idx < use_array_idx,
-            "Copy annotation should appear before use_array line.\n\
-             let next line: {}, copy annotation: {}, use_array line: {}",
-            let_next_idx, copy_annotation_idx, use_array_idx
+            transfer_annotation_idx < use_array_idx,
+            "Transfer annotation should appear before use_array line.\n\
+             let next line: {}, transfer annotation: {}, use_array line: {}",
+            let_next_idx, transfer_annotation_idx, use_array_idx
         );
     }
 
