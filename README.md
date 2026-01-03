@@ -128,22 +128,43 @@ Configure your editor to use `rs-commentary lsp` as a language server alongside 
 
 ## Architecture
 
+### Data Flow
+
+```
+Source ──► AST ──► AstIter ──► OwnershipAnalyzer ──► RenderContext ──► Renderers
+                      │              │
+                      │         TypeOracle ◄──► rust-analyzer
+                      │              │
+                      ▼              ▼
+                   Events      TransferEvents
+                  (EnterFn,    (FnArg, MacroArg,
+                   Expr,        LetBinding)
+                   Pat...)
+```
+
+**Key principles:**
+- **Event-first**: All AST access through AstIter events
+- **TypeOracle**: Single source of truth for type queries (Copy, scalar, macro expansion)
+- **Unified transfers**: Function calls, macros, and let bindings use same TransferEvent model
+
+### Source Layout
+
 ```
 src/
 ├── analysis/       # Ownership analysis engine
-│   ├── engine/     # Core analyzer (split into modules)
-│   │   ├── mod.rs  # OwnershipAnalyzer, state machine application
-│   │   └── macros.rs # Format macro analysis (println!, format!, etc.)
-│   ├── semantic.rs # rust-analyzer integration for NLL drops
-│   └── state.rs    # Binding states and transitions
+│   ├── engine/     # Core analyzer (event-driven)
+│   │   ├── mod.rs  # OwnershipAnalyzer processes AstIter events
+│   │   └── macros.rs # Macro borrow recording via rust-analyzer expansion
+│   ├── semantic.rs # rust-analyzer integration (TypeOracle, NLL drops)
+│   └── state.rs    # BindingState transitions, Capabilities
 ├── output/         # Rendering
 │   ├── renderers/  # Each output style (html, inline, columnar, etc.)
-│   ├── context.rs  # RenderContext with StateTimeline
+│   ├── context.rs  # RenderContext aggregates annotations
 │   └── helpers.rs  # Shared annotation utilities
 ├── util/
 │   ├── ast_visitor.rs # AstIter: lazy iterator over AST events
-│   └── state.rs       # StateTimeline: single source of truth for state
-├── execution/      # Call analysis (function registry, call detection)
+│   └── state.rs       # StateTimeline: time-traveling state queries
+├── execution/      # Call analysis (function registry, transfers)
 └── lsp/            # LSP server implementation
 ```
 

@@ -59,27 +59,69 @@
 //!
 //! ## Architecture
 //!
+//! ### Data Flow
+//!
 //! ```text
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │  Command Line Interface (CLI)                                │
-//! │    rs-commentary annotate file.rs --style=diagnostic        │
-//! ├─────────────────────────────────────────────────────────────┤
-//! │  Output Layer (output/)                                     │
-//! │    Pluggable renderers: diagnostic, inline, html, etc.      │
-//! ├─────────────────────────────────────────────────────────────┤
-//! │  Utilities (util/)                                          │
-//! │    AstIter - lazy iterator over AST events                  │
-//! │    StateTimeline - time-traveling state queries             │
-//! ├─────────────────────────────────────────────────────────────┤
-//! │  Analysis Engine (analysis/)                                │
-//! │    OwnershipAnalyzer - AST visitor, state machine           │
-//! │    SemanticAnalyzer - rust-analyzer integration             │
-//! │    BindingState - state transitions                         │
-//! ├─────────────────────────────────────────────────────────────┤
-//! │  rust-analyzer (ra_ap_*)                                    │
-//! │    Parsing, type inference, Copy detection, drop points     │
-//! └─────────────────────────────────────────────────────────────┘
+//!                              ┌─────────────┐
+//!                              │ Source File │
+//!                              └──────┬──────┘
+//!                                     │ parse
+//!                                     ▼
+//!                              ┌─────────────┐
+//!                              │     AST     │
+//!                              └──────┬──────┘
+//!                                     │
+//!                    ┌────────────────┼────────────────┐
+//!                    │                │                │
+//!                    ▼                ▼                ▼
+//!             ┌───────────┐    ┌───────────┐    ┌───────────┐
+//!             │  AstIter  │    │TypeOracle │    │ Semantics │
+//!             │  events   │◄───│  queries  │───►│(ra-ap-ide)│
+//!             └─────┬─────┘    └───────────┘    └───────────┘
+//!                   │               ▲
+//!                   │ EnterFn,      │ is_copy?
+//!                   │ Expr,         │ is_scalar?
+//!                   │ Pat, ...      │ expand_macro?
+//!                   ▼               │
+//!             ┌─────────────────────┴─────┐
+//!             │    OwnershipAnalyzer      │
+//!             │  • process(event)         │
+//!             │  • state machine          │
+//!             │  • TransferEvent emission │
+//!             └───────────┬───────────────┘
+//!                         │
+//!          ┌──────────────┼──────────────┐
+//!          │              │              │
+//!          ▼              ▼              ▼
+//!    ┌──────────┐  ┌─────────────┐  ┌──────────┐
+//!    │   Set    │  │  Transfer   │  │  State   │
+//!    │Annotation│  │   Events    │  │ Timeline │
+//!    └────┬─────┘  └──────┬──────┘  └────┬─────┘
+//!         │               │              │
+//!         └───────────────┼──────────────┘
+//!                         │
+//!                         ▼
+//!                  ┌─────────────┐
+//!                  │RenderContext│
+//!                  └──────┬──────┘
+//!                         │
+//!         ┌───────────────┼───────────────┐
+//!         ▼               ▼               ▼
+//!    ┌─────────┐    ┌──────────┐    ┌─────────┐
+//!    │Diagnostic│   │   HTML   │    │ Inline  │
+//!    │ Renderer │   │ Renderer │    │Renderer │
+//!    └─────────┘    └──────────┘    └─────────┘
 //! ```
+//!
+//! ### Key Components
+//!
+//! | Component | Role |
+//! |-----------|------|
+//! | **AstIter** | Lazy iterator yielding typed AST events |
+//! | **TypeOracle** | Single source of truth for type queries (Copy, scalar, macro expansion) |
+//! | **OwnershipAnalyzer** | Event-driven state machine, emits annotations |
+//! | **TransferEvent** | Unified model for value transfers (fn args, macros, let bindings) |
+//! | **RenderContext** | Aggregates annotations for renderer consumption |
 //!
 //! ## Usage
 //!
