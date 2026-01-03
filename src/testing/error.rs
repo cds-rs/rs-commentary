@@ -72,6 +72,8 @@ impl FnTestResult {
 pub struct FileTestResult {
     /// Path to the fixture file.
     pub path: PathBuf,
+    /// Module documentation (//! comments) - shown on failure.
+    pub module_doc: Option<String>,
     /// Results for each function in the file.
     pub functions: Vec<FnTestResult>,
 }

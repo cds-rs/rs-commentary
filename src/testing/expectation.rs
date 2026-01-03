@@ -155,6 +155,10 @@ impl ExpectationSet {
     pub fn parse(source: &str) -> (Self, Vec<ParseError>) {
         let mut set = ExpectationSet::new();
         let mut errors = Vec::new();
+        let lines: Vec<&str> = source.lines().collect();
+
+        // Track the last line that had code (for continuation detection)
+        let mut last_code_line: Option<u32> = None;
 
         // Parse source with rust-analyzer
         let parse = SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021);
@@ -172,11 +176,29 @@ impl ExpectationSet {
             // Get 0-indexed line number from byte offset (matches analyzer's line numbers)
             let line_num = byte_offset_to_line(source, range.start().into());
 
+            // Check if this comment is on a line by itself (continuation line)
+            let is_continuation_line = is_comment_only_line(&lines, line_num);
+
             // Extract the part after "//~"
             let after_marker = &text[3..]; // Skip "//~"
 
-            // Determine target line based on offset markers (^)
-            let (target_line, expectation_text) = parse_line_offset(after_marker, line_num);
+            // Determine target line based on offset markers (^) or continuation
+            let (target_line, expectation_text) = if is_continuation_line && !after_marker.trim_start().starts_with('^') {
+                // Bare continuation: applies to last code line
+                if let Some(last) = last_code_line {
+                    (last, after_marker.trim())
+                } else {
+                    // No previous code line, use current
+                    parse_line_offset(after_marker, line_num)
+                }
+            } else {
+                parse_line_offset(after_marker, line_num)
+            };
+
+            // Update last_code_line if this comment is inline with code
+            if !is_continuation_line {
+                last_code_line = Some(line_num);
+            }
 
             // Parse the expectation content
             match parse_expectation_content(expectation_text.trim(), target_line) {
@@ -209,6 +231,17 @@ impl ExpectationSet {
 /// Check if a token is a `//~` expectation comment.
 fn is_expectation_comment(token: &SyntaxToken) -> bool {
     token.kind() == SyntaxKind::COMMENT && token.text().starts_with("//~")
+}
+
+/// Check if a line contains only a comment (no code).
+fn is_comment_only_line(lines: &[&str], line_num: u32) -> bool {
+    if let Some(line) = lines.get(line_num as usize) {
+        let trimmed = line.trim();
+        // Line is comment-only if it starts with // (after trimming whitespace)
+        trimmed.starts_with("//")
+    } else {
+        false
+    }
 }
 
 /// Convert byte offset to 0-indexed line number.
@@ -412,5 +445,25 @@ fn test() {
         let line2 = set.get(2).unwrap();
         assert_eq!(line2.len(), 1);
         assert_eq!(line2[0].var, "x");
+    }
+
+    #[test]
+    fn test_parse_continuation_line() {
+        let source = r#"
+fn test() {
+    let y = &mut x;             //~ y: ref_mut
+                                //~ x: frozen
+}
+"#;
+        let (set, errors) = ExpectationSet::parse(source);
+        assert!(errors.is_empty(), "errors: {:?}", errors);
+
+        // Both expectations should apply to line 2 (the let y line)
+        let line2 = set.get(2).unwrap();
+        assert_eq!(line2.len(), 2);
+        assert_eq!(line2[0].var, "y");
+        assert_eq!(line2[0].state, Some(ExpectedState::RefMut));
+        assert_eq!(line2[1].var, "x");
+        assert_eq!(line2[1].state, Some(ExpectedState::Frozen));
     }
 }

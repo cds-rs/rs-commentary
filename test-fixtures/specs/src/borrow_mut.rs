@@ -6,14 +6,9 @@
 //! - Freezes owner to `frozen` state (no access until borrow ends)
 //! - Only one mutable borrow allowed at a time
 
-fn creates_ref_mut_binding() {
-    let mut x = String::new();  //~ x: owned_mut
-    let y = &mut x;             //~ y: ref_mut
-    let _ = y;
-}
-
 fn freezes_owner() {
     let mut x = String::new();  //~ x: owned_mut
-    let y = &mut x;             //~ y: ref_mut, x: frozen
+    let y = &mut x;             //~ y: ref_mut
+                                //~ x: frozen
     let _ = y;
 }

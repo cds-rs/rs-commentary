@@ -44,6 +44,31 @@ use crate::output::{RenderContext, RenderConfig};
 use crate::util::VarSnapshot;
 use matcher::{states_match, MatchResult};
 
+/// Extract module documentation (//! comments) from source.
+fn extract_module_doc(source: &str) -> Option<String> {
+    let mut doc_lines = Vec::new();
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//!") {
+            // Extract content after //!
+            let content = trimmed.strip_prefix("//!").unwrap_or("");
+            // Remove leading space if present
+            let content = content.strip_prefix(' ').unwrap_or(content);
+            doc_lines.push(content.to_string());
+        } else if !trimmed.is_empty() && !trimmed.starts_with("//") {
+            // Stop at first non-doc, non-comment line
+            break;
+        }
+    }
+
+    if doc_lines.is_empty() {
+        None
+    } else {
+        Some(doc_lines.join("\n"))
+    }
+}
+
 /// A test function discovered in a fixture file.
 #[derive(Debug)]
 pub struct FnTestCase {
@@ -156,6 +181,9 @@ pub fn verify_source_with_analyzer(
     source: &str,
     analyzer: &SemanticAnalyzer,
 ) -> Result<FileTestResult, VerificationError> {
+    // Extract module documentation for failure context
+    let module_doc = extract_module_doc(source);
+
     // Discover test functions
     let test_cases = discover_test_functions(source);
 
@@ -163,6 +191,7 @@ pub fn verify_source_with_analyzer(
         // No test functions with expectations - return empty result
         return Ok(FileTestResult {
             path: path.to_path_buf(),
+            module_doc,
             functions: vec![],
         });
     }
@@ -208,6 +237,7 @@ pub fn verify_source_with_analyzer(
 
     let result = FileTestResult {
         path: path.to_path_buf(),
+        module_doc,
         functions: fn_results,
     };
 
@@ -349,24 +379,45 @@ fn check_expectation(
 /// Format test results for display.
 pub fn format_results(result: &FileTestResult) -> String {
     let mut output = String::new();
-    output.push_str(&format!("{}\n", result.path.display()));
+
+    // Use filename as suite name
+    let suite_name = result
+        .path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown");
+    output.push_str(&format!("{}\n", suite_name));
+
+    let has_failures = result.functions.iter().any(|f| !f.passed());
 
     for func in &result.functions {
         if func.passed() {
-            output.push_str(&format!("  \u{2713} {}\n", func.name));
+            output.push_str(&format!("  ✓ {}\n", func.name));
         } else {
-            output.push_str(&format!("  \u{2717} {}\n", func.name));
+            output.push_str(&format!("  ✗ {}\n", func.name));
+
+            // Show module doc as context for failure
+            if let Some(doc) = &result.module_doc {
+                output.push_str("\n");
+                for line in doc.lines() {
+                    output.push_str(&format!("    {}\n", line));
+                }
+                output.push_str("\n");
+            }
+
             for failure in &func.failures {
-                output.push_str(&format!("      {}\n", failure));
+                output.push_str(&format!("    {}\n", failure));
             }
         }
     }
 
-    output.push_str(&format!(
-        "\n{} passed, {} failed\n",
-        result.pass_count(),
-        result.fail_count()
-    ));
+    if !has_failures {
+        output.push_str(&format!(
+            "\n{} passed, {} failed\n",
+            result.pass_count(),
+            result.fail_count()
+        ));
+    }
 
     output
 }

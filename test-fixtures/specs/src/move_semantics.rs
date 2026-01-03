@@ -6,14 +6,9 @@
 //! - Target becomes new owner
 //! - Applies to non-Copy types only
 
-fn invalidates_source_binding() {
-    let x = String::new();      //~ x: owned
-    let y = x;                  //~ y: owned, x: moved
-    let _ = y;
-}
-
-fn target_becomes_owner() {
+fn invalidates_source() {
     let x = String::new();      //~ x: owned
     let y = x;                  //~ y: owned
+                                //~ x: moved
     let _ = y;
 }
