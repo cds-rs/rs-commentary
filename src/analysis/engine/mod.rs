@@ -148,6 +148,8 @@ pub struct OwnershipAnalyzer<'oracle> {
     nll_borrow_ends: HashMap<(String, u32), u32>,
     /// Track which borrows have already been ended (to avoid duplicate events)
     ended_borrows: std::collections::HashSet<(String, u32)>,
+    /// Current for-loop expression (for iterator borrow tracking)
+    current_for_expr: Option<ast::ForExpr>,
 }
 
 impl<'oracle> OwnershipAnalyzer<'oracle> {
@@ -188,6 +190,7 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
             type_oracle: None,
             nll_borrow_ends: HashMap::new(),
             ended_borrows: std::collections::HashSet::new(),
+            current_for_expr: None,
         }
     }
 
@@ -709,6 +712,8 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
             AstEvent::EnterFor(for_expr) => {
                 // For loops create their own scope
                 self.enter_scope();
+                // Store the for_expr for iterator borrow tracking
+                self.current_for_expr = Some(for_expr.clone());
                 // Process the iterable before the loop scope
                 if let Some(iterable) = for_expr.iterable() {
                     self.process_expr(&iterable);
@@ -716,6 +721,7 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
             }
 
             AstEvent::ExitFor => {
+                self.current_for_expr = None;
                 self.exit_scope();
             }
 
@@ -909,8 +915,11 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
         } else if let Some(let_stmt) = self.let_stmt_stack.pop() {
             // This is a let binding - use the full let statement context
             self.handle_let_binding(pat, &let_stmt);
+        } else if self.current_for_expr.is_some() {
+            // For-loop pattern - check for iterator borrows
+            self.handle_for_loop_pat(pat, is_mut);
         } else {
-            // For/match pattern or other context
+            // Match pattern or other context
             self.visit_pat(pat, is_mut);
         }
     }
@@ -1027,6 +1036,121 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
         }
 
         self.snapshot_set(u32::from(let_stmt.syntax().text_range().end()));
+    }
+
+    /// Handle a for-loop pattern, checking for iterator borrows.
+    ///
+    /// For `for x in collection.iter()`, if `x` is `&T`, mark collection as `shared`.
+    /// For `for x in collection.iter_mut()`, if `x` is `&mut T`, mark collection as `frozen`.
+    fn handle_for_loop_pat(&mut self, pat: &ast::Pat, is_mut: bool) {
+        use super::BindingKind;
+
+        // Only handle IdentPat for now
+        let ast::Pat::IdentPat(ident_pat) = pat else {
+            self.visit_pat(pat, is_mut);
+            return;
+        };
+
+        // Try to get binding kind from type oracle
+        let binding_kind = self.type_oracle.as_ref().and_then(|oracle| oracle.binding_kind(ident_pat));
+
+        // If it's a reference type, try to find and mark the source collection
+        if let Some(kind) = binding_kind {
+            if matches!(kind, BindingKind::SharedRef | BindingKind::MutRef) {
+                // Try to extract the source collection from the iterable
+                if let Some(for_expr) = &self.current_for_expr.clone() {
+                    if let Some(source_id) = self.extract_iterator_source(for_expr) {
+                        let range = pat.syntax().text_range();
+                        let loop_var_name = ident_pat.name().map(|n| n.text().to_string()).unwrap_or_default();
+
+                        // Create the loop variable as a borrow binding
+                        let borrow_id = BindingId(self.next_binding_id);
+                        self.next_binding_id += 1;
+                        let decl_line = self.offset_to_line(range.start().into());
+
+                        let state = if kind == BindingKind::MutRef {
+                            BindingState::MutBorrow { from: source_id }
+                        } else {
+                            BindingState::SharedBorrow { from: source_id }
+                        };
+
+                        self.bindings.insert(borrow_id, BindingInfo {
+                            name: loop_var_name.clone(),
+                            scope: self.current_scope,
+                            is_mutable: is_mut || ident_pat.mut_token().is_some(),
+                            is_copy: true, // References are Copy
+                            is_scalar: false,
+                            decl_line,
+                            current_state: state,
+                        });
+
+                        // Register in current scope
+                        if let Some(scope) = self.scopes.get_mut(&self.current_scope) {
+                            scope.bindings.push(borrow_id);
+                        }
+
+                        // Mark the source as shared or frozen
+                        let event = if kind == BindingKind::MutRef {
+                            OwnershipEvent::MutBorrow { by: borrow_id }
+                        } else {
+                            OwnershipEvent::SharedBorrow { by: borrow_id }
+                        };
+                        self.apply_event(source_id, event);
+
+                        // Take snapshot
+                        self.snapshot_set(u32::from(range.end()));
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Fall back to normal pattern handling
+        self.visit_pat(pat, is_mut);
+    }
+
+    /// Extract the source collection from a for-loop iterable expression.
+    ///
+    /// Handles patterns like:
+    /// - `collection.iter()` / `collection.iter_mut()` -> collection
+    /// - `&collection` / `&mut collection` -> collection
+    fn extract_iterator_source(&self, for_expr: &ast::ForExpr) -> Option<BindingId> {
+        let iterable = for_expr.iterable()?;
+
+        match &iterable {
+            // Handle method calls like `a.iter()` or `a.iter_mut()`
+            ast::Expr::MethodCallExpr(method_call) => {
+                let receiver = method_call.receiver()?;
+                self.resolve_expr_to_binding(&receiver)
+            }
+            // Handle reference expressions like `&a` or `&mut a`
+            ast::Expr::RefExpr(ref_expr) => {
+                let inner = ref_expr.expr()?;
+                self.resolve_expr_to_binding(&inner)
+            }
+            // Handle direct path like `a` (into_iter, consumes)
+            ast::Expr::PathExpr(path_expr) => {
+                let (_, id, _) = self.resolve_path(path_expr)?;
+                Some(id)
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve an expression to a binding ID if it's a simple path.
+    fn resolve_expr_to_binding(&self, expr: &ast::Expr) -> Option<BindingId> {
+        match expr {
+            ast::Expr::PathExpr(path_expr) => {
+                let (_, id, _) = self.resolve_path(path_expr)?;
+                Some(id)
+            }
+            // Handle nested method calls like `a.iter().filter(...)`
+            ast::Expr::MethodCallExpr(method_call) => {
+                let receiver = method_call.receiver()?;
+                self.resolve_expr_to_binding(&receiver)
+            }
+            _ => None,
+        }
     }
 
     /// Process an expression (for state tracking).

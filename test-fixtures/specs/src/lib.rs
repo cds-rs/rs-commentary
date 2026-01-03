@@ -7,6 +7,7 @@ mod borrow_shared;
 mod borrow_mut;
 mod copy_types;
 mod drop_nll;
+mod iterators;
 mod move_semantics;
 
 // Helper modules (not tests)

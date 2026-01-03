@@ -26,3 +26,10 @@ fn non_copy_struct_moves() {
     let _ = y;
     //~ !x
 }
+
+fn copy_into_call_does_not_invalidate_source() {
+    fn takes(_: [u32; 5]) {}
+    let x = [1u32; 5];                //~ x: owned
+    takes(x);
+    let _ = x;                        //~ x: owned
+}

@@ -32,4 +32,8 @@ pub trait TypeOracle {
     /// Check if the binding is a scalar primitive (i32, usize, bool, etc.).
     /// Used for noise filtering in function call annotations.
     fn is_scalar(&self, pat: &ast::IdentPat) -> Option<bool>;
+
+    /// Get the binding kind (owned/copy/reference) for this pattern.
+    /// Used for iterator variable tracking in for-loops.
+    fn binding_kind(&self, pat: &ast::IdentPat) -> Option<BindingKind>;
 }

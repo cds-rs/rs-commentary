@@ -913,6 +913,36 @@ impl TypeOracle for SemanticTypeOracle<'_> {
                 | "()"
         ))
     }
+
+    fn binding_kind(&self, pat: &ast::IdentPat) -> Option<BindingKind> {
+        let db = self.host.raw_database();
+        let sema = Semantics::new(db);
+
+        // Parse the file through Semantics
+        let file = sema.parse_guess_edition(self.file_id);
+
+        // Find the corresponding IdentPat by offset
+        let offset = pat.syntax().text_range().start();
+        let sema_pat: ast::IdentPat = sema.find_node_at_offset_with_descend(file.syntax(), offset)?;
+
+        // Get the type
+        let ty = sema.type_of_binding_in_pat(&sema_pat)?;
+
+        // Check reference types first
+        if ty.is_mutable_reference() {
+            return Some(BindingKind::MutRef);
+        }
+        if ty.is_reference() {
+            return Some(BindingKind::SharedRef);
+        }
+
+        // For non-reference types, check Copy
+        if ty.is_copy(db) {
+            Some(BindingKind::OwnedCopy)
+        } else {
+            Some(BindingKind::OwnedMove)
+        }
+    }
 }
 
 impl SemanticAnalyzer {

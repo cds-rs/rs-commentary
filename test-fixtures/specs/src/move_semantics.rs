@@ -22,3 +22,12 @@ fn move_from_mut_owner_is_still_move() {
     let _ = y;
     //~ !x
 }
+
+// ASPIRATIONAL: move tracking through function calls not yet implemented
+#[allow(unused_variables)]
+fn move_into_call_invalidates_source() {
+    fn takes(_: String) {}
+    let x = String::from("hi");       //~ x: owned
+    takes(x);
+    // TODO: should be: x: moved, !x
+}
