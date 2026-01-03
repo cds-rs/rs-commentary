@@ -264,10 +264,11 @@ impl<'a> RenderContext<'a> {
         // by looking for the closest decl_line <= line
         let mut best_match: Option<(u32, BindingKind)> = None;
         for ((n, decl_line), kind) in &self.semantic_binding_kinds {
-            if n == name && *decl_line <= line {
-                if best_match.map_or(true, |(best_line, _)| *decl_line > best_line) {
-                    best_match = Some((*decl_line, *kind));
-                }
+            if n == name
+                && *decl_line <= line
+                && best_match.is_none_or(|(best_line, _)| *decl_line > best_line)
+            {
+                best_match = Some((*decl_line, *kind));
             }
         }
         best_match.map(|(_, kind)| kind)
@@ -302,16 +303,17 @@ impl<'a> RenderContext<'a> {
         let mut best_decl_line: u32 = 0;
 
         for ((n, decl_line), drop_line) in &self.semantic_drop_lines {
-            if n == name && *decl_line <= after_line {
-                if best_drop_line.is_none() || *decl_line > best_decl_line {
-                    best_drop_line = Some(*drop_line);
-                    best_decl_line = *decl_line;
-                }
+            if n == name
+                && *decl_line <= after_line
+                && (best_drop_line.is_none() || *decl_line > best_decl_line)
+            {
+                best_drop_line = Some(*drop_line);
+                best_decl_line = *decl_line;
             }
         }
 
         // If drop_line <= after_line + 1, the variable is dead after after_line
-        best_drop_line.map_or(false, |drop_line| drop_line <= after_line + 1)
+        best_drop_line.is_some_and(|drop_line| drop_line <= after_line + 1)
     }
 
     /// Get state changes for a line, filtering out variables that have copy events.

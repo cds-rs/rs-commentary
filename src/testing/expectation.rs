@@ -262,10 +262,10 @@ fn parse_line_offset(text: &str, current_line: u32) -> (u32, &str) {
         let target = current_line.saturating_sub(caret_count as u32);
         let remaining = &trimmed[caret_count..];
         (target, remaining)
-    } else if trimmed.starts_with('|') {
+    } else if let Some(rest) = trimmed.strip_prefix('|') {
         // Continuation: same as previous line (use current - 1 as approximation)
         // In practice, this would need context, but for simplicity we use current line
-        (current_line, &trimmed[1..])
+        (current_line, rest)
     } else {
         // No offset: applies to current line
         (current_line, trimmed)
@@ -301,8 +301,8 @@ fn parse_single_expectation(text: &str, line: u32) -> Result<Expectation, ParseE
     let text = text.trim();
 
     // Check for negation
-    if text.starts_with('!') {
-        let var = text[1..].trim();
+    if let Some(rest) = text.strip_prefix('!') {
+        let var = rest.trim();
         if var.is_empty() {
             return Err(ParseError::MissingVariable { line });
         }

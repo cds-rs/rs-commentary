@@ -42,7 +42,7 @@ use ra_ap_syntax::{AstNode, SourceFile};
 use crate::analysis::{OwnershipAnalyzer, SemanticAnalyzer, SemanticResult};
 use crate::output::{RenderContext, RenderConfig};
 use crate::util::VarSnapshot;
-use matcher::{states_match, MatchResult};
+use matcher::{is_not_live, states_match, MatchResult};
 
 /// Extract module documentation (//! comments) from source.
 fn extract_module_doc(source: &str) -> Option<String> {
@@ -207,12 +207,22 @@ pub fn verify_source_with_analyzer(
         .map(|info| (info.name.clone(), info.is_copy()))
         .collect();
 
+    // Extract NLL borrow ends: reference bindings with their drop lines
+    // Key by (name, decl_line) to avoid collisions across functions
+    use crate::analysis::BindingKind;
+    let nll_borrow_ends: HashMap<(String, u32), u32> = last_use_info
+        .values()
+        .filter(|info| matches!(info.kind, BindingKind::SharedRef | BindingKind::MutRef))
+        .map(|info| ((info.name.clone(), info.decl_line), info.drop_line))
+        .collect();
+
     // Create type oracle for analysis
     let type_oracle = analyzer.type_oracle(file_id);
 
-    // Run ownership analysis
+    // Run ownership analysis with NLL info
     let mut ownership_analyzer = OwnershipAnalyzer::new();
     ownership_analyzer.set_type_oracle(&type_oracle);
+    ownership_analyzer.set_nll_borrow_ends(nll_borrow_ends);
     ownership_analyzer
         .analyze(source)
         .map_err(|e| VerificationError::AnalysisFailed(format!("Analysis failed: {:?}", e)))?;
@@ -344,7 +354,9 @@ fn check_expectation(
 
     if exp.negated {
         // Negative assertion: variable should NOT be live
+        // A variable is "not live" if: not found, moved, or dropped
         match actual {
+            Some(v) if is_not_live(&v.state) => MatchResult::Match,
             Some(v) => MatchResult::UnexpectedVariable {
                 var: exp.var.clone(),
                 actual: v.state.clone(),
@@ -398,11 +410,11 @@ pub fn format_results(result: &FileTestResult) -> String {
 
             // Show module doc as context for failure
             if let Some(doc) = &result.module_doc {
-                output.push_str("\n");
+                output.push('\n');
                 for line in doc.lines() {
                     output.push_str(&format!("    {}\n", line));
                 }
-                output.push_str("\n");
+                output.push('\n');
             }
 
             for failure in &func.failures {

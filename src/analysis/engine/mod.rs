@@ -29,6 +29,8 @@ pub struct BindingInfo {
     /// True if this is a scalar primitive (i32, usize, bool, etc.)
     /// Used for noise suppression in function call annotations.
     pub is_scalar: bool,
+    /// Line where this binding was declared (0-indexed).
+    pub decl_line: u32,
     pub current_state: BindingState,
 }
 
@@ -141,6 +143,11 @@ pub struct OwnershipAnalyzer<'oracle> {
     semantic_scalar_types: HashMap<u32, bool>,
     /// Type oracle for on-demand type queries (optional, from rust-analyzer)
     type_oracle: Option<&'oracle dyn TypeOracle>,
+    /// NLL drop info for reference bindings: (name, decl_line) -> drop_line
+    /// When we reach drop_line, we should end the borrow and restore the source.
+    nll_borrow_ends: HashMap<(String, u32), u32>,
+    /// Track which borrows have already been ended (to avoid duplicate events)
+    ended_borrows: std::collections::HashSet<(String, u32)>,
 }
 
 impl<'oracle> OwnershipAnalyzer<'oracle> {
@@ -179,7 +186,18 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
             semantic_copy_types: HashMap::new(),
             semantic_scalar_types: HashMap::new(),
             type_oracle: None,
+            nll_borrow_ends: HashMap::new(),
+            ended_borrows: std::collections::HashSet::new(),
         }
+    }
+
+    /// Set NLL borrow end info from semantic analysis.
+    ///
+    /// For each reference binding (keyed by name and decl_line), provides
+    /// the line where the borrow ends. The source variable is determined
+    /// from the binding's state during analysis.
+    pub fn set_nll_borrow_ends(&mut self, borrow_ends: HashMap<(String, u32), u32>) {
+        self.nll_borrow_ends = borrow_ends;
     }
 
     /// Set the type oracle for on-demand type queries.
@@ -282,6 +300,10 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
     /// Generate an ownership set snapshot at the given byte offset.
     fn snapshot_set(&mut self, offset: u32) {
         let line = self.offset_to_line(offset);
+
+        // Check for NLL borrow endings before taking snapshot
+        self.process_nll_borrow_ends(line);
+
         let mut set = OwnershipSet::new(self.current_fn_name.clone(), line);
 
         // Collect all live bindings in current scope chain
@@ -371,12 +393,14 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
         let id = BindingId(self.next_binding_id);
         self.next_binding_id += 1;
 
+        let decl_line = self.offset_to_line(range.start().into());
         let info = BindingInfo {
             name: name.clone(),
             scope: self.current_scope,
             is_mutable,
             is_copy,
             is_scalar,
+            decl_line,
             current_state: BindingState::Owned { mutable: is_mutable },
         };
 
@@ -424,12 +448,14 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
             .map(|b| b.name.clone())
             .unwrap_or_else(|| "?".to_string());
 
+        let decl_line = self.offset_to_line(range.start().into());
         let info = BindingInfo {
             name: name.clone(),
             scope: self.current_scope,
             is_mutable,
             is_copy: true, // References are Copy
             is_scalar: false, // References are not scalars
+            decl_line,
             current_state: state.clone(),
         };
 
@@ -469,9 +495,24 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
     /// Exit the current scope, dropping all bindings in it.
     pub fn exit_scope(&mut self) {
         if let Some(scope) = self.scopes.get(&self.current_scope).cloned() {
+            // First, collect sources that need to be restored when borrows exit scope
+            let sources_to_restore: Vec<BindingId> = scope.bindings
+                .iter()
+                .filter_map(|binding_id| {
+                    self.bindings
+                        .get(binding_id)
+                        .and_then(|b| b.current_state.borrow_source())
+                })
+                .collect();
+
             // Apply ScopeExit event to all bindings in this scope
             for binding_id in &scope.bindings {
                 self.apply_event(*binding_id, OwnershipEvent::ScopeExit);
+            }
+
+            // Restore sources that were borrowed by bindings in this scope
+            for source_id in sources_to_restore {
+                self.apply_event(source_id, OwnershipEvent::AllBorrowsEnd);
             }
 
             // Move to parent scope
@@ -712,7 +753,7 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
             }
 
             AstEvent::CallArg { arg, call_target } => {
-                self.process_call_arg(arg, &call_target);
+                self.process_call_arg(arg, call_target);
             }
 
             AstEvent::MethodReceiver { receiver, method_call } => {
@@ -990,24 +1031,22 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
 
     /// Process an expression (for state tracking).
     fn process_expr(&mut self, expr: &ast::Expr) {
-        match expr {
-            ast::Expr::RefExpr(ref_expr) => {
-                let is_mut = ref_expr.mut_token().is_some();
-                if let Some(ast::Expr::PathExpr(path_expr)) = ref_expr.expr() {
-                    if let Some((_name, binding_id, _)) = self.resolve_path(&path_expr) {
-                        let range = expr.syntax().text_range();
-                        if is_mut {
-                            self.record_mut_borrow(binding_id, range);
-                        } else {
-                            self.record_shared_borrow(binding_id, range);
-                        }
+        // Handle reference expressions for borrow tracking
+        if let ast::Expr::RefExpr(ref_expr) = expr {
+            let is_mut = ref_expr.mut_token().is_some();
+            if let Some(ast::Expr::PathExpr(path_expr)) = ref_expr.expr() {
+                if let Some((_name, binding_id, _)) = self.resolve_path(&path_expr) {
+                    let range = expr.syntax().text_range();
+                    if is_mut {
+                        self.record_mut_borrow(binding_id, range);
+                    } else {
+                        self.record_shared_borrow(binding_id, range);
                     }
                 }
             }
-            // Other expression types don't need special handling in process_expr;
-            // they're handled by the iterator's traversal or by CallArg/MethodReceiver events
-            _ => {}
         }
+        // Other expression types don't need special handling in process_expr;
+        // they're handled by the iterator's traversal or by CallArg/MethodReceiver events
     }
 
     /// Handle `&x` passed to function call.
@@ -1154,6 +1193,7 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
         let id = BindingId(self.next_binding_id);
         self.next_binding_id += 1;
 
+        let decl_line = self.offset_to_line(range.start().into());
         let is_copy = type_str.map(|t| self.is_copy_type(t)).unwrap_or(false);
         let info = BindingInfo {
             name: name_str.clone(),
@@ -1161,6 +1201,7 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
             is_mutable: ident_pat.mut_token().is_some(),
             is_copy,
             is_scalar: false, // Function params default to non-scalar (conservative)
+            decl_line,
             current_state: state.clone(),
         };
 
@@ -1266,6 +1307,61 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
     // NLL and Call Handling
     // ========================================================================
 
+    /// Process NLL borrow endings based on semantic last-use data.
+    ///
+    /// For each reference binding that should end at or before `current_line`,
+    /// emit events to end the borrow and restore the source variable.
+    fn process_nll_borrow_ends(&mut self, current_line: u32) {
+        if self.nll_borrow_ends.is_empty() {
+            return;
+        }
+
+        // Collect borrows that should end at this line
+        // Key is (name, decl_line), value is drop_line
+        let borrows_to_end: Vec<(String, u32)> = self.nll_borrow_ends
+            .iter()
+            .filter(|(key, drop_line)| {
+                **drop_line <= current_line && !self.ended_borrows.contains(*key)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        for (borrow_name, decl_line) in borrows_to_end {
+            // Find the borrow binding by name AND decl_line
+            let borrow_info: Option<(BindingId, BindingId)> = self.bindings
+                .iter()
+                .find(|(_, b)| b.name == borrow_name && b.decl_line == decl_line)
+                .and_then(|(id, b)| {
+                    b.current_state.borrow_source().map(|from| (*id, from))
+                });
+
+            if let Some((borrow_id, source_id)) = borrow_info {
+                // Check if source is actually borrowed
+                let source_is_borrowed = self.bindings
+                    .get(&source_id)
+                    .map(|b| b.current_state.is_borrowed())
+                    .unwrap_or(false);
+
+                if source_is_borrowed {
+                    // End the borrow
+                    if let Some(borrow_binding) = self.bindings.get_mut(&borrow_id) {
+                        borrow_binding.current_state = BindingState::Dropped;
+                    }
+
+                    // Restore the source using AllBorrowsEnd
+                    if let Some(source_binding) = self.bindings.get_mut(&source_id) {
+                        let event = OwnershipEvent::AllBorrowsEnd;
+                        if let Ok(new_state) = source_binding.current_state.transition(event) {
+                            source_binding.current_state = new_state;
+                        }
+                    }
+
+                    self.ended_borrows.insert((borrow_name, decl_line));
+                }
+            }
+        }
+    }
+
     /// Handle a method call receiver, implementing NLL borrow ending.
     /// When we see x.method() and x is currently Shared/Frozen (due to a borrow),
     /// we know the borrow must have ended (NLL) if the method requires access.
@@ -1283,14 +1379,13 @@ impl<'oracle> OwnershipAnalyzer<'oracle> {
 
                 if is_borrowed {
                     // NLL: The method call means borrows have ended
-                    // Find all bindings that are SharedBorrow/MutBorrow from this binding
+                    // Find all bindings that borrow from this binding
                     let borrows_to_end: Vec<BindingId> = self.bindings.iter()
                         .filter_map(|(id, b)| {
-                            match &b.current_state {
-                                BindingState::SharedBorrow { from } if *from == binding_id => Some(*id),
-                                BindingState::MutBorrow { from } if *from == binding_id => Some(*id),
-                                _ => None,
-                            }
+                            b.current_state
+                                .borrow_source()
+                                .filter(|from| *from == binding_id)
+                                .map(|_| *id)
                         })
                         .collect();
 

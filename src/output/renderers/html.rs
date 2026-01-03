@@ -377,7 +377,7 @@ fn build_state_panel(ctx: &RenderContext, line_num: u32) -> String {
 
     for trans in &transitions {
         // Skip Copy types if configured (unless they're borrows)
-        let is_borrow = trans.curr.as_ref().map_or(false, |(s, _)| {
+        let is_borrow = trans.curr.as_ref().is_some_and(|(s, _)| {
             matches!(s, SetEntryState::SharedBorrow | SetEntryState::MutBorrow)
         });
         if ctx.config.filter_copy_types && ctx.is_copy_type(&trans.name) && !is_borrow {

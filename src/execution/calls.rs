@@ -78,20 +78,18 @@ impl<'a> CallDetector<'a> {
     }
 
     fn handle_call_expr(&mut self, call: &ast::CallExpr) {
-        if let Some(callee) = call.expr() {
-            if let ast::Expr::PathExpr(path) = &callee {
-                if let Some(path) = path.path() {
-                    let name = path.syntax().text().to_string();
-                    let kind = classify_call(&name, self.registry);
-                    self.calls.push(CallSite {
-                        line: self.line_offset,
-                        column: 0,
-                        kind,
-                    });
-                }
+        if let Some(ast::Expr::PathExpr(path_expr)) = call.expr() {
+            if let Some(path) = path_expr.path() {
+                let name = path.syntax().text().to_string();
+                let kind = classify_call(&name, self.registry);
+                self.calls.push(CallSite {
+                    line: self.line_offset,
+                    column: 0,
+                    kind,
+                });
             }
-            // Complex callee expressions are handled by the iterator's traversal
         }
+        // Complex callee expressions are handled by the iterator's traversal
     }
 
     fn handle_method_call(&mut self, method_call: &ast::MethodCallExpr) {

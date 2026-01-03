@@ -55,6 +55,14 @@ pub fn states_match(expected: &ExpectedState, actual: &SetEntryState, mutable: b
     }
 }
 
+/// Check if a state represents "not live" (moved or dropped).
+///
+/// Used for `!x` assertions: a variable that is moved or dropped
+/// is not usable and counts as "not live".
+pub fn is_not_live(state: &SetEntryState) -> bool {
+    matches!(state, SetEntryState::Moved { .. } | SetEntryState::Dropped)
+}
+
 /// Convert a SetEntryState to its canonical expectation name for error messages.
 pub fn state_to_name(state: &SetEntryState, mutable: bool) -> &'static str {
     match state {

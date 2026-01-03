@@ -380,10 +380,8 @@ impl StateTimeline {
 
         // Check the state at the last use line to see if it was moved
         if let Some(state) = self.get(last_use_line) {
-            if let Some((entry_state, _)) = state.states.get(name) {
-                if let SetEntryState::Moved { to } = entry_state {
-                    return InvalidationReason::Moved { to: to.clone() };
-                }
+            if let Some((SetEntryState::Moved { to }, _)) = state.states.get(name) {
+                return InvalidationReason::Moved { to: to.clone() };
             }
         }
 

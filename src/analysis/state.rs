@@ -528,6 +528,14 @@ impl BindingState {
             _ => None,
         }
     }
+
+    /// Get the source binding if this is a borrow state (SharedBorrow or MutBorrow).
+    pub fn borrow_source(&self) -> Option<BindingId> {
+        match self {
+            BindingState::SharedBorrow { from } | BindingState::MutBorrow { from } => Some(*from),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for BindingState {
